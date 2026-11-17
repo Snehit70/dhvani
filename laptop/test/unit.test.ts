@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { FrameAligner, LeadLimiter, processPcm } from "../src/audio";
 import { sanitize, defaults } from "../src/config";
-import { FailureLimiter, codesMatch, isDiscoverRequest, parseHello, parsePhoneStats } from "../src/protocol";
+import { FailureLimiter, codesMatch, isDiscoverRequest, parseHello, parsePhoneStats, parsePhoneVolume, phoneGain } from "../src/protocol";
 import { StreamStats } from "../src/stats";
 
 const hello = (o: Record<string, unknown> = {}) =>
@@ -126,4 +126,28 @@ test("parsePhoneStats keeps only flat, bounded fields", () => {
   expect(r?.fields).toEqual({ rssi: -60, ok: true, model: "x".repeat(64), inf: "y" });
   expect(parsePhoneStats('{"dhvani":"discover"}')).toBeNull();
   expect(parsePhoneStats("nope")).toBeNull();
+});
+
+test("parsePhoneVolume validates shape and bounds", () => {
+  const ok = { dhvani: "volume", v: 1, code: "123456", index: 7, max: 15, muted: false };
+  expect(parsePhoneVolume(JSON.stringify(ok))).toEqual({ code: "123456", index: 7, max: 15, muted: false });
+  expect(parsePhoneVolume(JSON.stringify({ ...ok, dhvani: "stats" }))).toBeNull();
+  expect(parsePhoneVolume(JSON.stringify({ ...ok, index: 16 }))).toBeNull();
+  expect(parsePhoneVolume(JSON.stringify({ ...ok, index: 1.5 }))).toBeNull();
+  expect(parsePhoneVolume(JSON.stringify({ ...ok, max: 0 }))).toBeNull();
+  expect(parsePhoneVolume(JSON.stringify({ ...ok, muted: "no" }))).toBeNull();
+  expect(parsePhoneVolume("not json")).toBeNull();
+});
+
+test("phoneGain: mute and zero are silent, max is unity, steps are monotonic", () => {
+  expect(phoneGain({ index: 15, max: 15, muted: true })).toBe(0);
+  expect(phoneGain({ index: 0, max: 15, muted: false })).toBe(0);
+  expect(phoneGain({ index: 15, max: 15, muted: false })).toBe(1);
+  let prev = 0;
+  for (let i = 1; i <= 15; i++) {
+    const g = phoneGain({ index: i, max: 15, muted: false });
+    expect(g).toBeGreaterThan(prev);
+    prev = g;
+  }
+  expect(phoneGain({ index: 1, max: 15, muted: false })).toBeLessThan(0.01);
 });

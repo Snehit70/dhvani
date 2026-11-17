@@ -11,6 +11,8 @@ export type Config = {
   /** 0..1.5 software gain. */
   volume: number;
   muted: boolean;
+  /** Scale output by the phone's own media volume (phone muted = laptop silent). */
+  followPhone: boolean;
   /** Name the phone shows for this laptop. */
   name: string;
 };
@@ -25,7 +27,7 @@ export function newCode(): string {
 }
 
 export function defaults(): Config {
-  return { code: newCode(), sink: "", volume: 1, muted: false, name: hostname() };
+  return { code: newCode(), sink: "", volume: 1, muted: false, followPhone: true, name: hostname() };
 }
 
 export function sanitize(input: Partial<Config>, base: Config): Config {
@@ -36,6 +38,7 @@ export function sanitize(input: Partial<Config>, base: Config): Config {
     c.volume = Math.min(1.5, Math.max(0, input.volume));
   }
   if (typeof input.muted === "boolean") c.muted = input.muted;
+  if (typeof input.followPhone === "boolean") c.followPhone = input.followPhone;
   if (typeof input.name === "string" && input.name.trim()) c.name = input.name.trim().slice(0, 40);
   return c;
 }

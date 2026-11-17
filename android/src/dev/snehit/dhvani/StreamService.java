@@ -63,6 +63,8 @@ public final class StreamService extends Service {
     private static final String KEY_SAVED_VOLUME = "savedVolume";
     private static final String TAG = "Dhvani";
     private static final long STATS_INTERVAL_MS = 10_000;
+    private static final long VOLUME_POLL_MS = 200;
+    private static final long VOLUME_RESEND_MS = 2_000;
 
     private final Handler main = new Handler(Looper.getMainLooper());
     /** Uptime when the current socket write began, 0 when no write is in flight. */
@@ -243,6 +245,8 @@ public final class StreamService extends Service {
                 long readMax = 0, writeMax = 0;
                 int slowWrites = 0, slowReads = 0;
                 try { statsSock = new DatagramSocket(); } catch (IOException ignored) {}
+                String lastVolume = null;
+                long nextVolumeCheck = 0, volumeResendAt = 0;
                 while (running) {
                     long r0 = SystemClock.uptimeMillis();
                     int n = rec.read(buf, 0, buf.length);
@@ -258,6 +262,18 @@ public final class StreamService extends Service {
                     long writeMs = SystemClock.uptimeMillis() - w0;
                     if (writeMs > writeMax) writeMax = writeMs;
                     if (writeMs > 20) slowWrites++;
+                    long now = SystemClock.uptimeMillis();
+                    if (now >= nextVolumeCheck) {
+                        nextVolumeCheck = now + VOLUME_POLL_MS;
+                        int[] v = phoneVolume();
+                        String key = v[0] + "/" + v[1] + (v[2] == 1 ? " muted" : "");
+                        if (!key.equals(lastVolume) || now >= volumeResendAt) {
+                            if (!key.equals(lastVolume)) Log.i(TAG, "phone volume " + key);
+                            sendVolume(statsSock, s, Protocol.volume(code, v[0], v[1], v[2] == 1));
+                            lastVolume = key;
+                            volumeResendAt = now + VOLUME_RESEND_MS;
+                        }
+                    }
                     if (SystemClock.uptimeMillis() >= nextStats) {
                         sendStats(statsSock, s, readMax, writeMax, slowReads, slowWrites);
                         readMax = writeMax = 0;
@@ -300,6 +316,26 @@ public final class StreamService extends Service {
             }
             backoff = Math.min(backoff * 2, 8000);
         }
+    }
+
+    /**
+     * Playback capture is taken before stream volume and mute apply, so the laptop
+     * scales its output by this. While the app holds the phone silent, report full
+     * volume so the laptop keeps its own level.
+     */
+    private int[] phoneVolume() {
+        if (savedVolume >= 0) return new int[] {1, 1, 0};
+        int max = Math.max(1, audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC));
+        int index = Math.min(max, Math.max(0, audio.getStreamVolume(AudioManager.STREAM_MUSIC)));
+        return new int[] {index, max, audio.isStreamMute(AudioManager.STREAM_MUSIC) ? 1 : 0};
+    }
+
+    private void sendVolume(DatagramSocket sock, Socket s, String packet) {
+        if (sock == null) return;
+        try {
+            byte[] b = packet.getBytes(StandardCharsets.UTF_8);
+            sock.send(new DatagramPacket(b, b.length, s.getInetAddress(), Protocol.DISCOVERY_PORT));
+        } catch (Exception ignored) {}
     }
 
     /** Best effort: a lost packet only loses one sample of diagnostics. */

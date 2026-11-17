@@ -62,6 +62,22 @@ final class Protocol {
     }
 
     /** Phone health report, sent over UDP to the discovery port while streaming. */
+    /** Phone media volume, so the laptop can follow it (capture is taken before volume applies). */
+    static String volume(String code, int index, int max, boolean muted) {
+        try {
+            JSONObject o = new JSONObject();
+            o.put("dhvani", "volume");
+            o.put("v", VERSION);
+            o.put("code", code);
+            o.put("index", index);
+            o.put("max", max);
+            o.put("muted", muted);
+            return o.toString();
+        } catch (JSONException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
     static String stats(String code, JSONObject fields) {
         try {
             fields.put("dhvani", "stats");

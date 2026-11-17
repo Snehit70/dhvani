@@ -14,6 +14,8 @@ import {
   isDiscoverRequest,
   parseHello,
   parsePhoneStats,
+  parsePhoneVolume,
+  phoneGain,
   type Hello,
 } from "./protocol";
 
@@ -24,6 +26,8 @@ export type Session = {
   since: number;
   rate: number;
   channels: number;
+  /** Phone media volume as last reported (null until the phone app sends it). */
+  phoneVolume: { index: number; max: number; muted: boolean } | null;
 };
 
 export type ServerHooks = {
@@ -105,6 +109,8 @@ export class AudioServer {
       const text = msg.toString();
       const stats = parsePhoneStats(text);
       if (stats) return this.phoneStats(stats, rinfo.address);
+      const vol = parsePhoneVolume(text);
+      if (vol) return this.phoneVolume(vol, rinfo.address);
       if (msg.length > 512 || !isDiscoverRequest(text)) return;
       const reply = Buffer.from(discoverReply(this.getConfig().name, audioPort));
       udp.send(reply, rinfo.port, rinfo.address);
@@ -215,6 +221,7 @@ export class AudioServer {
       since: Date.now(),
       rate: hello.rate,
       channels: hello.channels,
+      phoneVolume: null,
     };
     const bytesPerSec = hello.rate * hello.channels * 2;
     const active: Active = {
@@ -245,7 +252,9 @@ export class AudioServer {
       if (!frames.length) return;
       const player = this.ensurePlayer(active);
       const cfg = this.getConfig();
-      const { out, peak } = processPcm(frames, cfg.muted ? 0 : cfg.volume);
+      const pv = active.session.phoneVolume;
+      const follow = cfg.followPhone && pv ? phoneGain(pv) : 1;
+      const { out, peak } = processPcm(frames, cfg.muted ? 0 : cfg.volume * follow);
       const result = player ? player.write(out) : "closed";
       if (result !== "ok") {
         this.drops++;
@@ -315,6 +324,16 @@ export class AudioServer {
     if (!a || a.session.address !== address || !codesMatch(s.code, this.getConfig().code)) return;
     log("phone_stats", { session: a.session.id, ...s.fields });
     this.phone = s.fields;
+    this.hooks.onChange();
+  }
+
+  private phoneVolume(v: { code: string; index: number; max: number; muted: boolean }, address: string) {
+    const a = this.active;
+    if (!a || a.session.address !== address || !codesMatch(v.code, this.getConfig().code)) return;
+    const prev = a.session.phoneVolume;
+    if (prev && prev.index === v.index && prev.max === v.max && prev.muted === v.muted) return;
+    a.session.phoneVolume = { index: v.index, max: v.max, muted: v.muted };
+    log("phone_volume", { session: a.session.id, index: v.index, max: v.max, muted: v.muted });
     this.hooks.onChange();
   }
 

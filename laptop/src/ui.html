@@ -185,6 +185,16 @@ button, input { font: inherit; color: inherit; letter-spacing: inherit; }
 
 /* ---------- Volume: M3 slider (thick track, bar handle) ---------- */
 .volume { display: flex; align-items: center; gap: 12px; margin-top: 20px; }
+.switch-row { display: flex; align-items: center; gap: 16px; margin-top: 16px; cursor: pointer; }
+.switch-row .txt { flex: 1; min-width: 0; }
+.switch { appearance: none; flex: none; position: relative; width: 52px; height: 32px; margin: 0; border-radius: var(--shape-full);
+  background: var(--surface-c-highest); box-shadow: inset 0 0 0 2px var(--outline); cursor: pointer;
+  transition-property: background-color, box-shadow; transition-duration: 150ms; transition-timing-function: var(--ease); }
+.switch::after { content: ""; position: absolute; top: 8px; left: 8px; width: 16px; height: 16px; border-radius: 50%;
+  background: var(--outline); transition-property: translate, scale, background-color; transition-duration: 200ms; transition-timing-function: var(--ease); }
+.switch:checked { background: var(--primary); box-shadow: none; }
+.switch:checked::after { background: var(--on-primary); translate: 20px 0; scale: 1.5; }
+.switch:focus-visible { outline: 3px solid var(--primary); outline-offset: 2px; }
 .slider { flex: 1; min-width: 0; height: 44px; -webkit-appearance: none; appearance: none; background: transparent; cursor: pointer; margin: 0; }
 .slider::-webkit-slider-runnable-track { height: 16px; border-radius: var(--shape-full); background: linear-gradient(to right, var(--fill) var(--p, 66%), var(--secondary-container) var(--p, 66%)); }
 .slider::-moz-range-track { height: 16px; border-radius: var(--shape-full); background: var(--secondary-container); }
@@ -353,6 +363,10 @@ button, input { font: inherit; color: inherit; letter-spacing: inherit; }
             <span class="pct num title-s" id="volout">100%</span>
           </div>
           <div class="body-s muted" id="vol-hint">Above 100% boosts quiet phones. The laptop's own volume still applies.</div>
+          <label class="switch-row" for="follow">
+            <span class="txt"><span class="body-l">Follow phone volume</span><br><span class="body-s muted" id="follow-note">Phone volume buttons and mute also control this laptop.</span></span>
+            <input type="checkbox" role="switch" class="switch" id="follow">
+          </label>
         </section>
 
         <section class="card o-hist" aria-labelledby="hist-h">
@@ -542,6 +556,10 @@ function render(s) {
     const st = el("span"); st.innerHTML = '<i class="live-dot"></i>'; st.append("Streaming");
     meta.append(st, el("span", "num", dur((Date.now() - s.session.since) / 1000)),
       el("span", null, `${s.session.rate / 1000} kHz ${s.session.channels === 2 ? "stereo" : "mono"}`));
+    const pv = s.session.phoneVolume;
+    if (pv && s.followPhone && pv.max > 1) {
+      meta.append(el("span", null, pv.muted || pv.index === 0 ? "Phone muted" : `Phone volume ${pv.index}/${pv.max}`));
+    }
   } else {
     $("title").textContent = "Ready to pair";
     meta.append(el("span", null, `Open Dhvani on your phone and pick “${s.name}”.`));
@@ -574,6 +592,7 @@ function render(s) {
   m.setAttribute("aria-label", s.muted ? "Unmute" : "Mute");
   m.querySelector(".on-vol").classList.toggle("off", s.muted);
   m.querySelector(".on-mute").classList.toggle("off", !s.muted);
+  $("follow").checked = s.followPhone !== false;
 
   renderQuality(s);
 
@@ -637,6 +656,7 @@ $("volume").addEventListener("input", (e) => {
   volTimer = setTimeout(() => post("/api/settings", { volume: e.target.value / 100, muted: false }), 80);
 });
 $("mute").onclick = () => post("/api/settings", { muted: !state?.muted });
+$("follow").addEventListener("change", (e) => post("/api/settings", { followPhone: e.target.checked }));
 $("newcode").onclick = () => post("/api/code").then((ok) => ok && snack("New code ready. Phones using the old one are disconnected"));
 $("copy").onclick = () => copy(state?.code || "", "Code");
 $("fw-copy").onclick = () => copy(state?.firewallFix || "", "Command");

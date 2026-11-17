@@ -109,6 +109,7 @@ async function state() {
     sink: config.sink,
     volume: config.volume,
     muted: config.muted,
+    followPhone: config.followPhone,
     sinks,
     defaultSink,
     port: AUDIO_PORT,
@@ -133,7 +134,7 @@ function apply(next: Config) {
   const sinkChanged = next.sink !== config.sink;
   const codeChanged = next.code !== config.code;
   const changed: Record<string, unknown> = {};
-  for (const k of ["sink", "volume", "muted", "name"] as const) if (next[k] !== config[k]) changed[k] = next[k];
+  for (const k of ["sink", "volume", "muted", "followPhone", "name"] as const) if (next[k] !== config[k]) changed[k] = next[k];
   if (codeChanged) changed.code = "changed"; // never log the code itself
   config = next;
   saveConfig(config);

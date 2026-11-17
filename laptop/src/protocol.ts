@@ -152,3 +152,32 @@ export function parsePhoneStats(msg: string): { code: string; fields: Record<str
   }
   return { code: r.code, fields };
 }
+
+export type PhoneVolume = { code: string; index: number; max: number; muted: boolean };
+
+/** Phone media volume report: {"dhvani":"volume","v":1,"code","index","max","muted"}. */
+export function parsePhoneVolume(msg: string): PhoneVolume | null {
+  let o: unknown;
+  try {
+    o = JSON.parse(msg);
+  } catch {
+    return null;
+  }
+  if (!o || typeof o !== "object") return null;
+  const r = o as Record<string, unknown>;
+  if (r.dhvani !== "volume" || typeof r.code !== "string") return null;
+  const { index, max, muted } = r;
+  if (!Number.isInteger(index) || !Number.isInteger(max) || typeof muted !== "boolean") return null;
+  if ((max as number) < 1 || (max as number) > 1000 || (index as number) < 0 || (index as number) > (max as number)) return null;
+  return { code: r.code, index: index as number, max: max as number, muted };
+}
+
+/** Lowest phone step maps to -45 dB; linear in dB like Android's own media curve. */
+const PHONE_RANGE_DB = 45;
+
+/** Gain the laptop applies for a phone volume step: 0 when muted or at zero, 1 at max. */
+export function phoneGain(v: { index: number; max: number; muted: boolean }): number {
+  if (v.muted || v.index <= 0) return 0;
+  if (v.index >= v.max) return 1;
+  return 10 ** ((-PHONE_RANGE_DB * (1 - v.index / v.max)) / 20);
+}

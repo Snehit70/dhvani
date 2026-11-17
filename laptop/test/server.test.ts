@@ -5,7 +5,7 @@ import type { Config } from "../src/config";
 import type { Player, PlayerFactory } from "../src/player";
 import { AudioServer } from "../src/server";
 
-const config: Config = { code: "424242", sink: "", volume: 1, muted: false, name: "testbox" };
+const config: Config = { code: "424242", sink: "", volume: 1, muted: false, followPhone: true, name: "testbox" };
 
 type FakePlayer = Player & { data: number[]; opts: Parameters<PlayerFactory>[0] };
 let players: FakePlayer[] = [];
@@ -141,4 +141,46 @@ test("discovery answers broadcasts", async () => {
   sock.send('{"dhvani":"discover","v":1}', discPort, "127.0.0.1");
   expect(JSON.parse(await reply)).toEqual({ dhvani: "here", v: 1, name: "testbox", port: 47800 });
   sock.close();
+});
+
+test("phone volume scales output; muted phone means silent laptop", async () => {
+  const port = await start();
+  const probe = dgram.createSocket("udp4");
+  await new Promise<void>((r) => probe.bind(0, "127.0.0.1", () => r()));
+  const discPort = probe.address().port;
+  probe.close();
+  await server.listenDiscovery(discPort, port);
+  const c = connect(port);
+  c.sock.write(hello("424242"));
+  await c.line();
+  await until(() => server.session !== null);
+  const udp = dgram.createSocket("udp4");
+  const send = (o: object) => udp.send(JSON.stringify({ dhvani: "volume", v: 1, ...o }), discPort, "127.0.0.1");
+  // Wrong code is ignored.
+  send({ code: "000000", index: 0, max: 15, muted: true });
+  send({ code: "424242", index: 15, max: 15, muted: true });
+  await until(() => server.session?.phoneVolume?.muted === true);
+  c.sock.write(Buffer.from([0x00, 0x40, 0x00, 0x40]));
+  await until(() => players[0]?.data.length === 4);
+  expect(players[0]!.data).toEqual([0, 0, 0, 0]);
+  send({ code: "424242", index: 15, max: 15, muted: false });
+  await until(() => server.session?.phoneVolume?.muted === false);
+  c.sock.write(Buffer.from([0x00, 0x40, 0x00, 0x40]));
+  await until(() => players[0]!.data.length === 8);
+  expect(players[0]!.data.slice(4)).toEqual([0x00, 0x40, 0x00, 0x40]);
+  udp.close();
+  c.sock.end();
+});
+
+test("followPhone off ignores the phone's volume", async () => {
+  const port = await start({ ...config, followPhone: false });
+  const c = connect(port);
+  c.sock.write(hello("424242"));
+  await c.line();
+  await until(() => server.session !== null);
+  server.session!.phoneVolume = { index: 0, max: 15, muted: true };
+  c.sock.write(Buffer.from([0x00, 0x40, 0x00, 0x40]));
+  await until(() => players[0]?.data.length === 4);
+  expect(players[0]!.data).toEqual([0x00, 0x40, 0x00, 0x40]);
+  c.sock.end();
 });
