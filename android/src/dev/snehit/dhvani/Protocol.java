@@ -10,7 +10,7 @@ final class Protocol {
     static final int DISCOVERY_PORT = 47802;
     static final int RATE = 48000;
     static final int CHANNELS = 2;
-    static final String APP_VERSION = "0.1.0";
+    static final String APP_VERSION = "0.2.0";
 
     private Protocol() {}
 
@@ -86,6 +86,48 @@ final class Protocol {
             return fields.toString();
         } catch (JSONException e) {
             throw new IllegalStateException(e);
+        }
+    }
+
+    /** Sets the laptop's own playback volume (0..1.5) and/or mute. Null leaves a field unchanged. */
+    static String control(String code, Double volume, Boolean muted) {
+        try {
+            JSONObject o = new JSONObject();
+            o.put("dhvani", "control");
+            o.put("v", VERSION);
+            o.put("code", code);
+            if (volume != null) o.put("volume", Math.max(0, Math.min(1.5, volume)));
+            if (muted != null) o.put("muted", muted.booleanValue());
+            return o.toString();
+        } catch (JSONException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    static final class Laptop {
+        final double volume;
+        final boolean muted;
+        final String[] addresses;
+
+        Laptop(double volume, boolean muted, String[] addresses) {
+            this.volume = volume;
+            this.muted = muted;
+            this.addresses = addresses;
+        }
+    }
+
+    /** Parses the laptop's JSON line sent while streaming, or null for anything else. */
+    static Laptop parseLaptop(String line) {
+        try {
+            JSONObject o = new JSONObject(line);
+            if (!"laptop".equals(o.optString("dhvani"))) return null;
+            org.json.JSONArray a = o.optJSONArray("addresses");
+            int n = a == null ? 0 : Math.min(8, a.length());
+            String[] addrs = new String[n];
+            for (int i = 0; i < n; i++) addrs[i] = a.optString(i, "");
+            return new Laptop(o.optDouble("volume", 1), o.optBoolean("muted", false), addrs);
+        } catch (JSONException e) {
+            return null;
         }
     }
 

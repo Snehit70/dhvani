@@ -49,6 +49,11 @@ public final class StreamService extends Service {
     static final String EXTRA_CODE = "code";
     static final String EXTRA_SILENCE = "silence";
     static final String EXTRA_RECONNECT = "reconnect";
+    /** Changes the laptop's own volume while streaming: EXTRA_VOLUME, EXTRA_MUTED or EXTRA_TOGGLE_MUTE. */
+    static final String ACTION_CONTROL = "dev.snehit.dhvani.CONTROL";
+    static final String EXTRA_VOLUME = "volume";
+    static final String EXTRA_MUTED = "muted";
+    static final String EXTRA_TOGGLE_MUTE = "toggleMute";
 
     private static final String CHANNEL = "stream";
     private static final int NOTIFICATION_ID = 1;
@@ -65,6 +70,9 @@ public final class StreamService extends Service {
     private static final long STATS_INTERVAL_MS = 10_000;
     private static final long VOLUME_POLL_MS = 200;
     private static final long VOLUME_RESEND_MS = 2_000;
+    /** After this much digital silence, send only a short keepalive so the Wi-Fi radio can rest. */
+    private static final int IDLE_AFTER_MS = 2000;
+    private static final long KEEPALIVE_MS = 250;
 
     private final Handler main = new Handler(Looper.getMainLooper());
     /** Uptime when the current socket write began, 0 when no write is in flight. */
@@ -73,6 +81,12 @@ public final class StreamService extends Service {
     private volatile int stalls;
     private int reconnects;
     private WifiManager.WifiLock wifiLock;
+    private WifiManager.WifiLock wifiLockPerf;
+    /** Where UDP reports go: the laptop, or one of its LAN addresses when streaming over USB. */
+    private volatile java.net.InetAddress udpTarget;
+    private volatile String notificationText = "";
+    private final java.util.concurrent.ExecutorService sender =
+            java.util.concurrent.Executors.newSingleThreadExecutor();
     private final Runnable watchdog = new Runnable() {
         @Override public void run() {
             if (!running) return;
@@ -110,6 +124,11 @@ public final class StreamService extends Service {
     @Override public IBinder onBind(Intent intent) { return null; }
 
     @Override public int onStartCommand(Intent intent, int flags, int startId) {
+        if (intent != null && ACTION_CONTROL.equals(intent.getAction())) {
+            if (running) control(intent);
+            else if (worker == null) stopSelf(startId);
+            return START_NOT_STICKY;
+        }
         if (intent == null || ACTION_STOP.equals(intent.getAction())) {
             stopStreaming(null);
             return START_NOT_STICKY;
@@ -172,6 +191,7 @@ public final class StreamService extends Service {
 
     @Override public void onDestroy() {
         stopCapture();
+        sender.shutdown();
         super.onDestroy();
     }
 
@@ -235,12 +255,16 @@ public final class StreamService extends Service {
                 }
                 Log.i(TAG, "streaming to " + reply.name);
                 s.setSoTimeout(0);
+                udpTarget = s.getInetAddress();
+                startLaptopReader(s);
                 rec.startRecording();
                 silencePhone();
                 streamed = true;
                 backoff = 1000;
                 update(StreamState.Status.STREAMING, reply.name);
                 int zeroMs = 0;
+                int quietMs = 0;
+                long nextKeepalive = 0;
                 long nextStats = SystemClock.uptimeMillis() + STATS_INTERVAL_MS;
                 long readMax = 0, writeMax = 0;
                 int slowWrites = 0, slowReads = 0;
@@ -255,13 +279,20 @@ public final class StreamService extends Service {
                     if (readMs > 50) slowReads++;
                     if (n < 0) throw new IOException("capture error " + n);
                     if (n == 0) continue;
+                    boolean zero = allZero(buf, n);
+                    quietMs = zero ? quietMs + CHUNK_MS : 0;
                     long w0 = SystemClock.uptimeMillis();
-                    writeStartedAt = w0;
-                    out.write(buf, 0, n);
-                    writeStartedAt = 0;
-                    long writeMs = SystemClock.uptimeMillis() - w0;
-                    if (writeMs > writeMax) writeMax = writeMs;
-                    if (writeMs > 20) slowWrites++;
+                    // Long digital silence: skip most chunks. The laptop treats the pause as idle, not a gap.
+                    boolean send = quietMs < IDLE_AFTER_MS || w0 >= nextKeepalive;
+                    if (send) {
+                        if (quietMs >= IDLE_AFTER_MS) nextKeepalive = w0 + KEEPALIVE_MS;
+                        writeStartedAt = w0;
+                        out.write(buf, 0, n);
+                        writeStartedAt = 0;
+                        long writeMs = SystemClock.uptimeMillis() - w0;
+                        if (writeMs > writeMax) writeMax = writeMs;
+                        if (writeMs > 20) slowWrites++;
+                    }
                     long now = SystemClock.uptimeMillis();
                     if (now >= nextVolumeCheck) {
                         nextVolumeCheck = now + VOLUME_POLL_MS;
@@ -281,7 +312,7 @@ public final class StreamService extends Service {
                         nextStats = SystemClock.uptimeMillis() + STATS_INTERVAL_MS;
                     }
                     if (savedVolume >= 0 && !silenceBroken) {
-                        zeroMs = allZero(buf, n) && audio.isMusicActive() ? zeroMs + CHUNK_MS : 0;
+                        zeroMs = zero && audio.isMusicActive() ? zeroMs + CHUNK_MS : 0;
                         if (zeroMs >= SILENCE_PROBE_MS) {
                             silenceBroken = true;
                             Log.w(TAG, "capture is silent while muted; un-silencing phone");
@@ -303,6 +334,8 @@ public final class StreamService extends Service {
                         ? "Connection lost. Retrying…" : friendly(e) + " Retrying…");
             } finally {
                 writeStartedAt = 0;
+                udpTarget = null;
+                StreamState.clearLaptop();
                 if (statsSock != null) statsSock.close();
                 closeQuietly(s);
                 try { rec.stop(); } catch (RuntimeException ignored) {}
@@ -334,8 +367,68 @@ public final class StreamService extends Service {
         if (sock == null) return;
         try {
             byte[] b = packet.getBytes(StandardCharsets.UTF_8);
-            sock.send(new DatagramPacket(b, b.length, s.getInetAddress(), Protocol.DISCOVERY_PORT));
+            sock.send(new DatagramPacket(b, b.length, target(s), Protocol.DISCOVERY_PORT));
         } catch (Exception ignored) {}
+    }
+
+    private java.net.InetAddress target(Socket s) {
+        java.net.InetAddress t = udpTarget;
+        return t != null ? t : s.getInetAddress();
+    }
+
+    /**
+     * Reads the laptop's JSON lines (its volume, mute and LAN addresses) until the socket closes.
+     * Over USB the TCP peer is 127.0.0.1, which UDP cannot reach, so reports go to a LAN address.
+     */
+    private void startLaptopReader(Socket s) {
+        Thread t = new Thread(() -> {
+            try {
+                InputStream in = s.getInputStream();
+                boolean first = true, wasMuted = false;
+                while (running && socket == s) {
+                    Protocol.Laptop l = Protocol.parseLaptop(readLine(in));
+                    if (l == null) continue;
+                    if (s.getInetAddress().isLoopbackAddress()) {
+                        for (String a : l.addresses) {
+                            if (a.matches("\\d{1,3}(\\.\\d{1,3}){3}")) {
+                                udpTarget = java.net.InetAddress.getByName(a);
+                                break;
+                            }
+                        }
+                    }
+                    StreamState.setLaptop(l.volume, l.muted, l.addresses);
+                    if (first || l.muted != wasMuted) refreshNotification();
+                    first = false;
+                    wasMuted = l.muted;
+                }
+            } catch (IOException | RuntimeException ignored) {
+                // Socket closed; the stream loop handles reconnects.
+            }
+        }, "dhvani-laptop");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    private void control(Intent intent) {
+        Double volume = intent.hasExtra(EXTRA_VOLUME)
+                ? (double) Math.max(0f, Math.min(1.5f, intent.getFloatExtra(EXTRA_VOLUME, 1f))) : null;
+        Boolean muted = intent.hasExtra(EXTRA_MUTED) ? intent.getBooleanExtra(EXTRA_MUTED, false)
+                : intent.getBooleanExtra(EXTRA_TOGGLE_MUTE, false) ? !StreamState.laptopMuted : null;
+        if (volume == null && muted == null) return;
+        final java.net.InetAddress t = udpTarget;
+        final String c = code;
+        if (t == null || c == null) return;
+        // Shown right away; the laptop confirms with its own update over TCP.
+        if (volume != null) StreamState.laptopVolume = volume;
+        if (muted != null) StreamState.setLaptop(StreamState.laptopVolume, muted, null);
+        final byte[] b = Protocol.control(c, volume, muted).getBytes(StandardCharsets.UTF_8);
+        try {
+            sender.execute(() -> {
+                try (DatagramSocket ds = new DatagramSocket()) {
+                    ds.send(new DatagramPacket(b, b.length, t, Protocol.DISCOVERY_PORT));
+                } catch (IOException ignored) {}
+            });
+        } catch (java.util.concurrent.RejectedExecutionException ignored) {}
     }
 
     /** Best effort: a lost packet only loses one sample of diagnostics. */
@@ -365,7 +458,7 @@ public final class StreamService extends Service {
                 }
             }
             byte[] b = Protocol.stats(code, o).getBytes(StandardCharsets.UTF_8);
-            sock.send(new DatagramPacket(b, b.length, s.getInetAddress(), Protocol.DISCOVERY_PORT));
+            sock.send(new DatagramPacket(b, b.length, target(s), Protocol.DISCOVERY_PORT));
             Log.d(TAG, "stats " + o);
         } catch (Exception ignored) {}
     }
@@ -429,6 +522,18 @@ public final class StreamService extends Service {
         } catch (RuntimeException e) {
             wifiLock = null;
         }
+        // LOW_LATENCY only applies while the screen is on; HIGH_PERF keeps Wi-Fi awake with it off.
+        try {
+            WifiManager wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+            if (wm == null) return;
+            @SuppressWarnings("deprecation")
+            WifiManager.WifiLock l = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "dhvani:stream-perf");
+            wifiLockPerf = l;
+            wifiLockPerf.setReferenceCounted(false);
+            wifiLockPerf.acquire();
+        } catch (RuntimeException e) {
+            wifiLockPerf = null;
+        }
     }
 
     private void releaseWifiLock() {
@@ -436,6 +541,10 @@ public final class StreamService extends Service {
             try { wifiLock.release(); } catch (RuntimeException ignored) {}
         }
         wifiLock = null;
+        if (wifiLockPerf != null && wifiLockPerf.isHeld()) {
+            try { wifiLockPerf.release(); } catch (RuntimeException ignored) {}
+        }
+        wifiLockPerf = null;
     }
 
     private synchronized void restoreVolume() {
@@ -459,22 +568,36 @@ public final class StreamService extends Service {
 
     private void update(StreamState.Status s, String detail) {
         StreamState.set(s, detail);
+        refreshTile();
+        String text;
+        switch (s) {
+            case STREAMING: text = "Playing on " + detail; break;
+            case RECONNECTING: text = detail; break;
+            default: text = "Connecting to " + host; break;
+        }
+        notificationText = text;
+        refreshNotification();
+    }
+
+    private void refreshNotification() {
         main.post(() -> {
             if (!running) return;
-            String text;
-            switch (s) {
-                case STREAMING: text = "Playing on " + detail; break;
-                case RECONNECTING: text = detail; break;
-                default: text = "Connecting to " + host; break;
-            }
             NotificationManager nm = getSystemService(NotificationManager.class);
-            nm.notify(NOTIFICATION_ID, buildNotification(text));
+            nm.notify(NOTIFICATION_ID, buildNotification(notificationText));
         });
+    }
+
+    private void refreshTile() {
+        try {
+            android.service.quicksettings.TileService.requestListeningState(this,
+                    new android.content.ComponentName(this, DhvaniTile.class));
+        } catch (RuntimeException ignored) {}
     }
 
     private void fail(String message) {
         stopCapture();
         StreamState.set(StreamState.Status.ERROR, message);
+        refreshTile();
         stopForeground(STOP_FOREGROUND_REMOVE);
         stopSelf();
     }
@@ -488,6 +611,7 @@ public final class StreamService extends Service {
         stopCapture();
         if (error == null) StreamState.set(StreamState.Status.IDLE, "");
         else StreamState.set(StreamState.Status.ERROR, error);
+        refreshTile();
         stopForeground(STOP_FOREGROUND_REMOVE);
         stopSelf();
     }
@@ -539,7 +663,7 @@ public final class StreamService extends Service {
         PendingIntent stop = PendingIntent.getService(this, 1,
                 new Intent(this, StreamService.class).setAction(ACTION_STOP),
                 PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
-        return new Notification.Builder(this, CHANNEL)
+        Notification.Builder nb = new Notification.Builder(this, CHANNEL)
                 .setSmallIcon(R.drawable.ic_notify)
                 .setContentTitle("Dhvani")
                 .setContentText(text)
@@ -547,7 +671,15 @@ public final class StreamService extends Service {
                 .setOngoing(true)
                 .setOnlyAlertOnce(true)
                 .setCategory(Notification.CATEGORY_SERVICE)
-                .addAction(new Notification.Action.Builder(null, "Stop", stop).build())
-                .build();
+                .addAction(new Notification.Action.Builder(null, "Stop", stop).build());
+        if (StreamState.laptopVolume >= 0 && StreamState.status == StreamState.Status.STREAMING) {
+            PendingIntent mute = PendingIntent.getService(this, 2,
+                    new Intent(this, StreamService.class).setAction(ACTION_CONTROL)
+                            .putExtra(EXTRA_TOGGLE_MUTE, true),
+                    PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+            nb.addAction(new Notification.Action.Builder(null,
+                    StreamState.laptopMuted ? "Unmute laptop" : "Mute laptop", mute).build());
+        }
+        return nb.build();
     }
 }

@@ -15,6 +15,10 @@ final class StreamState {
     static volatile String detail = "";
     static volatile String laptop = "";
     static volatile String notice = "";
+    /** Laptop playback volume 0..1.5, or -1 until the laptop reports it. */
+    static volatile double laptopVolume = -1;
+    static volatile boolean laptopMuted = false;
+    static volatile String[] laptopAddresses = new String[0];
 
     private static final CopyOnWriteArrayList<Listener> listeners = new CopyOnWriteArrayList<>();
     private static final Handler main = new Handler(Looper.getMainLooper());
@@ -30,6 +34,19 @@ final class StreamState {
     static void setNotice(String n) {
         notice = n == null ? "" : n;
         notifyListeners();
+    }
+
+    static void setLaptop(double volume, boolean muted, String[] addresses) {
+        laptopVolume = volume;
+        laptopMuted = muted;
+        if (addresses != null) laptopAddresses = addresses;
+        notifyListeners();
+    }
+
+    static void clearLaptop() {
+        laptopVolume = -1;
+        laptopMuted = false;
+        laptopAddresses = new String[0];
     }
 
     static boolean active() {

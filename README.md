@@ -48,8 +48,25 @@ Options:
 
 - **Silence this phone**: mutes the phone speaker while streaming and restores it when you stop or the connection drops. Some phones also mute the shared audio when the speaker is muted. Dhvani detects that after about 3 s of silence, puts the volume back, and tells you to turn the option off.
 - **Reconnect automatically**: retries with backoff if Wi-Fi drops or the laptop restarts.
+- **Start when opened**: opening Dhvani connects to the saved laptop right away.
 
-Stop it from the app or from the notification.
+The laptop and code are remembered, so you pair once. Android still shows the
+"allow sharing" prompt at every start; apps cannot skip it.
+
+While streaming, the app shows a **Laptop volume** slider and mute button that
+change the laptop's own output. The notification has **Stop** and **Mute laptop**.
+
+Add the **Dhvani** Quick Settings tile (edit the quick settings panel) to start
+or stop from anywhere.
+
+During long digital silence the phone sends only a short keepalive four times a
+second, so the Wi-Fi radio can rest. The laptop counts that as idle, not as
+network gaps.
+
+**USB cable:** turn on USB mode in the laptop panel with `adb` installed and USB
+debugging on. The phone then lists the laptop as "USB cable". Audio goes over the
+cable; stats and the volume controls still go over Wi-Fi, so keep the phone on
+the same network for those.
 
 ## Logs
 

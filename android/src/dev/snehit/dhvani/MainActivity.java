@@ -35,6 +35,7 @@ import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.RadioButton;
 import android.widget.ScrollView;
+import android.widget.SeekBar;
 import android.widget.Switch;
 import android.widget.TextView;
 
@@ -59,6 +60,9 @@ public final class MainActivity extends Activity implements StreamState.Listener
     private static final int REQ_PERMS = 1;
     private static final int REQ_PROJECTION = 2;
     private static final long LAPTOP_TTL_MS = 8000;
+    /** Set by the Quick Settings tile: start streaming as soon as the screen opens. */
+    static final String EXTRA_AUTOSTART = "autostart";
+    private static final String USB_HOST = "127.0.0.1";
 
     private SharedPreferences prefs;
     private final Handler main = new Handler(Looper.getMainLooper());
@@ -82,7 +86,13 @@ public final class MainActivity extends Activity implements StreamState.Listener
     private LinearLayout laptopList;
     private View fieldsDivider;
     private EditText addressField, codeField;
-    private Switch silenceSwitch, reconnectSwitch;
+    private Switch silenceSwitch, reconnectSwitch, autoSwitch;
+    private LinearLayout volumeCard;
+    private SeekBar volumeBar;
+    private TextView volumeValue;
+    private Button muteButton;
+    private boolean draggingVolume;
+    private long lastVolumeSent;
 
     // Discovery
     /** The live discovery thread; a stopped thread sees it changed and exits. */
@@ -104,6 +114,25 @@ public final class MainActivity extends Activity implements StreamState.Listener
         palette();
         getWindow().getDecorView().setBackgroundColor(surface);
         setContentView(buildUi());
+        boolean launcher = Intent.ACTION_MAIN.equals(getIntent().getAction());
+        if (state == null && (getIntent().getBooleanExtra(EXTRA_AUTOSTART, false)
+                || (launcher && prefs.getBoolean("autoConnect", false)))) {
+            main.post(this::autostart);
+        }
+    }
+
+    @Override protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        if (intent.getBooleanExtra(EXTRA_AUTOSTART, false)) main.post(this::autostart);
+    }
+
+    /** Starts with the saved laptop and code; without them, stays put so the user can fill them in. */
+    private void autostart() {
+        if (StreamState.active()) return;
+        if (addressField.getText().toString().trim().isEmpty()
+                || !codeField.getText().toString().trim().matches("\\d{6}")) return;
+        onStartStop();
     }
 
     @Override protected void onResume() {
@@ -409,6 +438,60 @@ public final class MainActivity extends Activity implements StreamState.Listener
         blp.topMargin = dp(20);
         hero.addView(startButton, blp);
 
+        // Laptop volume, while streaming
+        volumeCard = new LinearLayout(this);
+        volumeCard.setOrientation(LinearLayout.VERTICAL);
+        volumeCard.setBackground(shape(surfaceLow, 24));
+        volumeCard.setPadding(dp(20), dp(16), dp(12), dp(12));
+        LinearLayout.LayoutParams vclp = fullWidth();
+        vclp.topMargin = dp(12);
+        root.addView(volumeCard, vclp);
+        LinearLayout vhead = new LinearLayout(this);
+        vhead.setGravity(Gravity.CENTER_VERTICAL);
+        vhead.addView(text("Laptop volume", 16, onSurface, false),
+                new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+        volumeValue = text("", 14, onSurfaceVariant, false);
+        volumeValue.setFontFeatureSettings("tnum");
+        vhead.addView(volumeValue);
+        muteButton = new Button(this);
+        muteButton.setAllCaps(false);
+        muteButton.setStateListAnimator(null);
+        muteButton.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        muteButton.setOnClickListener(v -> sendControl(null, !StreamState.laptopMuted));
+        LinearLayout.LayoutParams mlp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(40));
+        mlp.leftMargin = dp(12);
+        vhead.addView(muteButton, mlp);
+        volumeCard.addView(vhead);
+        volumeBar = new SeekBar(this);
+        volumeBar.setMax(150);
+        volumeBar.setContentDescription("Laptop volume");
+        volumeBar.setProgressTintList(ColorStateList.valueOf(primary));
+        volumeBar.setThumbTintList(ColorStateList.valueOf(primary));
+        volumeBar.setProgressBackgroundTintList(ColorStateList.valueOf(outlineVariant));
+        volumeBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override public void onProgressChanged(SeekBar b, int p, boolean user) {
+                if (!user) return;
+                volumeValue.setText(p + "%");
+                long now = System.currentTimeMillis();
+                if (now - lastVolumeSent >= 80) {
+                    lastVolumeSent = now;
+                    sendControl(p / 100f, null);
+                }
+            }
+            @Override public void onStartTrackingTouch(SeekBar b) { draggingVolume = true; }
+            @Override public void onStopTrackingTouch(SeekBar b) {
+                draggingVolume = false;
+                sendControl(b.getProgress() / 100f, null);
+            }
+        });
+        LinearLayout.LayoutParams vblp = fullWidth();
+        vblp.topMargin = dp(8);
+        volumeCard.addView(volumeBar, vblp);
+        TextView vnote = text("Changes the laptop's own output. Phone volume buttons still work too.",
+                12, onSurfaceVariant, false);
+        vnote.setPadding(0, dp(4), dp(8), 0);
+        volumeCard.addView(vnote);
+
         // Laptop
         LinearLayout lap = section(root, "Laptop");
         LinearLayout searchRow = new LinearLayout(this);
@@ -451,6 +534,9 @@ public final class MainActivity extends Activity implements StreamState.Listener
         reconnectSwitch = switchRow(opts, "Reconnect automatically",
                 "Keeps trying if Wi-Fi drops or the laptop restarts.",
                 prefs.getBoolean("reconnect", true));
+        autoSwitch = switchRow(opts, "Start when opened",
+                "Opening Dhvani connects to the saved laptop. Android still asks to allow sharing.",
+                prefs.getBoolean("autoConnect", false));
 
         TextView foot = text("Only playback audio is shared, never the microphone or the screen. "
                 + "Apps that block capture (some banking and DRM video apps) stay silent.", 12, onSurfaceVariant, false);
@@ -521,7 +607,22 @@ public final class MainActivity extends Activity implements StreamState.Listener
             startButton.setBackground(pressable(shape(primary, 28), onPrimary, 28));
             startButton.setTextColor(onPrimary);
         }
-        for (View v : new View[] {addressField, codeField, silenceSwitch, reconnectSwitch}) {
+        boolean showVolume = s == StreamState.Status.STREAMING && StreamState.laptopVolume >= 0;
+        volumeCard.setVisibility(showVolume ? View.VISIBLE : View.GONE);
+        if (showVolume) {
+            int pct = (int) Math.round(StreamState.laptopVolume * 100);
+            boolean muted = StreamState.laptopMuted;
+            if (!draggingVolume) {
+                volumeBar.setProgress(pct);
+                volumeValue.setText(muted ? "Muted" : pct + "%");
+            }
+            volumeBar.setAlpha(muted ? 0.5f : 1f);
+            muteButton.setText(muted ? "Unmute" : "Mute");
+            muteButton.setTextColor(muted ? onPrimary : onSecondaryContainer);
+            muteButton.setBackground(pressable(shape(muted ? primary : secondaryContainer, 20),
+                    muted ? onPrimary : onSecondaryContainer, 20));
+        }
+        for (View v : new View[] {addressField, codeField, silenceSwitch, reconnectSwitch, autoSwitch}) {
             v.setEnabled(!active);
             ((View) v.getParent()).setAlpha(active ? 0.38f : 1f);
         }
@@ -563,7 +664,8 @@ public final class MainActivity extends Activity implements StreamState.Listener
             name.setSingleLine(true);
             name.setEllipsize(android.text.TextUtils.TruncateAt.END);
             t.addView(name);
-            t.addView(text(addr, 14, selected ? onSecondaryContainer : onSurfaceVariant, false));
+            String shown = USB_HOST.equals(l.ip) ? "USB cable" : addr;
+            t.addView(text(shown, 14, selected ? onSecondaryContainer : onSurfaceVariant, false));
             row.addView(t, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
             RadioButton rb = new RadioButton(this);
             rb.setChecked(selected);
@@ -571,7 +673,7 @@ public final class MainActivity extends Activity implements StreamState.Listener
             rb.setFocusable(false);
             rb.setButtonTintList(ColorStateList.valueOf(selected ? primary : onSurfaceVariant));
             row.addView(rb);
-            row.setContentDescription(l.name + ", " + addr + (selected ? ", selected" : ""));
+            row.setContentDescription(l.name + ", " + shown + (selected ? ", selected" : ""));
             row.setOnClickListener(v -> {
                 if (StreamState.active()) return;
                 addressField.setText(addr);
@@ -592,7 +694,16 @@ public final class MainActivity extends Activity implements StreamState.Listener
                 .putString("code", codeField.getText().toString().trim())
                 .putBoolean("silence", silenceSwitch.isChecked())
                 .putBoolean("reconnect", reconnectSwitch.isChecked())
+                .putBoolean("autoConnect", autoSwitch.isChecked())
                 .apply();
+    }
+
+    private void sendControl(Float volume, Boolean muted) {
+        if (StreamState.status != StreamState.Status.STREAMING) return;
+        Intent i = new Intent(this, StreamService.class).setAction(StreamService.ACTION_CONTROL);
+        if (volume != null) i.putExtra(StreamService.EXTRA_VOLUME, volume.floatValue());
+        if (muted != null) i.putExtra(StreamService.EXTRA_MUTED, muted.booleanValue());
+        try { startService(i); } catch (RuntimeException ignored) {}
     }
 
     private void showError(String msg) {
@@ -707,6 +818,29 @@ public final class MainActivity extends Activity implements StreamState.Listener
         return out;
     }
 
+    /**
+     * With a cable and the laptop's USB mode on, adb reverse forwards 127.0.0.1:47800 to the laptop.
+     * Ask it the discovery question over TCP; no listener there fails at once.
+     */
+    private void probeUsb() {
+        try (java.net.Socket s = new java.net.Socket()) {
+            s.connect(new java.net.InetSocketAddress(USB_HOST, Protocol.AUDIO_PORT), 300);
+            s.setSoTimeout(600);
+            s.getOutputStream().write((Protocol.DISCOVER + "\n").getBytes(StandardCharsets.UTF_8));
+            java.io.InputStream in = s.getInputStream();
+            StringBuilder sb = new StringBuilder();
+            int c;
+            while (sb.length() < 512 && (c = in.read()) >= 0 && c != '\n') sb.append((char) c);
+            Object[] r = Protocol.parseDiscoverReply(sb.toString());
+            if (r == null) return;
+            boolean fresh = !laptops.containsKey(USB_HOST);
+            laptops.put(USB_HOST, new Laptop(USB_HOST, (String) r[0], Protocol.AUDIO_PORT, System.currentTimeMillis()));
+            if (fresh) main.post(this::renderLaptops);
+        } catch (Exception ignored) {
+            // No cable, USB mode off, or the laptop is not running.
+        }
+    }
+
     private void discoverLoop() {
         byte[] probe = Protocol.DISCOVER.getBytes(StandardCharsets.UTF_8);
         byte[] buf = new byte[512];
@@ -723,6 +857,7 @@ public final class MainActivity extends Activity implements StreamState.Listener
                             sock.send(new DatagramPacket(probe, probe.length, t, Protocol.DISCOVERY_PORT));
                         } catch (Exception ignored) {}
                     }
+                    probeUsb();
                     nextProbe = now + 2000;
                 }
                 try {
