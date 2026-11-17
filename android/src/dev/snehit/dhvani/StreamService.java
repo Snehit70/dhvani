@@ -314,6 +314,7 @@ public final class StreamService extends Service {
             o.put("stalls", stalls);
             o.put("reconnects", reconnects);
             o.put("silenced", savedVolume >= 0);
+            o.put("musicActive", audio.isMusicActive());
             o.put("sdk", Build.VERSION.SDK_INT);
             o.put("model", Build.MODEL);
             o.put("app", Protocol.APP_VERSION);
