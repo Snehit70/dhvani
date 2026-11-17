@@ -15,7 +15,9 @@ const factory: PlayerFactory = (opts) => {
     data: [],
     opts,
     get closed() { return closed; },
-    write(pcm) { p.data.push(...pcm); return true; },
+    write(pcm) { p.data.push(...pcm); return "ok" as const; },
+    leadMs: 0,
+    underruns: 0,
     close() { closed = true; },
   };
   players.push(p);

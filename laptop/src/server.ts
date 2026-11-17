@@ -2,7 +2,9 @@ import net from "node:net";
 import dgram from "node:dgram";
 import type { Config } from "./config";
 import { FrameAligner, processPcm } from "./audio";
+import { log } from "./log";
 import type { Player, PlayerFactory } from "./player";
+import { StreamStats } from "./stats";
 import {
   FailureLimiter,
   MAX_HELLO_BYTES,
@@ -11,6 +13,7 @@ import {
   encodeReply,
   isDiscoverRequest,
   parseHello,
+  parsePhoneStats,
   type Hello,
 } from "./protocol";
 
@@ -32,6 +35,9 @@ export type ServerHooks = {
 
 const LEVEL_INTERVAL_MS = 66;
 const RESPAWN_INTERVAL_MS = 1000;
+export const STATS_INTERVAL_MS = 10_000;
+
+export type EndReason = "phone_closed" | "socket_error" | "replaced" | "disconnected" | "code_changed" | "shutdown";
 
 type Active = {
   session: Session;
@@ -39,6 +45,14 @@ type Active = {
   hello: Hello;
   player: Player | null;
   lastSpawn: number;
+  stats: StreamStats;
+  statsTimer: ReturnType<typeof setInterval>;
+  totalBytes: number;
+  totalDrops: number;
+  /** Underruns from players that already exited, plus the live player's count. */
+  pastUnderruns: number;
+  reportedUnderruns: number;
+  socketError: string;
 };
 
 export class AudioServer {
@@ -78,7 +92,11 @@ export class AudioServer {
     const udp = dgram.createSocket({ type: "udp4", reuseAddr: true });
     this.udp = udp;
     udp.on("message", (msg, rinfo) => {
-      if (msg.length > 512 || !isDiscoverRequest(msg.toString())) return;
+      if (msg.length > 1024) return;
+      const text = msg.toString();
+      const stats = parsePhoneStats(text);
+      if (stats) return this.phoneStats(stats, rinfo.address);
+      if (msg.length > 512 || !isDiscoverRequest(text)) return;
       const reply = Buffer.from(discoverReply(this.getConfig().name, audioPort));
       udp.send(reply, rinfo.port, rinfo.address);
     });
@@ -91,7 +109,7 @@ export class AudioServer {
   }
 
   close(): void {
-    this.disconnect();
+    this.disconnect("shutdown");
     this.tcp?.close();
     this.udp?.close();
     this.listening = false;
@@ -99,16 +117,15 @@ export class AudioServer {
   }
 
   /** Ends the current phone session, if any. */
-  disconnect(): void {
+  disconnect(reason: EndReason = "disconnected"): void {
     this.active?.socket.destroy();
-    this.endActive();
+    this.endActive(reason);
   }
 
   /** Re-opens playback, e.g. after the output device changed. */
   restartPlayer(): void {
     if (!this.active) return;
-    this.active.player?.close();
-    this.active.player = null;
+    this.retirePlayer(this.active);
     this.active.lastSpawn = 0;
   }
 
@@ -124,10 +141,14 @@ export class AudioServer {
     let buf = Buffer.alloc(0);
     let done = false;
 
-    const timer = setTimeout(() => socket.destroy(), this.helloTimeoutMs);
+    const timer = setTimeout(() => {
+      log("hello_rejected", { address, error: "timeout" });
+      socket.destroy();
+    }, this.helloTimeoutMs);
     const reject = (error: Parameters<typeof encodeReply>[0]) => {
       done = true;
       clearTimeout(timer);
+      if (!error.ok) log("hello_rejected", { address, error: error.error });
       socket.end(encodeReply(error));
     };
 
@@ -139,12 +160,14 @@ export class AudioServer {
         if (buf.length > MAX_HELLO_BYTES) {
           done = true;
           clearTimeout(timer);
+          log("hello_rejected", { address, error: "too_long" });
           socket.destroy();
         }
         return;
       }
       if (nl > MAX_HELLO_BYTES) {
         done = true;
+        log("hello_rejected", { address, error: "too_long" });
         clearTimeout(timer);
         socket.destroy();
         return;
@@ -174,7 +197,7 @@ export class AudioServer {
     // Latest phone wins: a new session replaces the old one.
     if (this.active) {
       this.active.socket.destroy();
-      this.endActive();
+      this.endActive("replaced");
     }
     const session: Session = {
       id: this.nextId++,
@@ -184,8 +207,19 @@ export class AudioServer {
       rate: hello.rate,
       channels: hello.channels,
     };
-    const active: Active = { session, socket, hello, player: null, lastSpawn: 0 };
+    const bytesPerSec = hello.rate * hello.channels * 2;
+    const active: Active = {
+      session, socket, hello, player: null, lastSpawn: 0,
+      stats: new StreamStats(),
+      statsTimer: setInterval(() => this.flushStats(active, bytesPerSec), STATS_INTERVAL_MS),
+      totalBytes: 0, totalDrops: 0, pastUnderruns: 0, reportedUnderruns: 0, socketError: "",
+    };
+    active.statsTimer.unref?.();
     this.active = active;
+    log("session_start", {
+      session: session.id, device: session.device, address, rate: hello.rate, channels: hello.channels,
+      sink: this.getConfig().sink || "default", volume: this.getConfig().volume, muted: this.getConfig().muted,
+    });
     this.session = session;
     this.drops = 0;
     this.lastError = "";
@@ -194,17 +228,30 @@ export class AudioServer {
     const aligner = new FrameAligner(2 * hello.channels);
     const onAudio = (chunk: Uint8Array) => {
       if (this.active !== active) return;
+      active.stats.arrival(chunk.length);
+      active.totalBytes += chunk.length;
       const frames = aligner.push(chunk);
       if (!frames.length) return;
       const player = this.ensurePlayer(active);
       const cfg = this.getConfig();
       const { out, peak } = processPcm(frames, cfg.muted ? 0 : cfg.volume);
-      if (player && !player.write(out)) this.drops++;
+      const result = player ? player.write(out) : "closed";
+      if (result !== "ok") {
+        this.drops++;
+        active.totalDrops++;
+        if (result === "late") active.stats.dropLate++;
+        else if (result === "stalled") active.stats.dropStalled++;
+        else active.stats.dropNoPlayer++;
+      }
+      active.stats.chunk(peak, player?.leadMs ?? 0);
       this.reportLevel(peak);
     };
     socket.on("data", onAudio);
+    socket.on("error", (e) => {
+      active.socketError = e.message;
+    });
     socket.on("close", () => {
-      if (this.active === active) this.endActive();
+      if (this.active === active) this.endActive(active.socketError ? "socket_error" : "phone_closed");
     });
     this.hooks.onChange();
     if (rest.length) onAudio(rest);
@@ -215,13 +262,46 @@ export class AudioServer {
     const now = Date.now();
     if (now - active.lastSpawn < RESPAWN_INTERVAL_MS) return null;
     active.lastSpawn = now;
-    active.player = this.makePlayer(
-      { rate: active.hello.rate, channels: active.hello.channels, sink: this.getConfig().sink },
+    if (active.player) this.retirePlayer(active);
+    const sink = this.getConfig().sink;
+    log("player_start", { session: active.session.id, sink: sink || "default" });
+    const player = this.makePlayer(
+      { rate: active.hello.rate, channels: active.hello.channels, sink },
       (reason) => {
-        if (this.active === active && active.player?.closed) this.fail(reason);
+        log("player_exit", { session: active.session.id, reason });
+        if (this.active === active && active.player === player) this.fail(reason);
       },
     );
-    return active.player;
+    active.player = player;
+    return player;
+  }
+
+  private retirePlayer(active: Active) {
+    if (!active.player) return;
+    active.pastUnderruns += active.player.underruns;
+    active.player.close();
+    active.player = null;
+  }
+
+  private underruns(active: Active) {
+    return active.pastUnderruns + (active.player?.underruns ?? 0);
+  }
+
+  private flushStats(active: Active, bytesPerSec: number) {
+    const u = this.underruns(active);
+    log("session_stats", {
+      session: active.session.id,
+      ...active.stats.flush(bytesPerSec),
+      underruns: u - active.reportedUnderruns,
+    });
+    active.reportedUnderruns = u;
+  }
+
+  private phoneStats(s: { code: string; fields: Record<string, unknown> }, address: string) {
+    const a = this.active;
+    // Only the phone that is currently streaming, with the right code, gets logged.
+    if (!a || a.session.address !== address || !codesMatch(s.code, this.getConfig().code)) return;
+    log("phone_stats", { session: a.session.id, ...s.fields });
   }
 
   private reportLevel(peak: number) {
@@ -234,12 +314,23 @@ export class AudioServer {
     }
   }
 
-  private endActive() {
+  private endActive(reason: EndReason) {
     const a = this.active;
     if (!a) return;
     this.active = null;
     this.session = null;
-    a.player?.close();
+    clearInterval(a.statsTimer);
+    this.flushStats(a, a.hello.rate * a.hello.channels * 2);
+    log("session_end", {
+      session: a.session.id,
+      reason,
+      error: a.socketError || undefined,
+      durationS: Math.round((Date.now() - a.session.since) / 100) / 10,
+      mb: Math.round(a.totalBytes / 1e4) / 100,
+      drops: a.totalDrops,
+      underruns: this.underruns(a),
+    });
+    this.retirePlayer(a);
     this.hooks.onLevel(0);
     this.hooks.onChange();
   }

@@ -51,6 +51,26 @@ Options:
 
 Stop it from the app or from the notification.
 
+## Logs
+
+Every session is logged as JSON lines to `~/.local/state/dhvani/events.jsonl`
+(rotates at 5 MB) and to the journal (`journalctl --user -u dhvani`).
+
+```sh
+dhvani report        # last 10 sessions: drops, Wi-Fi gaps, phone signal, why it ended
+dhvani report 50
+jq 'select(.ev=="session_stats")' ~/.local/state/dhvani/events.jsonl
+```
+
+Events: `start`, `stop`, `firewall`, `settings`, `hello_rejected`, `session_start`,
+`session_stats` (every 10 s: arrival gaps p50/p95/max, rate vs real time, drops
+by cause, queued lead, underruns, peak, silence %), `phone_stats` (every 10 s
+from the phone: socket write/read stalls, watchdog trips, reconnects, Wi-Fi
+RSSI/link speed/band), `player_start`, `player_exit`, `session_end` (reason,
+duration, totals). The pairing code is never logged.
+
+On the phone: `adb logcat -s Dhvani`.
+
 ## Limits
 
 - Apps that opt out of capture (some banking and DRM video apps) and calls are not shared. That is Android policy.

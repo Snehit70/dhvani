@@ -125,3 +125,30 @@ export class FailureLimiter {
     this.entries.delete(addr);
   }
 }
+
+/**
+ * Phone-side health report sent over UDP while streaming. Returns the code it
+ * claims plus only plain numeric/boolean/short-string fields, so a stray packet
+ * cannot inject arbitrary structures into the log.
+ */
+export function parsePhoneStats(msg: string): { code: string; fields: Record<string, number | boolean | string> } | null {
+  let o: unknown;
+  try {
+    o = JSON.parse(msg);
+  } catch {
+    return null;
+  }
+  if (!o || typeof o !== "object") return null;
+  const r = o as Record<string, unknown>;
+  if (r.dhvani !== "stats" || typeof r.code !== "string") return null;
+  const fields: Record<string, number | boolean | string> = {};
+  let n = 0;
+  for (const [k, v] of Object.entries(r)) {
+    if (k === "dhvani" || k === "code" || k === "v" || !/^[a-zA-Z][a-zA-Z0-9]{0,23}$/.test(k)) continue;
+    if (++n > 32) break;
+    if (typeof v === "number" && Number.isFinite(v)) fields[k] = v;
+    else if (typeof v === "boolean") fields[k] = v;
+    else if (typeof v === "string") fields[k] = v.slice(0, 64);
+  }
+  return { code: r.code, fields };
+}

@@ -56,6 +56,8 @@ export class FrameAligner {
 export class LeadLimiter {
   private anchor = -1;
   private writtenMs = 0;
+  /** Times the player ran dry (audible gap) since creation. */
+  underruns = 0;
   constructor(
     private bytesPerMs: number,
     private maxLeadMs = 80,
@@ -67,6 +69,7 @@ export class LeadLimiter {
   admit(bytes: number): boolean {
     const t = this.now();
     if (this.anchor < 0 || this.lead(t) < -this.underrunMs) {
+      if (this.anchor >= 0) this.underruns++;
       this.anchor = t;
       this.writtenMs = 0;
     }

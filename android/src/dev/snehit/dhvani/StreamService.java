@@ -17,6 +17,9 @@ import android.media.projection.MediaProjection;
 import android.media.projection.MediaProjectionManager;
 import android.net.wifi.WifiManager;
 import android.os.SystemClock;
+import android.util.Log;
+
+import org.json.JSONObject;
 import android.os.Build;
 import android.os.Handler;
 import android.os.IBinder;
@@ -26,6 +29,8 @@ import android.os.Process;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
@@ -56,16 +61,25 @@ public final class StreamService extends Service {
     private static final long WRITE_STALL_MS = 3000;
     private static final String STATE_PREFS = "dhvani_state";
     private static final String KEY_SAVED_VOLUME = "savedVolume";
+    private static final String TAG = "Dhvani";
+    private static final long STATS_INTERVAL_MS = 10_000;
 
     private final Handler main = new Handler(Looper.getMainLooper());
     /** Uptime when the current socket write began, 0 when no write is in flight. */
     private volatile long writeStartedAt;
+    /** Times the watchdog killed a stuck connection this run. */
+    private volatile int stalls;
+    private int reconnects;
     private WifiManager.WifiLock wifiLock;
     private final Runnable watchdog = new Runnable() {
         @Override public void run() {
             if (!running) return;
             long t = writeStartedAt;
-            if (t != 0 && SystemClock.uptimeMillis() - t > WRITE_STALL_MS) closeQuietly(socket);
+            if (t != 0 && SystemClock.uptimeMillis() - t > WRITE_STALL_MS) {
+                stalls++;
+                Log.w(TAG, "write stuck " + (SystemClock.uptimeMillis() - t) + " ms, dropping connection");
+                closeQuietly(socket);
+            }
             main.postDelayed(this, 1000);
         }
     };
@@ -142,6 +156,10 @@ public final class StreamService extends Service {
         }
 
         running = true;
+        stalls = 0;
+        reconnects = 0;
+        Log.i(TAG, "start host=" + host + ":" + port + " silence=" + silence + " reconnect=" + reconnect
+                + " sdk=" + Build.VERSION.SDK_INT + " model=" + Build.MODEL);
         StreamState.setNotice("");
         acquireWifiLock();
         worker = new Thread(this::runLoop, "dhvani-stream");
@@ -197,6 +215,7 @@ public final class StreamService extends Service {
             // stopCapture may have closed the previous socket just before this one was published.
             if (!running) { closeQuietly(s); break; }
             boolean streamed = false;
+            DatagramSocket statsSock = null;
             try {
                 s.setTcpNoDelay(true);
                 s.setSendBufferSize(CHUNK_BYTES * 8);
@@ -208,9 +227,11 @@ public final class StreamService extends Service {
                 Protocol.Reply reply = Protocol.parseReply(readLine(s.getInputStream()));
                 if (!reply.ok) {
                     if (!running) break;
+                    Log.w(TAG, "laptop refused: " + reply.error);
                     stopFromWorker(Protocol.errorMessage(reply.error));
                     return;
                 }
+                Log.i(TAG, "streaming to " + reply.name);
                 s.setSoTimeout(0);
                 rec.startRecording();
                 silencePhone();
@@ -218,17 +239,36 @@ public final class StreamService extends Service {
                 backoff = 1000;
                 update(StreamState.Status.STREAMING, reply.name);
                 int zeroMs = 0;
+                long nextStats = SystemClock.uptimeMillis() + STATS_INTERVAL_MS;
+                long readMax = 0, writeMax = 0;
+                int slowWrites = 0, slowReads = 0;
+                try { statsSock = new DatagramSocket(); } catch (IOException ignored) {}
                 while (running) {
+                    long r0 = SystemClock.uptimeMillis();
                     int n = rec.read(buf, 0, buf.length);
+                    long readMs = SystemClock.uptimeMillis() - r0;
+                    if (readMs > readMax) readMax = readMs;
+                    if (readMs > 50) slowReads++;
                     if (n < 0) throw new IOException("capture error " + n);
                     if (n == 0) continue;
-                    writeStartedAt = SystemClock.uptimeMillis();
+                    long w0 = SystemClock.uptimeMillis();
+                    writeStartedAt = w0;
                     out.write(buf, 0, n);
                     writeStartedAt = 0;
+                    long writeMs = SystemClock.uptimeMillis() - w0;
+                    if (writeMs > writeMax) writeMax = writeMs;
+                    if (writeMs > 20) slowWrites++;
+                    if (SystemClock.uptimeMillis() >= nextStats) {
+                        sendStats(statsSock, s, readMax, writeMax, slowReads, slowWrites);
+                        readMax = writeMax = 0;
+                        slowReads = slowWrites = 0;
+                        nextStats = SystemClock.uptimeMillis() + STATS_INTERVAL_MS;
+                    }
                     if (savedVolume >= 0 && !silenceBroken) {
                         zeroMs = allZero(buf, n) && audio.isMusicActive() ? zeroMs + CHUNK_MS : 0;
                         if (zeroMs >= SILENCE_PROBE_MS) {
                             silenceBroken = true;
+                            Log.w(TAG, "capture is silent while muted; un-silencing phone");
                             restoreVolume();
                             StreamState.setNotice("This phone mutes the shared audio too, so it keeps "
                                     + "playing out loud. Turn off \"Silence this phone\".");
@@ -237,14 +277,17 @@ public final class StreamService extends Service {
                 }
             } catch (IOException | RuntimeException e) {
                 if (!running) break;
+                Log.w(TAG, (streamed ? "connection lost: " : "connect failed: ") + e);
                 if (!reconnect) {
                     stopFromWorker(streamed ? "Connection to the laptop was lost." : friendly(e));
                     return;
                 }
+                reconnects++;
                 update(StreamState.Status.RECONNECTING, streamed
                         ? "Connection lost. Retrying…" : friendly(e) + " Retrying…");
             } finally {
                 writeStartedAt = 0;
+                if (statsSock != null) statsSock.close();
                 closeQuietly(s);
                 try { rec.stop(); } catch (RuntimeException ignored) {}
                 // While the laptop is away the phone plays on its own speaker again.
@@ -257,6 +300,37 @@ public final class StreamService extends Service {
             }
             backoff = Math.min(backoff * 2, 8000);
         }
+    }
+
+    /** Best effort: a lost packet only loses one sample of diagnostics. */
+    private void sendStats(DatagramSocket sock, Socket s, long readMax, long writeMax, int slowReads, int slowWrites) {
+        if (sock == null) return;
+        try {
+            JSONObject o = new JSONObject();
+            o.put("readMaxMs", readMax);
+            o.put("writeMaxMs", writeMax);
+            o.put("slowReads", slowReads);
+            o.put("slowWrites", slowWrites);
+            o.put("stalls", stalls);
+            o.put("reconnects", reconnects);
+            o.put("silenced", savedVolume >= 0);
+            o.put("sdk", Build.VERSION.SDK_INT);
+            o.put("model", Build.MODEL);
+            o.put("app", Protocol.APP_VERSION);
+            WifiManager wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+            if (wm != null) {
+                @SuppressWarnings("deprecation")
+                android.net.wifi.WifiInfo wi = wm.getConnectionInfo();
+                if (wi != null && wi.getRssi() > -127) {
+                    o.put("rssi", wi.getRssi());
+                    o.put("linkMbps", wi.getLinkSpeed());
+                    o.put("freqMHz", wi.getFrequency());
+                }
+            }
+            byte[] b = Protocol.stats(code, o).getBytes(StandardCharsets.UTF_8);
+            sock.send(new DatagramPacket(b, b.length, s.getInetAddress(), Protocol.DISCOVERY_PORT));
+            Log.d(TAG, "stats " + o);
+        } catch (Exception ignored) {}
     }
 
     private static boolean allZero(byte[] b, int n) {

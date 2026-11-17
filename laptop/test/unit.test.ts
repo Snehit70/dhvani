@@ -1,7 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { FrameAligner, LeadLimiter, processPcm } from "../src/audio";
 import { sanitize, defaults } from "../src/config";
-import { FailureLimiter, codesMatch, isDiscoverRequest, parseHello } from "../src/protocol";
+import { FailureLimiter, codesMatch, isDiscoverRequest, parseHello, parsePhoneStats } from "../src/protocol";
+import { StreamStats } from "../src/stats";
 
 const hello = (o: Record<string, unknown> = {}) =>
   JSON.stringify({ v: 1, code: "123456", device: "Pixel", rate: 48000, channels: 2, format: "s16le", ...o });
@@ -98,4 +99,31 @@ test("LeadLimiter drops bursts beyond the lead and re-anchors after underruns", 
   t += 500;
   expect(l.admit(10)).toBe(true);
   expect(l.lead()).toBeCloseTo(10);
+});
+
+test("StreamStats summarises arrival gaps, rate and drops per window", () => {
+  let t = 0;
+  const s = new StreamStats(() => t);
+  for (let i = 0; i < 100; i++) { t += 10; s.arrival(1920); s.chunk(i % 2 ? 0.5 : 0, 20); }
+  t += 150; s.arrival(1920); s.chunk(0.9, 60); // one Wi-Fi hiccup
+  s.dropLate = 2;
+  const w = s.flush(192_000);
+  expect(w.gapMaxMs).toBe(150);
+  expect(w.gaps100).toBe(1);
+  expect(w.gapP50Ms).toBe(10);
+  expect(w.ratePct).toBeCloseTo(87.8, 0); // 101 chunks in 1.15 s
+  expect(w.dropLate).toBe(2);
+  expect(w.leadMaxMs).toBe(60);
+  expect(w.peakMax).toBe(0.9);
+  expect(w.silentPct).toBeCloseTo(49.5, 0);
+  expect(s.flush(192_000).gapMaxMs).toBe(0); // window resets
+});
+
+test("parsePhoneStats keeps only flat, bounded fields", () => {
+  const r = parsePhoneStats(JSON.stringify({ dhvani: "stats", v: 1, code: "123456", rssi: -60, ok: true,
+    model: "x".repeat(100), nested: { a: 1 }, "bad key": 1, inf: "y" }));
+  expect(r?.code).toBe("123456");
+  expect(r?.fields).toEqual({ rssi: -60, ok: true, model: "x".repeat(64), inf: "y" });
+  expect(parsePhoneStats('{"dhvani":"discover"}')).toBeNull();
+  expect(parsePhoneStats("nope")).toBeNull();
 });

@@ -10,6 +10,7 @@ final class Protocol {
     static final int DISCOVERY_PORT = 47802;
     static final int RATE = 48000;
     static final int CHANNELS = 2;
+    static final String APP_VERSION = "0.1.0";
 
     private Protocol() {}
 
@@ -57,6 +58,18 @@ final class Protocol {
             case "bad_version": return "The laptop runs a different Dhvani version. Update both.";
             case "bad_format": return "The laptop rejected the audio format. Update both apps.";
             default: return "The laptop refused the connection (" + error + ").";
+        }
+    }
+
+    /** Phone health report, sent over UDP to the discovery port while streaming. */
+    static String stats(String code, JSONObject fields) {
+        try {
+            fields.put("dhvani", "stats");
+            fields.put("v", VERSION);
+            fields.put("code", code);
+            return fields.toString();
+        } catch (JSONException e) {
+            throw new IllegalStateException(e);
         }
     }
 

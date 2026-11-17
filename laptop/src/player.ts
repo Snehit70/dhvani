@@ -3,11 +3,17 @@ import { LeadLimiter } from "./audio";
 
 export type PlayerOptions = { rate: number; channels: number; sink: string };
 
+/** ok = queued; late = dropped, too far ahead of real time; stalled = pw-cat not reading. */
+export type WriteResult = "ok" | "late" | "stalled" | "closed";
+
 export interface Player {
-  /** Queues PCM. Returns false if dropped because playback is behind. */
-  write(pcm: Uint8Array): boolean;
+  write(pcm: Uint8Array): WriteResult;
   close(): void;
   readonly closed: boolean;
+  /** Audio queued ahead of real time, ms. */
+  readonly leadMs: number;
+  /** Times playback ran dry since this player started. */
+  readonly underruns: number;
 }
 
 export type PlayerFactory = (
@@ -62,12 +68,18 @@ export const pwCatPlayer: PlayerFactory = (opts, onExit) => {
     get closed() {
       return closed;
     },
+    get leadMs() {
+      return lead.lead();
+    },
+    get underruns() {
+      return lead.underruns;
+    },
     write(pcm) {
-      if (closed) return false;
-      if (child.stdin.writableLength > maxBacklog) return false;
-      if (!lead.admit(pcm.length)) return false;
+      if (closed) return "closed";
+      if (child.stdin.writableLength > maxBacklog) return "stalled";
+      if (!lead.admit(pcm.length)) return "late";
       child.stdin.write(pcm);
-      return true;
+      return "ok";
     },
     close() {
       if (closed) return;

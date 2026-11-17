@@ -1,6 +1,8 @@
 import { execFile } from "node:child_process";
 import { networkInterfaces } from "node:os";
 import { loadConfig, newCode, sanitize, saveConfig, type Config } from "./config";
+import { LOG_FILE, log } from "./log";
+import { report } from "./report";
 import { listSinks, pwCatPlayer } from "./player";
 import { AUDIO_PORT, DISCOVERY_PORT, UI_PORT } from "./protocol";
 import { AudioServer } from "./server";
@@ -52,7 +54,7 @@ async function zoneAllows(zone: string, port: number, proto: string): Promise<bo
 }
 
 async function checkFirewall() {
-  if ((await run("firewall-cmd", ["--state"])).code !== 0) return void (firewall = "unknown");
+  if ((await run("firewall-cmd", ["--state"])).code !== 0) return void setFirewall("unknown");
   // Check the zone each LAN interface actually sits in, not just the default zone.
   const zones = new Set<string>();
   for (const { iface } of addresses()) {
@@ -61,18 +63,23 @@ async function checkFirewall() {
   }
   if (zones.size === 0) {
     const d = await run("firewall-cmd", ["--get-default-zone"]);
-    if (d.code !== 0 || !d.out) return void (firewall = "unknown");
+    if (d.code !== 0 || !d.out) return void setFirewall("unknown");
     zones.add(d.out);
   }
   let open = true;
   for (const zone of zones) {
     for (const [port, proto] of [[AUDIO_PORT, "tcp"], [DISCOVERY_PORT, "udp"]] as const) {
       const ok = await zoneAllows(zone, port, proto);
-      if (ok === null) return void (firewall = "unknown");
+      if (ok === null) return void setFirewall("unknown");
       if (!ok) open = false;
     }
   }
-  firewall = open ? "open" : "blocked";
+  setFirewall(open ? "open" : "blocked");
+}
+
+function setFirewall(next: typeof firewall) {
+  if (next !== firewall) log("firewall", { state: next });
+  firewall = next;
 }
 
 let ui: WebUI;
@@ -121,10 +128,14 @@ async function state() {
 function apply(next: Config) {
   const sinkChanged = next.sink !== config.sink;
   const codeChanged = next.code !== config.code;
+  const changed: Record<string, unknown> = {};
+  for (const k of ["sink", "volume", "muted", "name"] as const) if (next[k] !== config[k]) changed[k] = next[k];
+  if (codeChanged) changed.code = "changed"; // never log the code itself
   config = next;
   saveConfig(config);
+  if (Object.keys(changed).length) log("settings", changed);
   if (sinkChanged) server.restartPlayer();
-  if (codeChanged) server.disconnect();
+  if (codeChanged) server.disconnect("code_changed");
 }
 
 ui = new WebUI({
@@ -138,7 +149,7 @@ ui = new WebUI({
     apply({ ...config, code: newCode() });
   },
   disconnect() {
-    server.disconnect();
+    server.disconnect("disconnected");
   },
 });
 
@@ -147,6 +158,18 @@ async function main() {
     console.log(VERSION);
     return;
   }
+  if (process.argv[2] === "report") {
+    report(LOG_FILE, process.argv.slice(3));
+    return;
+  }
+  // Logged before listening: a phone may reconnect the instant the port opens,
+  // and `dhvani report` treats "start" as the boundary where session ids restart.
+  log("start", {
+    version: VERSION,
+    addresses: addresses().map((a) => `${a.iface}=${a.address}`),
+    sink: config.sink || "default",
+    volume: config.volume,
+  });
   try {
     await server.listen(AUDIO_PORT);
   } catch (e) {
@@ -168,8 +191,10 @@ async function main() {
   console.log(`Dhvani ${VERSION} listening on TCP ${AUDIO_PORT}, panel http://127.0.0.1:${UI_PORT}`);
   console.log(`Pairing code ${config.code}. Addresses: ${addresses().map((a) => a.address).join(", ") || "none"}`);
 
+
   const stop = () => {
     server.close();
+    log("stop");
     ui.close();
     process.exit(0);
   };
