@@ -743,7 +743,7 @@ function renderKpis() {
     const n = p.rssi >= -55 ? 4 : p.rssi >= -67 ? 3 : p.rssi >= -75 ? 2 : 1;
     [...$("k-bars").children].forEach((b, i) => b.classList.toggle("on", i < n));
   } else { setV("k-wifi", "–"); $("k-wifi-s").textContent = /(^|:)127\./.test(s.session.address || "") ? "USB cable" : "Waiting for the phone"; }
-  if (last) { setV("k-rate", last.kbps, " kbps"); $("k-rate-s").textContent = `${Math.round(last.kbps / expectedKbps() * 100)}% of real time`; }
+  if (last) { setV("k-rate", last.kbps, " kbps"); $("k-rate-s").textContent = last.idle && last.kbps < expectedKbps() * 0.5 ? "Phone idle during silence" : `${Math.round(last.kbps / expectedKbps() * 100)}% of real time`; }
   const ur = last?.underruns ?? 0;
   setV("k-drop", ur, ur === 1 ? " gap" : " gaps");
   $("k-drop-s").textContent = `${s.drops} chunks skipped`;

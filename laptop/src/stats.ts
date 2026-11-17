@@ -1,3 +1,6 @@
+/** A gap this long after an all-zero chunk is the phone idling, not the network. */
+export const IDLE_GAP_MS = 60;
+
 /** Per-window stream health counters, flushed to the log every few seconds. */
 export class StreamStats {
   bytes = 0;
@@ -11,6 +14,9 @@ export class StreamStats {
   gaps100 = 0;
   leadMaxMs = 0;
   peakMax = 0;
+  /** Time the phone held back data during silence (battery saver), excluded from gaps and rate. */
+  idleMs = 0;
+  private lastSilent = false;
   private gaps: number[] = [];
   private lastAt = 0;
   private windowStart: number;
@@ -22,8 +28,11 @@ export class StreamStats {
   /** Called for every TCP data event, before processing. */
   arrival(bytes: number) {
     const t = this.now();
-    if (this.lastAt) {
-      const gap = t - this.lastAt;
+    const gap = this.lastAt ? t - this.lastAt : 0;
+    if (this.lastSilent && gap > IDLE_GAP_MS) {
+      // After an all-zero chunk the phone may pause sending on purpose; not a network gap.
+      this.idleMs += gap;
+    } else if (this.lastAt) {
       this.gaps.push(gap);
       if (gap > this.gapMaxMs) this.gapMaxMs = gap;
       if (gap > 50) this.gaps50++;
@@ -33,9 +42,11 @@ export class StreamStats {
     this.bytes += bytes;
   }
 
-  chunk(peak: number, leadMs: number) {
+  /** `silent`: the incoming chunk was all zeros (before laptop volume). */
+  chunk(peak: number, leadMs: number, silent = peak === 0) {
     this.chunks++;
-    if (peak === 0) this.silentChunks++;
+    if (silent) this.silentChunks++;
+    this.lastSilent = silent;
     if (peak > this.peakMax) this.peakMax = peak;
     if (leadMs > this.leadMaxMs) this.leadMaxMs = leadMs;
   }
@@ -44,13 +55,16 @@ export class StreamStats {
   flush(bytesPerSec: number): Record<string, number> {
     const t = this.now();
     const secs = Math.max(0.001, (t - this.windowStart) / 1000);
+    const activeSecs = secs - this.idleMs / 1000;
     const sorted = this.gaps.sort((a, b) => a - b);
     const pct = (p: number) => (sorted.length ? sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * p))]! : 0);
     const r = (n: number) => Math.round(n * 10) / 10;
     const out = {
       secs: r(secs),
       // 100 = data arrived exactly at the audio rate.
-      ratePct: r((this.bytes / secs / bytesPerSec) * 100),
+      // Measured only over time the phone was sending; mostly-idle windows read as on time.
+      ratePct: activeSecs < 1 ? 100 : r((this.bytes / activeSecs / bytesPerSec) * 100),
+      idlePct: r(Math.min(100, (this.idleMs / 1000 / secs) * 100)),
       gapP50Ms: r(pct(0.5)),
       gapP95Ms: r(pct(0.95)),
       gapMaxMs: r(this.gapMaxMs),
@@ -63,7 +77,7 @@ export class StreamStats {
       peakMax: Math.round(this.peakMax * 1000) / 1000,
       silentPct: this.chunks ? r((this.silentChunks / this.chunks) * 100) : 0,
     };
-    this.bytes = this.chunks = this.silentChunks = 0;
+    this.bytes = this.chunks = this.silentChunks = this.idleMs = 0;
     this.dropLate = this.dropStalled = this.dropNoPlayer = 0;
     this.gapMaxMs = this.gaps50 = this.gaps100 = this.leadMaxMs = this.peakMax = 0;
     this.gaps = [];

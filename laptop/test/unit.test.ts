@@ -127,6 +127,19 @@ test("JitterBuffer sheds excess lead only in quiet chunks, with a hard cap", () 
   expect(r.filter(Boolean).length).toBe(6); // 150..200 ms admitted, then capped at target + 100
 });
 
+test("StreamStats does not count battery-saver idle as network gaps", () => {
+  let t = 0;
+  const s = new StreamStats(() => t);
+  for (let i = 0; i < 50; i++) { t += 10; s.arrival(1920); s.chunk(0.5, 20); }
+  s.arrival(1920); s.chunk(0, 20, true);
+  for (let i = 0; i < 8; i++) { t += 250; s.arrival(1920); s.chunk(0, 20, true); } // keepalives
+  const w = s.flush(192_000);
+  expect(w.gapMaxMs).toBe(10);
+  expect(w.gaps100).toBe(0);
+  expect(w.idlePct).toBeGreaterThan(75);
+  expect(w.ratePct).toBe(100);
+});
+
 test("StreamStats summarises arrival gaps, rate and drops per window", () => {
   let t = 0;
   const s = new StreamStats(() => t);

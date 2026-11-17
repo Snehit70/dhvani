@@ -68,6 +68,8 @@ export type LiveMetrics = {
   /** Audio queued ahead of playback, and what the jitter buffer aims for. */
   leadMs: number;
   targetMs: number;
+  /** Only silence arrived this second (the phone may be saving battery). */
+  idle: boolean;
   /** Totals for the session so far. */
   drops: number;
   underruns: number;
@@ -91,7 +93,7 @@ type Active = {
   reportedUnderruns: number;
   socketError: string;
   analyzer: Analyzer;
-  sec: { bytes: number; gapMax: number; lastAt: number };
+  sec: { bytes: number; gapMax: number; lastAt: number; lastSilent: boolean; idle: boolean };
   secTimer: ReturnType<typeof setInterval>;
 };
 
@@ -285,7 +287,7 @@ export class AudioServer {
       statsTimer: setInterval(() => this.flushStats(active, bytesPerSec), STATS_INTERVAL_MS),
       totalBytes: 0, totalDrops: 0, pastUnderruns: 0, reportedUnderruns: 0, socketError: "",
       analyzer: new Analyzer(hello.rate, hello.channels),
-      sec: { bytes: 0, gapMax: 0, lastAt: 0 },
+      sec: { bytes: 0, gapMax: 0, lastAt: 0, lastSilent: false, idle: true },
       secTimer: setInterval(() => this.tickSecond(active), 1000),
     };
     active.statsTimer.unref?.();
@@ -309,7 +311,7 @@ export class AudioServer {
       active.stats.arrival(chunk.length);
       active.totalBytes += chunk.length;
       const now = performance.now();
-      if (active.sec.lastAt) active.sec.gapMax = Math.max(active.sec.gapMax, now - active.sec.lastAt);
+      if (active.sec.lastAt && !active.sec.lastSilent) active.sec.gapMax = Math.max(active.sec.gapMax, now - active.sec.lastAt);
       active.sec.lastAt = now;
       active.sec.bytes += chunk.length;
       const frames = aligner.push(chunk);
@@ -328,7 +330,11 @@ export class AudioServer {
         else if (result === "stalled") active.stats.dropStalled++;
         else active.stats.dropNoPlayer++;
       }
-      active.stats.chunk(peak, player?.leadMs ?? 0);
+      // Post-gain peak is 0 when the laptop is muted; only then scan the raw frames.
+      const silent = peak === 0 && isAllZero(frames);
+      active.sec.lastSilent = silent;
+      if (!silent) active.sec.idle = false;
+      active.stats.chunk(peak, player?.leadMs ?? 0, silent);
       this.reportLevel(active, peak);
     };
     socket.on("data", onAudio);
@@ -447,7 +453,8 @@ export class AudioServer {
       t: Date.now(),
       kbps: Math.round((s.bytes * 8) / 1000),
       // Nothing arrived at all this second: the gap is still running.
-      gapMaxMs: Math.round(s.bytes ? s.gapMax : performance.now() - s.lastAt),
+      gapMaxMs: Math.round(s.bytes || s.lastSilent ? s.gapMax : performance.now() - s.lastAt),
+      idle: s.idle,
       leadMs: Math.round(active.player?.leadMs ?? 0),
       targetMs: Math.round(active.player?.targetMs ?? 0),
       drops: active.totalDrops,
@@ -456,6 +463,7 @@ export class AudioServer {
     });
     s.bytes = 0;
     s.gapMax = 0;
+    s.idle = true;
   }
 
   private endActive(reason: EndReason) {
@@ -487,4 +495,9 @@ export class AudioServer {
     this.hooks.onChange();
     this.hooks.onSessionEnd?.(a.session, reason);
   }
+}
+
+function isAllZero(b: Uint8Array): boolean {
+  for (let i = 0; i < b.length; i++) if (b[i] !== 0) return false;
+  return true;
 }
