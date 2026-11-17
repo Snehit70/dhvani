@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import { networkInterfaces } from "node:os";
 import { loadConfig, newCode, sanitize, saveConfig, type Config } from "./config";
 import { LOG_FILE, log } from "./log";
-import { report } from "./report";
+import { recentSessions, report } from "./report";
 import { listSinks, pwCatPlayer } from "./player";
 import { AUDIO_PORT, DISCOVERY_PORT, UI_PORT } from "./protocol";
 import { AudioServer } from "./server";
@@ -117,6 +117,10 @@ async function state() {
     drops: server.drops,
     level: lastLevelSent,
     lastError: server.lastError,
+    quality: server.quality,
+    phone: server.phone,
+    recent: server.recent,
+    firewallFix: `sudo firewall-cmd --permanent --add-port=${AUDIO_PORT}/tcp --add-port=${DISCOVERY_PORT}/udp && sudo firewall-cmd --reload`,
     health: {
       listening: server.listening,
       discovery: server.discovery,
@@ -170,6 +174,7 @@ async function main() {
     sink: config.sink || "default",
     volume: config.volume,
   });
+  server.recent = recentSessions(LOG_FILE, 6);
   try {
     await server.listen(AUDIO_PORT);
   } catch (e) {

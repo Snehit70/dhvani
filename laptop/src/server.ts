@@ -37,6 +37,10 @@ const LEVEL_INTERVAL_MS = 66;
 const RESPAWN_INTERVAL_MS = 1000;
 export const STATS_INTERVAL_MS = 10_000;
 
+export type SessionSummary = {
+  device: string; start: number; durationS: number; reason: string; drops: number; underruns: number;
+};
+
 export type EndReason = "phone_closed" | "socket_error" | "replaced" | "disconnected" | "code_changed" | "shutdown";
 
 type Active = {
@@ -59,6 +63,11 @@ export class AudioServer {
   session: Session | null = null;
   drops = 0;
   lastError = "";
+  /** Latest 10 s stream window and phone report for the live session (null when idle). */
+  quality: Record<string, unknown> | null = null;
+  phone: Record<string, unknown> | null = null;
+  /** Most recent sessions, newest first. */
+  recent: SessionSummary[] = [];
   listening = false;
   discovery = false;
 
@@ -223,6 +232,8 @@ export class AudioServer {
     this.session = session;
     this.drops = 0;
     this.lastError = "";
+    this.quality = null;
+    this.phone = null;
     socket.write(encodeReply({ ok: true, name: this.getConfig().name }));
 
     const aligner = new FrameAligner(2 * hello.channels);
@@ -289,12 +300,13 @@ export class AudioServer {
 
   private flushStats(active: Active, bytesPerSec: number) {
     const u = this.underruns(active);
-    log("session_stats", {
-      session: active.session.id,
-      ...active.stats.flush(bytesPerSec),
-      underruns: u - active.reportedUnderruns,
-    });
+    const window = { ...active.stats.flush(bytesPerSec), underruns: u - active.reportedUnderruns };
+    log("session_stats", { session: active.session.id, ...window });
     active.reportedUnderruns = u;
+    if (this.active === active) {
+      this.quality = window;
+      this.hooks.onChange();
+    }
   }
 
   private phoneStats(s: { code: string; fields: Record<string, unknown> }, address: string) {
@@ -302,6 +314,8 @@ export class AudioServer {
     // Only the phone that is currently streaming, with the right code, gets logged.
     if (!a || a.session.address !== address || !codesMatch(s.code, this.getConfig().code)) return;
     log("phone_stats", { session: a.session.id, ...s.fields });
+    this.phone = s.fields;
+    this.hooks.onChange();
   }
 
   private reportLevel(peak: number) {
@@ -321,11 +335,18 @@ export class AudioServer {
     this.session = null;
     clearInterval(a.statsTimer);
     this.flushStats(a, a.hello.rate * a.hello.channels * 2);
+    this.quality = null;
+    this.phone = null;
+    const durationS = Math.round((Date.now() - a.session.since) / 100) / 10;
+    this.recent = [
+      { device: a.session.device, start: a.session.since, durationS, reason, drops: a.totalDrops, underruns: this.underruns(a) },
+      ...this.recent,
+    ].slice(0, 6);
     log("session_end", {
       session: a.session.id,
       reason,
       error: a.socketError || undefined,
-      durationS: Math.round((Date.now() - a.session.since) / 100) / 10,
+      durationS,
       mb: Math.round(a.totalBytes / 1e4) / 100,
       drops: a.totalDrops,
       underruns: this.underruns(a),

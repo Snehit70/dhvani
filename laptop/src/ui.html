@@ -3,328 +3,633 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
 <title>Dhvani</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='7' fill='%230d9488'/%3E%3Cpath d='M7 10v4M10 7v10M13 9v6M16 11v2' stroke='white' stroke-width='2' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='7' fill='%23006a64'/%3E%3Cpath d='M7 10v4M10 7v10M13 9v6M16 11v2' stroke='white' stroke-width='2' stroke-linecap='round'/%3E%3C/svg%3E">
 <style>
+/* ---------- Material 3 tokens (seed #006A64), plus success/warning custom colors ---------- */
 :root {
-  --bg: #f3f4f6; --panel: #ffffff; --raise: #f8f9fa; --text: #111317; --muted: #6b7280; --faint: #9ca3af;
-  --line: #e5e7eb; --accent: #0d9488; --accent-2: #0f766e; --accent-soft: #e6f6f4; --on-accent: #ffffff;
-  --ok: #059669; --warn: #d97706; --bad: #dc2626; --track: #e5e7eb;
-  --shadow: 0 1px 2px rgba(17,19,23,.04), 0 4px 16px rgba(17,19,23,.04);
-  --r: 18px; color-scheme: light;
+  --primary: #006a64; --on-primary: #fff; --primary-container: #9ef2e8; --on-primary-container: #00201d;
+  --secondary: #4a6360; --secondary-container: #cce8e3; --on-secondary-container: #051f1c;
+  --tertiary-container: #cce5ff; --on-tertiary-container: #001d31;
+  --error: #ba1a1a; --on-error: #fff; --error-container: #ffdad6; --on-error-container: #410002;
+  --success: #2e6b30; --success-container: #b0f2a9; --on-success-container: #002204;
+  --warning: #7a5900; --warning-container: #ffdea1; --on-warning-container: #261900;
+  --surface: #f4fbf9; --surface-c-lowest: #fff; --surface-c-low: #eff5f3; --surface-c: #e9efed;
+  --surface-c-high: #e3eae8; --surface-c-highest: #dde4e2;
+  --on-surface: #161d1c; --on-surface-variant: #3f4947; --outline: #6f7977; --outline-variant: #bec9c6;
+  --inverse-surface: #2b3231; --inverse-on-surface: #ecf2f0; --inverse-primary: #82d5cc;
+  --shape-xs: 4px; --shape-s: 8px; --shape-m: 12px; --shape-l: 16px; --shape-xl: 28px; --shape-full: 999px;
+  --ease: cubic-bezier(0.2, 0, 0, 1);
+  --mono: ui-monospace, "JetBrains Mono", "SF Mono", Menlo, monospace;
+  color-scheme: light;
 }
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #0b0d10; --panel: #14171c; --raise: #1a1e24; --text: #eef0f3; --muted: #9aa3af; --faint: #6b7280;
-    --line: #232830; --accent: #2dd4bf; --accent-2: #5eead4; --accent-soft: #10302c; --on-accent: #062320;
-    --ok: #34d399; --warn: #fbbf24; --bad: #f87171; --track: #262b33;
-    --shadow: 0 1px 2px rgba(0,0,0,.3); color-scheme: dark;
+    --primary: #82d5cc; --on-primary: #003733; --primary-container: #00504b; --on-primary-container: #9ef2e8;
+    --secondary: #b1ccc7; --secondary-container: #334b48; --on-secondary-container: #cce8e3;
+    --tertiary-container: #2d4960; --on-tertiary-container: #cce5ff;
+    --error: #ffb4ab; --on-error: #690005; --error-container: #93000a; --on-error-container: #ffdad6;
+    --success: #95d68f; --success-container: #13521b; --on-success-container: #b0f2a9;
+    --warning: #f5bf48; --warning-container: #5c4200; --on-warning-container: #ffdea1;
+    --surface: #0e1514; --surface-c-lowest: #090f0f; --surface-c-low: #161d1c; --surface-c: #1a2120;
+    --surface-c-high: #252b2a; --surface-c-highest: #2f3635;
+    --on-surface: #dde4e2; --on-surface-variant: #bec9c6; --outline: #899390; --outline-variant: #3f4947;
+    --inverse-surface: #dde4e2; --inverse-on-surface: #2b3231; --inverse-primary: #006a64;
+    color-scheme: dark;
   }
 }
+
+/* ---------- Base + M3 type scale ---------- */
 * { box-sizing: border-box; }
-html { -webkit-font-smoothing: antialiased; }
-body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
-main { max-width: 980px; margin: 0 auto; padding: 24px 20px 56px; }
-button, select, input { font: inherit; color: inherit; }
-:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+html { -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; text-size-adjust: 100%; }
+body {
+  margin: 0; background: var(--surface); color: var(--on-surface);
+  font: 400 14px/20px "Roboto Flex", Roboto, "Google Sans Text", Inter, system-ui, sans-serif; letter-spacing: .0179em;
+}
+button, input { font: inherit; color: inherit; letter-spacing: inherit; }
 [hidden] { display: none !important; }
+:focus-visible { outline: 3px solid var(--secondary); outline-offset: 2px; }
+.headline-s { font-size: 24px; line-height: 32px; font-weight: 400; letter-spacing: 0; margin: 0; }
+.title-l { font-size: 22px; line-height: 28px; font-weight: 400; letter-spacing: 0; margin: 0; }
+.title-m { font-size: 16px; line-height: 24px; font-weight: 500; letter-spacing: .009em; margin: 0; }
+.title-s { font-size: 14px; line-height: 20px; font-weight: 500; letter-spacing: .007em; margin: 0; }
+.body-l { font-size: 16px; line-height: 24px; letter-spacing: .031em; }
+.body-s { font-size: 12px; line-height: 16px; letter-spacing: .033em; }
+.label-m { font-size: 12px; line-height: 16px; font-weight: 500; letter-spacing: .042em; }
+.muted { color: var(--on-surface-variant); }
+.num { font-variant-numeric: tabular-nums; }
+.mono { font-family: var(--mono); letter-spacing: 0; }
 
-/* Header */
-header { display: flex; align-items: center; gap: 12px; margin-bottom: 20px; }
-.logo { width: 34px; height: 34px; border-radius: 10px; background: linear-gradient(140deg, #14b8a6, #0f766e); display: grid; place-items: center; box-shadow: 0 4px 12px rgba(13,148,136,.35); }
-header h1 { margin: 0; font-size: 19px; font-weight: 650; letter-spacing: -.01em; }
-header .spacer { flex: 1; }
-.chip { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; font-weight: 550; color: var(--muted); background: var(--panel); border: 1px solid var(--line); padding: 5px 10px; border-radius: 99px; }
-.chip i { width: 7px; height: 7px; border-radius: 50%; background: var(--faint); }
-.chip.ok i { background: var(--ok); } .chip.warn i { background: var(--warn); } .chip.bad i { background: var(--bad); }
+/* ---------- Layout ---------- */
+.shell { max-width: 1040px; margin: 0 auto; padding: 8px 24px 64px; }
+.topbar { display: flex; align-items: center; gap: 12px; height: 64px; }
+.brand { width: 36px; height: 36px; border-radius: var(--shape-m); background: var(--primary); color: var(--on-primary); display: grid; place-items: center; flex: none; }
+.topbar .who { min-width: 0; }
+.topbar .who .body-s { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.spacer { flex: 1; }
+.grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; margin-top: 16px; align-items: start; }
+.col { display: grid; gap: 16px; min-width: 0; }
+@media (max-width: 820px) {
+  .grid { grid-template-columns: minmax(0, 1fr); } .shell { padding: 4px 16px 48px; }
+  .col { display: contents; } .o-hist { order: 3; }
+}
 
-/* Cards */
-.card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--r); box-shadow: var(--shadow); padding: 22px; }
-.label { font-size: 12px; font-weight: 600; letter-spacing: .05em; text-transform: uppercase; color: var(--muted); margin: 0 0 14px; }
-.grid { display: grid; gap: 16px; grid-template-columns: 1.15fr 1fr; margin-top: 16px; align-items: start; }
-.stack { display: grid; gap: 16px; }
-@media (max-width: 760px) { .grid { grid-template-columns: 1fr; } }
+/* ---------- Surfaces (M3 filled cards: tonal elevation, no borders) ---------- */
+.card { background: var(--surface-c-low); border-radius: var(--shape-xl); padding: 24px; min-width: 0; }
+.card-head { display: flex; align-items: center; gap: 8px; margin-bottom: 16px; min-height: 28px; }
+.card-head .title-m { flex: 1; }
+.hero { background: var(--surface-c); padding: 28px; position: relative; overflow: hidden; }
+.hero.live { background: var(--primary-container); color: var(--on-primary-container); }
+.hero.down { background: var(--error-container); color: var(--on-error-container); }
+.hero.live .muted, .hero.down .muted { color: inherit; opacity: .78; }
 
-/* Hero */
-.hero { position: relative; overflow: hidden; padding: 26px; }
-.hero::before { content: ""; position: absolute; inset: 0; background: radial-gradient(120% 140% at 0% 0%, var(--accent-soft), transparent 55%); opacity: 0; transition: opacity .4s; pointer-events: none; }
-.hero.live::before { opacity: 1; }
-.hero-top { position: relative; display: flex; align-items: center; gap: 16px; }
-.phone { width: 52px; height: 52px; border-radius: 16px; background: var(--raise); border: 1px solid var(--line); display: grid; place-items: center; color: var(--muted); flex: none; transition: all .3s; }
-.hero.live .phone { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
-.hero-text { flex: 1; min-width: 0; }
-.hero-title { font-size: 22px; font-weight: 650; letter-spacing: -.015em; line-height: 1.2; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.hero-sub { color: var(--muted); font-size: 13.5px; margin-top: 3px; display: flex; flex-wrap: wrap; gap: 4px 12px; }
-.hero-sub span { white-space: nowrap; }
-.pulse { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); display: inline-block; margin-right: 6px; vertical-align: 1px; animation: pulse 1.6s infinite; }
-@keyframes pulse { 0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--ok) 55%, transparent); } 100% { box-shadow: 0 0 0 8px transparent; } }
-.btn { border: 1px solid var(--line); background: var(--panel); border-radius: 12px; padding: 9px 14px; font-weight: 600; font-size: 14px; cursor: pointer; transition: border-color .15s, background .15s; }
-.btn:hover { border-color: var(--faint); }
-.btn.ghost-bad:hover { border-color: var(--bad); color: var(--bad); }
-.viz { position: relative; display: flex; align-items: center; gap: 3px; height: 64px; margin-top: 22px; }
-.viz b { flex: 1; min-width: 2px; height: 4px; border-radius: 99px; background: var(--track); transition: height 90ms linear, background .3s; }
-.hero.live .viz b { background: var(--accent); }
-.err { position: relative; margin-top: 14px; padding: 10px 12px; border-radius: 12px; font-size: 13.5px; color: var(--bad); background: color-mix(in srgb, var(--bad) 9%, transparent); }
+/* ---------- Buttons with M3 state layers ---------- */
+.btn, .icon-btn, .list-item { position: relative; isolation: isolate; cursor: pointer; border: 0; -webkit-tap-highlight-color: transparent; }
+.btn::after, .icon-btn::after, .list-item::after {
+  content: ""; position: absolute; inset: 0; border-radius: inherit; background: currentColor; opacity: 0;
+  transition-property: opacity; transition-duration: 150ms; transition-timing-function: var(--ease); z-index: -1; pointer-events: none;
+}
+.btn:hover::after, .icon-btn:hover::after, .list-item:hover::after { opacity: .08; }
+.btn:active::after, .icon-btn:active::after, .list-item:active::after { opacity: .1; }
+.btn, .icon-btn { transition-property: scale, background-color, color; transition-duration: 150ms; transition-timing-function: var(--ease); }
+.btn:active, .icon-btn:active { scale: 0.96; }
+.btn { display: inline-flex; align-items: center; justify-content: center; gap: 8px; height: 40px; padding: 0 24px; border-radius: var(--shape-full); font-size: 14px; font-weight: 500; letter-spacing: .007em; white-space: nowrap; background: transparent; }
+.btn svg { margin-left: -8px; flex: none; }
+.btn.filled { background: var(--primary); color: var(--on-primary); }
+.btn.tonal { background: var(--secondary-container); color: var(--on-secondary-container); }
+.btn.outlined { box-shadow: inset 0 0 0 1px var(--outline); color: var(--primary); padding: 0 20px; }
+.btn.text { color: var(--primary); padding: 0 12px; }
+.btn.text svg { margin-left: -4px; }
+.btn.danger { box-shadow: inset 0 0 0 1px currentColor; color: var(--error); background: transparent; }
+.hero.live .btn.danger { color: var(--on-primary-container); }
+.btn.small { height: 32px; padding: 0 12px; font-size: 13px; }
+.btn.small svg { margin-left: -2px; }
+.icon-btn { width: 40px; height: 40px; border-radius: var(--shape-full); display: grid; place-items: center; background: transparent; color: var(--on-surface-variant); flex: none; }
+.icon-btn.tonal { background: var(--secondary-container); color: var(--on-secondary-container); }
+.icon-btn[aria-pressed="true"] { background: var(--error-container); color: var(--on-error-container); }
+.icon-btn .swap { display: grid; }
+.icon-btn .swap > svg { grid-area: 1 / 1; transition-property: opacity, scale, filter; transition-duration: 200ms; transition-timing-function: var(--ease); }
+.icon-btn .swap > svg.off { opacity: 0; scale: .25; filter: blur(4px); }
 
-/* Output devices */
-.devices { display: grid; gap: 8px; }
-.device { display: flex; align-items: center; gap: 12px; width: 100%; text-align: left; padding: 12px 14px; border-radius: 14px; border: 1px solid var(--line); background: var(--raise); cursor: pointer; transition: border-color .15s, background .15s; }
-.device:hover { border-color: var(--faint); }
-.device[aria-checked="true"] { border-color: var(--accent); background: var(--accent-soft); }
-.device .ic { width: 34px; height: 34px; border-radius: 10px; display: grid; place-items: center; background: var(--panel); border: 1px solid var(--line); color: var(--muted); flex: none; }
-.device[aria-checked="true"] .ic { color: var(--accent); border-color: transparent; }
-.device .t { flex: 1; min-width: 0; }
-.device .n { font-weight: 600; font-size: 14.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.device .d { color: var(--muted); font-size: 12.5px; }
-.device .tick { width: 20px; height: 20px; border-radius: 50%; border: 1.5px solid var(--line); flex: none; display: grid; place-items: center; }
-.device[aria-checked="true"] .tick { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+/* ---------- Assist / status chips ---------- */
+.chip { display: inline-flex; align-items: center; gap: 8px; height: 32px; padding: 0 12px 0 10px; border-radius: var(--shape-s); background: var(--surface-c-high); color: var(--on-surface-variant); font-size: 13px; font-weight: 500; white-space: nowrap; }
+.chip i { width: 8px; height: 8px; border-radius: 50%; background: var(--outline); flex: none; }
+.chip.ok i { background: var(--success); }
+.chip.warn i { background: var(--warning); }
+.chip.bad i { background: var(--error); }
+.chip.good { background: var(--success-container); color: var(--on-success-container); }
+.chip.fair { background: var(--warning-container); color: var(--on-warning-container); }
+.chip.poor { background: var(--error-container); color: var(--on-error-container); }
+.chip.measuring { background: color-mix(in srgb, var(--on-primary-container) 12%, transparent); color: inherit; }
 
-.volume { display: flex; align-items: center; gap: 12px; margin-top: 18px; padding-top: 18px; border-top: 1px solid var(--line); }
-.mute { width: 40px; height: 40px; border-radius: 12px; border: 1px solid var(--line); background: var(--raise); display: grid; place-items: center; cursor: pointer; flex: none; color: var(--text); }
-.mute[aria-pressed="true"] { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 40%, var(--line)); }
-input[type=range] { -webkit-appearance: none; appearance: none; flex: 1; height: 6px; border-radius: 99px; background: linear-gradient(to right, var(--accent) var(--p, 66%), var(--track) var(--p, 66%)); cursor: pointer; }
-input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 20px; height: 20px; border-radius: 50%; background: #fff; border: 0; box-shadow: 0 1px 4px rgba(0,0,0,.3), 0 0 0 1px rgba(0,0,0,.04); }
-input[type=range]::-moz-range-thumb { width: 20px; height: 20px; border-radius: 50%; background: #fff; border: 0; box-shadow: 0 1px 4px rgba(0,0,0,.3); }
-input[type=range].muted { --accent: var(--faint); }
-.pct { width: 46px; text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; font-size: 14px; }
-.hint { color: var(--muted); font-size: 12.5px; margin-top: 8px; }
+/* ---------- Banners ---------- */
+.banner { display: flex; gap: 16px; align-items: flex-start; padding: 16px 16px 16px 20px; border-radius: var(--shape-l); margin-top: 16px; }
+.banner.error { background: var(--error-container); color: var(--on-error-container); }
+.banner.warn { background: var(--warning-container); color: var(--on-warning-container); }
+.banner > svg { flex: none; margin-top: 2px; }
+.banner .b-body { flex: 1; min-width: 0; display: grid; gap: 4px; }
+.banner .cmd { display: flex; align-items: center; gap: 8px; margin-top: 8px; background: color-mix(in srgb, currentColor 9%, transparent); border-radius: var(--shape-s); padding: 6px 6px 6px 12px; }
+.banner .cmd code { flex: 1; min-width: 0; font: 12.5px/18px var(--mono); overflow-x: auto; white-space: nowrap; scrollbar-width: none; }
 
-/* Pairing */
-.digits { display: grid; grid-template-columns: repeat(6, 1fr); gap: 8px; }
-.digits span { aspect-ratio: 4 / 5; max-height: 64px; display: grid; place-items: center; font: 650 28px/1 ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace; background: var(--raise); border: 1px solid var(--line); border-radius: 12px; font-variant-numeric: tabular-nums; }
-.row-btns { display: flex; gap: 8px; margin-top: 14px; }
-.addr { margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--line); display: grid; gap: 6px; }
-.addr-row { display: flex; justify-content: space-between; gap: 10px; font-size: 14px; }
-.addr-row .k { color: var(--muted); }
-.addr-row .v { font-family: ui-monospace, Menlo, monospace; font-size: 13.5px; }
+/* ---------- Hero contents ---------- */
+.hero-top { display: flex; align-items: center; gap: 16px; }
+.avatar { width: 56px; height: 56px; border-radius: var(--shape-l); display: grid; place-items: center; flex: none; background: var(--surface-c-highest); color: var(--on-surface-variant); }
+.hero.live .avatar { background: var(--primary); color: var(--on-primary); }
+.hero.down .avatar { background: var(--error); color: var(--on-error); }
+.hero-text { flex: 1; min-width: 0; display: grid; gap: 2px; }
+.hero-text .headline-s { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+@media (max-width: 560px) { .hero-top { flex-wrap: wrap; } #disconnect { order: 3; width: 100%; } .hero { padding: 20px; } }
+.meta { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; }
+.meta > span { white-space: nowrap; }
+.live-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: currentColor; margin-right: 6px; vertical-align: 1px; animation: blink 2s var(--ease) infinite; }
+@keyframes blink { 50% { opacity: .35; } }
 
-/* Settings */
-.field { display: grid; gap: 6px; }
-.field span { font-size: 13px; color: var(--muted); }
-input[type=text] { background: var(--raise); border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px; width: 100%; }
-input[type=text]:focus { border-color: var(--accent); outline: none; }
-.health { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 16px; }
-.health div { display: flex; align-items: center; gap: 8px; padding: 9px 11px; border-radius: 12px; background: var(--raise); font-size: 13px; }
-.health i { width: 8px; height: 8px; border-radius: 50%; flex: none; background: var(--faint); }
-.health .ok i { background: var(--ok); } .health .warn i { background: var(--warn); } .health .bad i { background: var(--bad); }
-.health em { font-style: normal; color: var(--muted); margin-left: auto; }
+.viz { display: flex; align-items: center; gap: 3px; height: 72px; margin-top: 24px; }
+.viz b { flex: 1; min-width: 2px; height: 4px; border-radius: var(--shape-full); background: currentColor; opacity: .35; transition-property: height; transition-duration: 90ms; transition-timing-function: linear; }
+.hero.live .viz b { opacity: 1; color: var(--primary); }
 
-details { margin-top: 16px; }
-summary { cursor: pointer; list-style: none; display: flex; align-items: center; justify-content: space-between; font-weight: 600; }
-summary::-webkit-details-marker { display: none; }
-summary .chev { transition: transform .2s; color: var(--muted); }
-details[open] summary .chev { transform: rotate(180deg); }
-.steps { counter-reset: s; list-style: none; margin: 16px 0 0; padding: 0; display: grid; gap: 12px; }
+.pair { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 16px; margin-top: 24px; }
+.pair-box { background: var(--surface-c-lowest); border-radius: var(--shape-l); padding: 16px 16px 12px; display: grid; gap: 8px; align-content: start; min-width: 0; }
+.pair-box .label-m { color: var(--on-surface-variant); }
+.pair-box .addr-big { font: 500 22px/32px var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pair-actions { display: flex; flex-wrap: wrap; gap: 4px; margin: 0 -8px; }
+.digits { display: flex; gap: 6px; }
+.digits span { width: 40px; height: 48px; display: grid; place-items: center; font: 500 26px/1 var(--mono); background: var(--surface-c-high); border-radius: var(--shape-s); font-variant-numeric: tabular-nums; }
+.digits.small span { width: 26px; height: 32px; font-size: 17px; border-radius: 6px; }
+@media (max-width: 560px) { .pair { grid-template-columns: minmax(0, 1fr); } .digits span { width: calc((100vw - 120px) / 6); max-width: 44px; } }
+.first-time { margin-top: 20px; }
+.first-time summary { display: inline-flex; align-items: center; gap: 4px; cursor: pointer; list-style: none; color: var(--primary); font-weight: 500; padding: 8px 12px; margin: 0 -12px; border-radius: var(--shape-full); }
+.first-time summary::-webkit-details-marker { display: none; }
+.first-time summary:hover { background: color-mix(in srgb, var(--primary) 8%, transparent); }
+.first-time summary svg { transition-property: rotate; transition-duration: 200ms; transition-timing-function: var(--ease); }
+.first-time[open] summary svg { rotate: 180deg; }
+.steps { counter-reset: s; list-style: none; margin: 12px 0 0; padding: 0; display: grid; gap: 12px; }
 .steps li { counter-increment: s; display: flex; gap: 12px; align-items: flex-start; }
-.steps li::before { content: counter(s); flex: none; width: 24px; height: 24px; border-radius: 50%; background: var(--accent-soft); color: var(--accent); font-weight: 700; font-size: 12.5px; display: grid; place-items: center; }
-.small { color: var(--muted); font-size: 12.5px; margin: 14px 0 0; }
-code { font-family: ui-monospace, Menlo, monospace; font-size: 12.5px; background: var(--raise); border: 1px solid var(--line); padding: 1px 6px; border-radius: 6px; }
+.steps li::before { content: counter(s); flex: none; width: 24px; height: 24px; border-radius: 50%; background: var(--secondary-container); color: var(--on-secondary-container); font: 500 12px/24px inherit; text-align: center; }
 
-.toast { position: fixed; bottom: 22px; left: 50%; transform: translate(-50%, 8px); background: var(--text); color: var(--bg); padding: 9px 16px; border-radius: 12px; font-size: 14px; font-weight: 550; opacity: 0; transition: opacity .2s, transform .2s; pointer-events: none; }
-.toast.show { opacity: 1; transform: translate(-50%, 0); }
-@media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
+/* ---------- Lists (M3 list items with radio) ---------- */
+.list { display: grid; gap: 2px; margin: 0 -12px; }
+.list-item { display: flex; align-items: center; gap: 16px; width: 100%; min-height: 64px; padding: 8px 12px; text-align: left; background: transparent; border-radius: var(--shape-l); color: var(--on-surface); }
+.list-item[aria-checked="true"] { background: var(--secondary-container); color: var(--on-secondary-container); }
+.list-item .lead { width: 40px; height: 40px; border-radius: var(--shape-m); display: grid; place-items: center; background: var(--surface-c-highest); color: var(--on-surface-variant); flex: none; }
+.list-item[aria-checked="true"] .lead { background: var(--primary); color: var(--on-primary); }
+.list-item .txt { flex: 1; min-width: 0; }
+.list-item .h { font-size: 16px; line-height: 24px; letter-spacing: .009em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.list-item .s { font-size: 14px; line-height: 20px; color: var(--on-surface-variant); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.list-item[aria-checked="true"] .s { color: inherit; opacity: .8; }
+.radio { width: 20px; height: 20px; border-radius: 50%; box-shadow: inset 0 0 0 2px var(--on-surface-variant); flex: none; display: grid; place-items: center; margin-right: 4px; }
+.radio::after { content: ""; width: 10px; height: 10px; border-radius: 50%; background: var(--primary); scale: 0; transition-property: scale; transition-duration: 150ms; transition-timing-function: var(--ease); }
+[aria-checked="true"] .radio { box-shadow: inset 0 0 0 2px var(--primary); }
+[aria-checked="true"] .radio::after { scale: 1; }
+
+/* ---------- Volume: M3 slider (thick track, bar handle) ---------- */
+.volume { display: flex; align-items: center; gap: 12px; margin-top: 20px; }
+.slider { flex: 1; min-width: 0; height: 44px; -webkit-appearance: none; appearance: none; background: transparent; cursor: pointer; margin: 0; }
+.slider::-webkit-slider-runnable-track { height: 16px; border-radius: var(--shape-full); background: linear-gradient(to right, var(--fill) var(--p, 66%), var(--secondary-container) var(--p, 66%)); }
+.slider::-moz-range-track { height: 16px; border-radius: var(--shape-full); background: var(--secondary-container); }
+.slider::-moz-range-progress { height: 16px; border-radius: var(--shape-full); background: var(--fill); }
+.slider::-webkit-slider-thumb { -webkit-appearance: none; width: 4px; height: 44px; margin-top: -14px; border-radius: 2px; background: var(--fill); box-shadow: 0 0 0 6px var(--surface-c-low); }
+.slider::-moz-range-thumb { width: 4px; height: 44px; border: 0; border-radius: 2px; background: var(--fill); box-shadow: 0 0 0 6px var(--surface-c-low); }
+.slider { --fill: var(--primary); }
+.slider.muted { --fill: var(--outline); }
+.slider:focus-visible { outline: none; }
+.slider:focus-visible::-webkit-slider-thumb { width: 2px; }
+.pct { min-width: 56px; text-align: right; font-weight: 500; }
+.boost { color: var(--warning); }
+
+/* ---------- Quality tiles ---------- */
+.tiles { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.tile { background: var(--surface-c-lowest); border-radius: var(--shape-l); padding: 14px 16px; display: grid; gap: 2px; min-width: 0; }
+.tile .label-m { color: var(--on-surface-variant); display: flex; align-items: center; gap: 6px; }
+.tile .v { font-size: 22px; line-height: 28px; font-variant-numeric: tabular-nums; }
+.tile .v small { font-size: 14px; color: var(--on-surface-variant); margin-left: 2px; }
+.tile .body-s { color: var(--on-surface-variant); }
+.bars { display: inline-flex; align-items: flex-end; gap: 2px; height: 12px; }
+.bars i { width: 3px; border-radius: 1px; background: var(--outline-variant); }
+.bars i:nth-child(1) { height: 4px; } .bars i:nth-child(2) { height: 7px; } .bars i:nth-child(3) { height: 10px; } .bars i:nth-child(4) { height: 12px; }
+.bars i.on { background: var(--primary); }
+.advice { margin: 12px 0 0; color: var(--on-surface-variant); }
+.empty { display: grid; justify-items: start; gap: 4px; padding: 4px 0; color: var(--on-surface-variant); }
+
+/* ---------- Key/value rows, field, health ---------- */
+.rows { display: grid; }
+.row { display: flex; align-items: center; gap: 12px; min-height: 48px; border-top: 1px solid var(--outline-variant); }
+.row:first-child { border-top: 0; }
+.row .k { color: var(--on-surface-variant); flex: 1; min-width: 0; }
+.row .v { text-align: right; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.row .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 8px; vertical-align: 1px; background: var(--outline); }
+.row .dot.ok { background: var(--success); } .row .dot.warn { background: var(--warning); } .row .dot.bad { background: var(--error); }
+.field { position: relative; margin-bottom: 8px; }
+.field input { width: 100%; height: 56px; padding: 18px 16px 4px; border: 0; border-radius: var(--shape-xs) var(--shape-xs) 0 0; background: var(--surface-c-highest); box-shadow: inset 0 -1px 0 var(--on-surface-variant); outline: none; font-size: 16px; transition-property: box-shadow; transition-duration: 150ms; }
+.field input:focus { box-shadow: inset 0 -2px 0 var(--primary); }
+.field label { position: absolute; left: 16px; top: 8px; font-size: 12px; line-height: 16px; color: var(--on-surface-variant); pointer-events: none; }
+.field input:focus + label { color: var(--primary); }
+.field .support { font-size: 12px; color: var(--on-surface-variant); padding: 4px 16px 0; display: block; }
+
+/* ---------- History ---------- */
+.history { display: grid; }
+.h-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 12px; padding: 10px 0; border-top: 1px solid var(--outline-variant); }
+.h-row:first-child { border-top: 0; padding-top: 0; }
+.h-row .h { font-size: 16px; line-height: 24px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.h-row .when { color: var(--on-surface-variant); text-align: right; }
+.h-row .s { grid-column: 1 / -1; color: var(--on-surface-variant); }
+.h-row .s .warnish { color: var(--warning); }
+
+/* ---------- Snackbar ---------- */
+.snackbar { position: fixed; left: 24px; bottom: 24px; max-width: min(560px, calc(100vw - 32px)); min-height: 48px; display: flex; align-items: center; padding: 14px 16px; border-radius: var(--shape-xs); background: var(--inverse-surface); color: var(--inverse-on-surface); box-shadow: 0 2px 6px 2px rgb(0 0 0 / .15), 0 1px 2px rgb(0 0 0 / .3); opacity: 0; translate: 0 8px; pointer-events: none; transition-property: opacity, translate; transition-duration: 200ms; transition-timing-function: ease-out; }
+.snackbar.show { opacity: 1; translate: 0 0; }
+@media (max-width: 560px) { .snackbar { left: 16px; right: 16px; bottom: 16px; } }
+
+/* ---------- Entrance (once, first load only) ---------- */
+.enter > * { animation: rise 400ms var(--ease) both; }
+.enter > *:nth-child(2) { animation-delay: 100ms; }
+.enter > *:nth-child(3) { animation-delay: 200ms; }
+@keyframes rise { from { opacity: 0; translate: 0 8px; } }
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition-duration: 0ms !important; }
+}
 </style>
 </head>
 <body>
 <svg width="0" height="0" style="position:absolute" aria-hidden="true">
-  <symbol id="i-phone" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="2.5" width="12" height="19" rx="3"/><path d="M11 18.5h2"/></symbol>
-  <symbol id="i-head" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 15v-3a8 8 0 0 1 16 0v3"/><rect x="3" y="14" width="5" height="7" rx="2"/><rect x="16" y="14" width="5" height="7" rx="2"/></symbol>
-  <symbol id="i-speaker" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="2.5" width="14" height="19" rx="3"/><circle cx="12" cy="14" r="3.5"/><path d="M12 6.5h.01"/></symbol>
-  <symbol id="i-auto" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v3M12 18v3M3 12h3M18 12h3"/><circle cx="12" cy="12" r="4"/></symbol>
-  <symbol id="i-vol" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9.5h3.5L12 5v14l-4.5-4.5H4z"/><path d="M15.5 9a4 4 0 0 1 0 6M18 6.5a7.5 7.5 0 0 1 0 11"/></symbol>
-  <symbol id="i-mute" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9.5h3.5L12 5v14l-4.5-4.5H4z"/><path d="M16 9.5l5 5M21 9.5l-5 5"/></symbol>
-  <symbol id="i-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M6 12.5l4 4 8-9"/></symbol>
-  <symbol id="i-chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></symbol>
+  <defs>
+  <symbol id="i-phone" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="2.5" width="12" height="19" rx="3"/><path d="M11 18.5h2"/></symbol>
+  <symbol id="i-phone-off" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="2.5" width="12" height="19" rx="3"/><path d="M11 18.5h2M3 3l18 18"/></symbol>
+  <symbol id="i-head" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 15v-3a8 8 0 0 1 16 0v3"/><rect x="3" y="14" width="5" height="7" rx="2"/><rect x="16" y="14" width="5" height="7" rx="2"/></symbol>
+  <symbol id="i-speaker" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="2.5" width="14" height="19" rx="3"/><circle cx="12" cy="14" r="3.5"/><path d="M12 6.5h.01"/></symbol>
+  <symbol id="i-auto" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12a8 8 0 0 1 13.7-5.6M20 12a8 8 0 0 1-13.7 5.6"/><path d="M18 3v3.5h-3.5M6 21v-3.5h3.5"/></symbol>
+  <symbol id="i-vol" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9.5h3.5L12 5v14l-4.5-4.5H4z"/><path d="M15.5 9a4 4 0 0 1 0 6M18 6.5a7.5 7.5 0 0 1 0 11"/></symbol>
+  <symbol id="i-mute" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9.5h3.5L12 5v14l-4.5-4.5H4z"/><path d="M16 9.5l5 5M21 9.5l-5 5"/></symbol>
+  <symbol id="i-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="8.5" y="8.5" width="12" height="12" rx="2.5"/><path d="M15.5 8.5V6a2.5 2.5 0 0 0-2.5-2.5H6A2.5 2.5 0 0 0 3.5 6v7A2.5 2.5 0 0 0 6 15.5h2.5"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 12a8 8 0 1 1-2.3-5.6L20 8.5"/><path d="M20 3.5v5h-5"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7.5v5.5M12 16.5h.01"/></symbol>
+  <symbol id="i-shield" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7.5 3v5.5c0 4.5-3.2 8-7.5 9.5-4.3-1.5-7.5-5-7.5-9.5V6z"/><path d="M12 8v4.5M12 15.5h.01"/></symbol>
+  <symbol id="i-chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></symbol>
+  <symbol id="i-close" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6 6l12 12M18 6L6 18"/></symbol>
+  <symbol id="i-wave" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 10v4M9 6v12M13 8v8M17 10v4"/></symbol>
+  </defs>
 </svg>
-<main>
-  <header>
-    <div class="logo" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.4" stroke-linecap="round"><path d="M5 10v4M9 6v12M13 8v8M17 10v4"/></svg></div>
-    <h1>Dhvani</h1>
+
+<div class="shell">
+  <header class="topbar">
+    <div class="brand" aria-hidden="true"><svg width="20" height="20"><use href="#i-wave"/></svg></div>
+    <div class="who">
+      <div class="title-l">Dhvani</div>
+      <span class="body-s muted" id="laptop-line">Phone audio on this laptop</span>
+    </div>
     <div class="spacer"></div>
-    <span class="chip" id="svc"><i></i><span>Connecting…</span></span>
+    <span class="chip" id="svc" role="status"><i></i><span>Connecting…</span></span>
   </header>
 
-  <section class="card hero" id="hero" aria-live="polite">
-    <div class="hero-top">
-      <div class="phone"><svg width="24" height="24"><use href="#i-phone"/></svg></div>
-      <div class="hero-text">
-        <div class="hero-title" id="title">Waiting for your phone</div>
-        <div class="hero-sub" id="sub"><span>Open Dhvani on the phone and tap Start</span></div>
-      </div>
-      <button class="btn ghost-bad" id="disconnect" hidden>Disconnect</button>
-    </div>
-    <div class="viz" id="viz" role="meter" aria-label="Audio level" aria-valuemin="0" aria-valuemax="100"></div>
-    <div class="err" id="error" hidden></div>
-  </section>
-
-  <div class="grid">
-    <section class="card">
-      <h2 class="label">Play on</h2>
-      <div class="devices" id="devices" role="radiogroup" aria-label="Output device"></div>
-      <div class="volume">
-        <button class="mute" id="mute" aria-pressed="false" title="Mute"><svg width="20" height="20"><use href="#i-vol"/></svg></button>
-        <input type="range" id="volume" min="0" max="150" step="1" aria-label="Volume">
-        <span class="pct" id="volout">100%</span>
-      </div>
-      <div class="hint">Above 100% boosts quiet phones. Your laptop's own volume still applies.</div>
-    </section>
-
-    <div class="stack">
-      <section class="card">
-        <h2 class="label">Pairing code</h2>
-        <div class="digits" id="code" aria-label="Pairing code"></div>
-        <div class="row-btns">
-          <button class="btn" id="copy">Copy</button>
-          <button class="btn" id="newcode">New code</button>
+  <main id="main" class="enter">
+    <div>
+      <div class="banner error" id="fw-banner" hidden>
+        <svg width="24" height="24"><use href="#i-shield"/></svg>
+        <div class="b-body">
+          <div class="title-s">The firewall is blocking phones</div>
+          <div>Phones can't reach this laptop until ports 47800 (TCP) and 47802 (UDP) are open. Run this once in a terminal:</div>
+          <div class="cmd"><code id="fw-cmd"></code><button class="btn text small" id="fw-copy" type="button"><svg width="18" height="18"><use href="#i-copy"/></svg>Copy</button></div>
         </div>
-        <div class="addr" id="addrs"></div>
-      </section>
+      </div>
+      <div class="banner warn" id="err-banner" hidden>
+        <svg width="24" height="24"><use href="#i-alert"/></svg>
+        <div class="b-body"><div class="title-s">Playback problem</div><div id="err-text"></div></div>
+      </div>
 
-      <section class="card">
-        <h2 class="label">This laptop</h2>
-        <label class="field">
-          <span>Name the phone sees</span>
-          <input type="text" id="name" maxlength="40" autocomplete="off" spellcheck="false">
-        </label>
-        <div class="health" id="health"></div>
+      <section class="card hero" id="hero" aria-live="polite" style="margin-top:16px">
+        <div class="hero-top">
+          <div class="avatar" id="avatar"><svg width="28" height="28"><use href="#i-phone"/></svg></div>
+          <div class="hero-text">
+            <h1 class="headline-s" id="title">Ready to pair</h1>
+            <div class="meta body-l muted" id="meta"></div>
+          </div>
+          <button class="btn danger" id="disconnect" type="button" hidden>Disconnect</button>
+        </div>
+
+        <div id="live-body" hidden>
+          <div class="viz" id="viz" role="meter" aria-label="Audio level" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"></div>
+        </div>
+
+        <div id="pair-body">
+          <div class="pair">
+            <div class="pair-box">
+              <span class="label-m">Pairing code</span>
+              <div class="digits" id="code" aria-label="Pairing code"></div>
+              <div class="pair-actions">
+                <button class="btn text small" id="copy" type="button"><svg width="18" height="18"><use href="#i-copy"/></svg>Copy</button>
+                <button class="btn text small" id="newcode" type="button"><svg width="18" height="18"><use href="#i-refresh"/></svg>New code</button>
+              </div>
+            </div>
+            <div class="pair-box">
+              <span class="label-m">Laptop address</span>
+              <div class="addr-big num" id="addr-main">…</div>
+              <div class="body-s muted" id="addr-note">The app usually finds this laptop by itself.</div>
+            </div>
+          </div>
+          <details class="first-time" id="setup">
+            <summary>First time on this phone?<svg width="18" height="18"><use href="#i-chev"/></svg></summary>
+            <ol class="steps">
+              <li><span>Install <b>dhvani.apk</b> on the phone (Android 10 or newer).</span></li>
+              <li><span>Join the same Wi-Fi as this laptop.</span></li>
+              <li><span>Open Dhvani, tap <b id="hint-name">this laptop</b>, enter the code above and tap <b>Start</b>.</span></li>
+              <li><span>Allow the sharing prompt. Only audio leaves the phone; the screen is never recorded.</span></li>
+            </ol>
+          </details>
+        </div>
       </section>
     </div>
-  </div>
 
-  <section class="card" style="margin-top:16px">
-    <details id="setup">
-      <summary><span>Set up a phone</span><svg class="chev" width="18" height="18"><use href="#i-chev"/></svg></summary>
-      <ol class="steps">
-        <li><span>Install <code>dhvani.apk</code> on the phone. Android 10 or newer.</span></li>
-        <li><span>Put the phone on the same Wi-Fi as this laptop.</span></li>
-        <li><span>Open Dhvani, tap <b id="hint-name">this laptop</b> in the list (or type its address), enter the code, tap <b>Start</b>.</span></li>
-        <li><span>Allow the sharing prompt. Only audio leaves the phone; the screen is never recorded.</span></li>
-      </ol>
-      <p class="small">Apps that block capture (some banking and DRM video apps) stay silent here. Android enforces that.</p>
-    </details>
-  </section>
-</main>
-<div class="toast" id="toast" role="status"></div>
+    <div class="grid">
+      <div class="col">
+        <section class="card" aria-labelledby="out-h">
+          <div class="card-head"><h2 class="title-m" id="out-h">Play on</h2></div>
+          <div class="list" id="devices" role="radiogroup" aria-labelledby="out-h"></div>
+          <div class="volume">
+            <button class="icon-btn tonal" id="mute" type="button" aria-pressed="false" aria-label="Mute">
+              <span class="swap"><svg width="24" height="24" class="on-vol"><use href="#i-vol"/></svg><svg width="24" height="24" class="on-mute off"><use href="#i-mute"/></svg></span>
+            </button>
+            <input type="range" class="slider" id="volume" min="0" max="150" step="1" aria-label="Volume">
+            <span class="pct num title-s" id="volout">100%</span>
+          </div>
+          <div class="body-s muted" id="vol-hint">Above 100% boosts quiet phones. The laptop's own volume still applies.</div>
+        </section>
+
+        <section class="card o-hist" aria-labelledby="hist-h">
+          <div class="card-head"><h2 class="title-m" id="hist-h">Recent sessions</h2></div>
+          <div class="history" id="history"></div>
+        </section>
+      </div>
+
+      <div class="col">
+        <section class="card" aria-labelledby="q-h">
+          <div class="card-head"><h2 class="title-m" id="q-h">Connection</h2><span class="chip" id="q-chip" hidden></span></div>
+          <div id="quality"></div>
+        </section>
+
+        <section class="card" aria-labelledby="lap-h">
+          <div class="card-head"><h2 class="title-m" id="lap-h">This laptop</h2></div>
+          <div class="field">
+            <input type="text" id="name" maxlength="40" autocomplete="off" spellcheck="false" placeholder=" ">
+            <label for="name">Name</label>
+            <span class="support">Shown in the phone's laptop list</span>
+          </div>
+          <div class="rows" id="health"></div>
+        </section>
+      </div>
+    </div>
+  </main>
+</div>
+<div class="snackbar" id="snack" role="status" aria-live="polite"></div>
 
 <script>
 const $ = (id) => document.getElementById(id);
-const svg = (id, size = 18) => `<svg width="${size}" height="${size}"><use href="#${id}"/></svg>`;
-let state = null, editing = false, everLive = false;
+const icon = (id, size = 24) => `<svg width="${size}" height="${size}"><use href="#${id}"/></svg>`;
+const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
+let state = null, editing = false, down = false;
 
-const BARS = 48;
-const viz = $("viz");
-const levels = new Array(BARS).fill(0);
-for (let i = 0; i < BARS; i++) viz.append(document.createElement("b"));
+// ---------- Level visualizer ----------
+const BARS = 48, levels = new Array(BARS).fill(0), viz = $("viz");
+for (let i = 0; i < BARS; i++) viz.append(el("b"));
 function drawViz() {
-  const bars = viz.children;
-  for (let i = 0; i < BARS; i++) bars[i].style.height = Math.max(4, Math.round(levels[i] * 64)) + "px";
+  for (let i = 0; i < BARS; i++) viz.children[i].style.height = Math.max(4, Math.round(levels[i] * 72)) + "px";
 }
 drawViz();
 
+// ---------- Helpers ----------
 async function post(path, body = {}) {
   try {
     const r = await fetch(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
     if (!r.ok) throw new Error(r.statusText);
     render(await r.json());
     return true;
-  } catch { toast("Couldn't reach the Dhvani service"); return false; }
+  } catch { snack("Couldn't reach the Dhvani service"); return false; }
 }
-function toast(msg) {
-  const t = $("toast"); t.textContent = msg; t.classList.add("show");
-  clearTimeout(toast.t); toast.t = setTimeout(() => t.classList.remove("show"), 1800);
+function snack(msg) {
+  const t = $("snack"); t.textContent = msg; t.classList.add("show");
+  clearTimeout(snack.t); snack.t = setTimeout(() => t.classList.remove("show"), 2400);
 }
-function dur(ts) {
-  const s = Math.max(0, Math.round((Date.now() - ts) / 1000));
-  const m = Math.floor(s / 60), h = Math.floor(m / 60);
-  return h ? `${h}h ${m % 60}m` : m ? `${m}m ${s % 60}s` : `${s}s`;
+function copy(text, what) {
+  navigator.clipboard?.writeText(text).then(() => snack(`${what} copied`), () => snack("The browser blocked copying"));
 }
-function iconFor(name) { return /bluez|headset|headphone/i.test(name) ? "i-head" : "i-speaker"; }
+function dur(sec) {
+  const s = Math.max(0, Math.round(sec)), m = Math.floor(s / 60), h = Math.floor(m / 60);
+  return h ? `${h} h ${m % 60} min` : m ? `${m} min ${s % 60 ? (s % 60) + " s" : ""}`.trim() : `${s} s`;
+}
+function ago(ts) {
+  const m = Math.round((Date.now() - ts) / 60000);
+  if (m < 1) return "Just now";
+  if (m < 60) return `${m} min ago`;
+  const h = Math.round(m / 60);
+  if (h < 24) return `${h} h ago`;
+  return new Date(ts).toLocaleDateString(undefined, { month: "short", day: "numeric" });
+}
+const isHeadset = (name) => /bluez|headset|headphone|hands.?free/i.test(name);
+const REASONS = {
+  phone_closed: "Stopped on the phone", socket_error: "Connection lost", replaced: "Another phone took over",
+  disconnected: "Disconnected here", code_changed: "Code changed", shutdown: "Service restarted",
+};
 
-function deviceButton(value, title, detail, icon, checked) {
-  const b = document.createElement("button");
-  b.className = "device"; b.type = "button";
+// ---------- Connection quality ----------
+function grade(q, p) {
+  if (!q) return null;
+  const drops = (q.dropLate || 0) + (q.dropStalled || 0);
+  const rssi = p && typeof p.rssi === "number" ? p.rssi : null;
+  const tips = [];
+  if (q.gaps100 > 0) tips.push(`Wi-Fi paused ${q.gaps100}× for over 100 ms in the last 10 s.`);
+  if (q.dropStalled > 0) tips.push("The laptop's audio output stalled. Try another output or reconnect the headset.");
+  if (q.underruns > 0) tips.push(`Playback ran dry ${q.underruns}× (short gaps you may hear).`);
+  if (rssi !== null && rssi < -70) tips.push("Weak Wi-Fi signal on the phone. Move closer to the router.");
+  if (p && p.freqMHz && p.freqMHz < 3000 && (q.gaps100 > 0 || rssi < -67)) tips.push("The phone is on 2.4 GHz; a 5 GHz network is usually steadier.");
+  if (q.ratePct < 90) tips.push("Audio is arriving slower than real time.");
+  if (q.silentPct >= 95) tips.unshift("The phone is sending silence. Play something; some apps block audio capture.");
+  let level = "good";
+  if (q.gaps100 > 0 || drops > 0 || q.underruns > 0 || q.gaps50 > 5 || (rssi !== null && rssi < -67)) level = "fair";
+  if (q.gaps100 > 3 || drops > 25 || q.underruns > 3 || q.ratePct < 90 || (rssi !== null && rssi < -78)) level = "poor";
+  return { level, label: { good: "Excellent", fair: "Fair", poor: "Poor" }[level], tips };
+}
+function tile(label, value, unit, sub, extra) {
+  const t = el("div", "tile");
+  const l = el("span", "label-m", label); if (extra) l.prepend(extra);
+  const v = el("div", "v", value); if (unit) v.append(el("small", null, unit));
+  t.append(l, v, el("span", "body-s", sub));
+  return t;
+}
+function renderQuality(s) {
+  const box = $("quality"), chip = $("q-chip");
+  box.replaceChildren();
+  if (!s.session) {
+    chip.hidden = true;
+    const e = el("div", "empty");
+    e.append(el("span", "body-l", "No phone connected"), el("span", null, "Signal, delay and dropouts show here while streaming."));
+    box.append(e);
+    return;
+  }
+  const q = s.quality, p = s.phone, g = grade(q, p);
+  chip.hidden = false;
+  chip.className = "chip " + (g ? g.level : "measuring");
+  chip.textContent = g ? g.label : "Measuring…";
+  const tiles = el("div", "tiles");
+  if (p && typeof p.rssi === "number") {
+    const bars = el("span", "bars"); const n = p.rssi >= -55 ? 4 : p.rssi >= -67 ? 3 : p.rssi >= -75 ? 2 : 1;
+    for (let i = 0; i < 4; i++) bars.append(el("i", i < n ? "on" : ""));
+    const band = p.freqMHz ? (p.freqMHz > 5900 ? "6 GHz" : p.freqMHz > 3000 ? "5 GHz" : "2.4 GHz") : "";
+    tiles.append(tile("Wi-Fi signal", String(p.rssi), " dBm", [band, p.linkMbps ? `${p.linkMbps} Mbps` : ""].filter(Boolean).join(" · ") || "Phone Wi-Fi", bars));
+  } else {
+    tiles.append(tile("Wi-Fi signal", "—", "", "Needs the latest phone app"));
+  }
+  if (q) {
+    tiles.append(tile("Buffer", String(Math.round(q.leadMaxMs)), " ms", "Queued ahead of playback"));
+    tiles.append(tile("Worst gap", String(Math.round(q.gapMaxMs)), " ms", q.gaps100 ? `${q.gaps100} over 100 ms` : "Steady stream"));
+    const d = (q.dropLate || 0) + (q.dropStalled || 0);
+    tiles.append(tile("Skipped", String(d), d === 1 ? " chunk" : " chunks", `${s.drops} this session`));
+  } else {
+    tiles.append(tile("Buffer", "…", "", "First reading in 10 s"), tile("Worst gap", "…", "", ""), tile("Skipped", String(s.drops), "", "This session"));
+  }
+  box.append(tiles);
+  if (g && g.tips.length) box.append(el("p", "advice", g.tips.join(" ")));
+  else if (g) box.append(el("p", "advice", "Stream is steady."));
+}
+
+// ---------- Render ----------
+function deviceItem(value, title, detail, ic, checked) {
+  const b = el("button", "list-item"); b.type = "button";
   b.setAttribute("role", "radio"); b.setAttribute("aria-checked", String(checked));
-  b.innerHTML = `<span class="ic">${svg(icon)}</span><span class="t"><div class="n"></div><div class="d"></div></span><span class="tick">${checked ? svg("i-check", 12) : ""}</span>`;
-  b.querySelector(".n").textContent = title;
-  b.querySelector(".d").textContent = detail;
-  b.onclick = () => { if (!checked) post("/api/settings", { sink: value }).then((ok) => ok && toast(`Playing on ${title}`)); };
+  b.innerHTML = `<span class="lead">${icon(ic)}</span><span class="txt"><div class="h"></div><div class="s"></div></span><span class="radio"></span>`;
+  b.querySelector(".h").textContent = title;
+  b.querySelector(".s").textContent = detail;
+  b.onclick = () => { if (!checked) post("/api/settings", { sink: value }).then((ok) => ok && snack(`Playing on ${title}`)); };
   return b;
 }
-
 function setVolumeUi(pct, muted) {
   const r = $("volume");
   r.style.setProperty("--p", (pct / 150 * 100) + "%");
   r.classList.toggle("muted", muted);
   $("volout").textContent = muted ? "Muted" : pct + "%";
+  $("volout").classList.toggle("boost", !muted && pct > 100);
+}
+function setDigits(node, code) {
+  if (node.dataset.v === code) return;
+  node.dataset.v = code; node.replaceChildren();
+  for (const d of code) node.append(el("span", null, d));
 }
 
 function render(s) {
-  state = s;
+  state = s; down = false;
   const live = !!s.session;
-  if (live) everLive = true;
-  $("svc").className = "chip ok"; $("svc").lastElementChild.textContent = `Running · v${s.version}`;
-  $("hero").classList.toggle("live", live);
-  $("title").textContent = live ? s.session.device : "Waiting for your phone";
-  const sub = $("sub"); sub.replaceChildren();
-  const add = (t, pulse) => { const e = document.createElement("span"); if (pulse) e.innerHTML = '<i class="pulse"></i>'; e.append(t); sub.append(e); };
-  if (live) {
-    add("Streaming", true);
-    add(dur(s.session.since));
-    add(`${s.session.rate / 1000} kHz ${s.session.channels === 2 ? "stereo" : "mono"}`);
-    add(s.session.address);
-    if (s.drops) add(`${s.drops} late chunks skipped`);
-  } else add("Open Dhvani on the phone and tap Start");
+  const main = s.addresses[0]?.address;
+
+  $("svc").className = "chip " + (s.health.firewall === "blocked" || s.lastError ? "warn" : "ok");
+  $("svc").lastElementChild.textContent = live ? "Streaming" : "Ready";
+  $("laptop-line").textContent = `${s.name} · v${s.version}`;
+
+  // Banners
+  $("fw-banner").hidden = s.health.firewall !== "blocked";
+  $("fw-cmd").textContent = s.firewallFix || "";
+  $("err-banner").hidden = !s.lastError;
+  $("err-text").textContent = s.lastError;
+
+  // Hero
+  const hero = $("hero");
+  hero.className = "card hero" + (live ? " live" : "");
+  $("avatar").innerHTML = icon("i-phone", 28);
+  $("live-body").hidden = !live;
+  $("pair-body").hidden = live;
   $("disconnect").hidden = !live;
-  $("error").hidden = !s.lastError; $("error").textContent = s.lastError;
-  if (!live) { levels.fill(0); drawViz(); }
-
-  // Output devices
-  const list = $("devices"); list.replaceChildren();
-  const def = s.sinks.find((x) => x.name === s.defaultSink);
-  list.append(deviceButton("", "Follow system output", def ? `Now: ${def.description}` : "Whatever the laptop uses", "i-auto", s.sink === ""));
-  for (const k of s.sinks) list.append(deviceButton(k.name, k.description, k.name === s.defaultSink ? "System default" : (iconFor(k.name) === "i-head" ? "Bluetooth" : "Speaker / jack"), iconFor(k.name), s.sink === k.name));
-  if (s.sink && !s.sinks.some((k) => k.name === s.sink)) list.append(deviceButton(s.sink, "Saved device", "Not connected right now", "i-speaker", true));
-
-  const pct = Math.round(s.volume * 100);
-  if (document.activeElement !== $("volume")) $("volume").value = pct;
-  setVolumeUi(document.activeElement === $("volume") ? +$("volume").value : pct, s.muted);
-  $("mute").setAttribute("aria-pressed", String(s.muted));
-  $("mute").innerHTML = svg(s.muted ? "i-mute" : "i-vol", 20);
-  $("mute").title = s.muted ? "Unmute" : "Mute";
-
-  const code = $("code");
-  if (code.dataset.v !== s.code) {
-    code.dataset.v = s.code; code.replaceChildren();
-    for (const d of s.code) { const e = document.createElement("span"); e.textContent = d; code.append(e); }
+  const meta = $("meta"); meta.replaceChildren();
+  if (live) {
+    $("title").textContent = s.session.device;
+    const st = el("span"); st.innerHTML = '<i class="live-dot"></i>'; st.append("Streaming");
+    meta.append(st, el("span", "num", dur((Date.now() - s.session.since) / 1000)),
+      el("span", null, `${s.session.rate / 1000} kHz ${s.session.channels === 2 ? "stereo" : "mono"}`));
+  } else {
+    $("title").textContent = "Ready to pair";
+    meta.append(el("span", null, `Open Dhvani on your phone and pick “${s.name}”.`));
+    levels.fill(0); drawViz();
   }
-  const addrs = $("addrs"); addrs.replaceChildren();
-  const rows = s.addresses.length ? s.addresses : [{ iface: "Network", address: "offline" }];
-  for (const a of rows) {
-    const r = document.createElement("div"); r.className = "addr-row";
-    r.innerHTML = '<span class="k"></span><span class="v"></span>';
-    r.firstChild.textContent = a.iface; r.lastChild.textContent = a.address === "offline" ? "No network" : a.address;
-    addrs.append(r);
-  }
-  if (!editing) $("name").value = s.name;
+  setDigits($("code"), s.code);
+  $("addr-main").textContent = main || "No network";
+  $("addr-note").textContent = !main ? "Connect this laptop to Wi-Fi first."
+    : s.addresses.length > 1 ? `Also: ${s.addresses.slice(1).map((a) => a.address).join(", ")}`
+    : "The app usually finds this laptop by itself.";
   $("hint-name").textContent = s.name;
 
-  const fw = s.health.firewall;
-  const items = [
-    ["Audio server", s.health.listening ? "ok" : "bad", s.health.listening ? "On" : "Off"],
-    ["Discovery", s.health.discovery ? "ok" : "warn", s.health.discovery ? "On" : "Off"],
-    ["Firewall", fw === "open" ? "ok" : fw === "blocked" ? "bad" : "warn", fw === "open" ? "Open" : fw === "blocked" ? "Blocked" : "Unknown"],
-    ["Playback", s.lastError ? "bad" : "ok", s.lastError ? "Error" : "Ready"],
-  ];
-  const h = $("health"); h.replaceChildren();
-  for (const [k, cls, v] of items) {
-    const d = document.createElement("div"); d.className = cls;
-    d.innerHTML = "<i></i><span></span><em></em>";
-    d.children[1].textContent = k; d.children[2].textContent = v;
-    h.append(d);
+  // Output list
+  const list = $("devices"); list.replaceChildren();
+  const def = s.sinks.find((x) => x.name === s.defaultSink);
+  list.append(deviceItem("", "Follow system output", def ? `Now ${def.description}` : "Whatever the laptop uses", "i-auto", s.sink === ""));
+  for (const k of s.sinks) {
+    list.append(deviceItem(k.name, k.description,
+      [isHeadset(k.name) ? "Bluetooth" : "Speaker or jack", k.name === s.defaultSink ? "system default" : ""].filter(Boolean).join(" · "),
+      isHeadset(k.name) ? "i-head" : "i-speaker", s.sink === k.name));
   }
-  if (!everLive && !$("setup").dataset.touched) $("setup").open = !live;
+  if (s.sink && !s.sinks.some((k) => k.name === s.sink)) list.append(deviceItem(s.sink, "Saved device", "Not connected. Using it when it's back", "i-speaker", true));
+
+  // Volume
+  const pct = Math.round(s.volume * 100), focused = document.activeElement === $("volume");
+  if (!focused) $("volume").value = pct;
+  setVolumeUi(focused ? +$("volume").value : pct, s.muted);
+  const m = $("mute");
+  m.setAttribute("aria-pressed", String(s.muted));
+  m.setAttribute("aria-label", s.muted ? "Unmute" : "Mute");
+  m.querySelector(".on-vol").classList.toggle("off", s.muted);
+  m.querySelector(".on-mute").classList.toggle("off", !s.muted);
+
+  renderQuality(s);
+
+  // History
+  const h = $("history"); h.replaceChildren();
+  if (!s.recent?.length) {
+    const e = el("div", "empty"); e.append(el("span", null, "Finished sessions appear here.")); h.append(e);
+  }
+  for (const r of s.recent || []) {
+    const row = el("div", "h-row");
+    const sub = el("div", "s");
+    sub.append(`${dur(r.durationS)} · ${REASONS[r.reason] || r.reason}`);
+    if (r.drops || r.underruns) sub.append(" · ", el("span", "warnish", [r.drops ? `${r.drops} skipped` : "", r.underruns ? `${r.underruns} gaps` : ""].filter(Boolean).join(", ")));
+    row.append(el("div", "h", r.device), el("div", "when body-s", ago(r.start)), sub);
+    h.append(row);
+  }
+
+  // This laptop
+  if (!editing) $("name").value = s.name;
+  const fw = s.health.firewall;
+  const rows = [
+    ["Address", main || "No network", null, true],
+    ["Pairing code", null, null, false, true],
+    ["Audio server", s.health.listening ? "Listening on 47800" : "Off", s.health.listening ? "ok" : "bad"],
+    ["Discovery", s.health.discovery ? "On" : "Off. Type the address on the phone", s.health.discovery ? "ok" : "warn"],
+    ["Firewall", fw === "open" ? "Open" : fw === "blocked" ? "Blocking phones" : "Not checked", fw === "open" ? "ok" : fw === "blocked" ? "bad" : "warn"],
+  ];
+  const hb = $("health"); hb.replaceChildren();
+  for (const [k, v, dot, mono, isCode] of rows) {
+    const r = el("div", "row"); r.append(el("span", "k", k));
+    if (isCode) {
+      const d = el("div", "digits small"); setDigits(d, s.code);
+      const b = el("button", "icon-btn"); b.type = "button"; b.setAttribute("aria-label", "Copy code"); b.innerHTML = icon("i-copy", 20);
+      b.onclick = () => copy(s.code, "Code");
+      r.append(d, b);
+    } else {
+      const val = el("span", "v" + (mono ? " num" : ""));
+      if (dot) val.append(el("i", "dot " + dot));
+      val.append(v);
+      r.append(val);
+    }
+    hb.append(r);
+  }
 }
 
+function renderDown() {
+  down = true;
+  $("svc").className = "chip bad"; $("svc").lastElementChild.textContent = "Not running";
+  const hero = $("hero"); hero.className = "card hero down";
+  $("avatar").innerHTML = icon("i-phone-off", 28);
+  $("title").textContent = "Dhvani isn't running";
+  const meta = $("meta"); meta.replaceChildren(el("span", null, "Start it with: systemctl --user start dhvani"));
+  $("live-body").hidden = true; $("pair-body").hidden = true; $("disconnect").hidden = true;
+}
+
+// ---------- Events ----------
 let volTimer;
 $("volume").addEventListener("input", (e) => {
   setVolumeUi(+e.target.value, false);
@@ -332,17 +637,29 @@ $("volume").addEventListener("input", (e) => {
   volTimer = setTimeout(() => post("/api/settings", { volume: e.target.value / 100, muted: false }), 80);
 });
 $("mute").onclick = () => post("/api/settings", { muted: !state?.muted });
-$("newcode").onclick = () => post("/api/code").then((ok) => ok && toast("New code ready"));
-$("copy").onclick = () => navigator.clipboard?.writeText(state?.code || "").then(() => toast("Code copied"), () => toast("Copy blocked by the browser"));
-$("disconnect").onclick = () => post("/api/disconnect");
-$("setup").addEventListener("toggle", () => ($("setup").dataset.touched = "1"));
+$("newcode").onclick = () => post("/api/code").then((ok) => ok && snack("New code ready. Phones using the old one are disconnected"));
+$("copy").onclick = () => copy(state?.code || "", "Code");
+$("fw-copy").onclick = () => copy(state?.firewallFix || "", "Command");
+$("disconnect").onclick = () => post("/api/disconnect").then((ok) => ok && snack("Phone disconnected"));
 $("name").addEventListener("focus", () => (editing = true));
 $("name").addEventListener("blur", () => {
   editing = false;
   const v = $("name").value.trim();
-  if (v && v !== state?.name) post("/api/settings", { name: v }).then((ok) => ok && toast("Name saved"));
+  if (v && v !== state?.name) post("/api/settings", { name: v }).then((ok) => ok && snack("Name saved"));
+  else if (state) $("name").value = state.name;
 });
-$("name").addEventListener("keydown", (e) => { if (e.key === "Enter") e.target.blur(); });
+$("name").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") e.target.blur();
+  if (e.key === "Escape") { e.target.value = state?.name || ""; e.target.blur(); }
+});
+
+// A system theme flip must snap, not crossfade every surface.
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
+  const st = document.createElement("style");
+  st.textContent = "*,*::before,*::after{transition:none !important}";
+  document.head.append(st); void document.body.offsetHeight;
+  requestAnimationFrame(() => st.remove());
+});
 
 function connect() {
   const es = new EventSource("/api/events");
@@ -353,15 +670,13 @@ function connect() {
     drawViz();
     viz.setAttribute("aria-valuenow", Math.round(levels[BARS - 1] * 100));
   });
-  es.onerror = () => {
-    $("svc").className = "chip bad"; $("svc").lastElementChild.textContent = "Service not running";
-    $("hero").classList.remove("live");
-    $("title").textContent = "Dhvani service is not running";
-  };
+  es.onopen = () => { if (down) fetch("/api/state").then((r) => r.json()).then(render).catch(() => {}); };
+  es.onerror = renderDown;
 }
-fetch("/api/state").then((r) => r.json()).then(render).catch(() => {});
+fetch("/api/state").then((r) => r.json()).then(render).catch(renderDown);
 connect();
-setInterval(() => state?.session && render(state), 1000);
+setInterval(() => state?.session && !down && render(state), 1000);
+setTimeout(() => $("main").classList.remove("enter"), 800);
 </script>
 </body>
 </html>

@@ -23,6 +23,25 @@ function readEvents(file: string): Ev[] {
   return out;
 }
 
+/** Last `n` finished sessions from the log, newest first, for the panel after a restart. */
+export function recentSessions(file: string, n: number) {
+  const starts = new Map<number, Ev>();
+  const out: { device: string; start: number; durationS: number; reason: string; drops: number; underruns: number }[] = [];
+  for (const e of readEvents(file)) {
+    if (e.ev === "start") starts.clear();
+    if (e.ev === "session_start") starts.set(num(e.session), e);
+    if (e.ev === "session_end") {
+      const s = starts.get(num(e.session));
+      if (!s) continue;
+      out.push({
+        device: String(s.device ?? "Phone"), start: Date.parse(s.t), durationS: num(e.durationS),
+        reason: String(e.reason), drops: num(e.drops), underruns: num(e.underruns),
+      });
+    }
+  }
+  return out.slice(-n).reverse();
+}
+
 const num = (v: unknown) => (typeof v === "number" ? v : 0);
 
 /** `dhvani report [N]`: one line per recent session plus what went wrong in it. */
