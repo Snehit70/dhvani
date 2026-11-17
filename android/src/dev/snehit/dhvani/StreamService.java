@@ -1,0 +1,442 @@
+package dev.snehit.dhvani;
+
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.PendingIntent;
+import android.app.Service;
+import android.content.Context;
+import android.content.Intent;
+import android.content.pm.ServiceInfo;
+import android.media.AudioAttributes;
+import android.media.AudioFormat;
+import android.media.AudioManager;
+import android.media.AudioPlaybackCaptureConfiguration;
+import android.media.AudioRecord;
+import android.media.projection.MediaProjection;
+import android.media.projection.MediaProjectionManager;
+import android.net.wifi.WifiManager;
+import android.os.SystemClock;
+import android.os.Build;
+import android.os.Handler;
+import android.os.IBinder;
+import android.os.Looper;
+import android.os.Process;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.InetSocketAddress;
+import java.net.Socket;
+import java.nio.charset.StandardCharsets;
+
+/**
+ * Foreground service that captures what the phone is playing and sends it to the laptop.
+ * One instance, one projection; reconnects reuse the same projection.
+ */
+public final class StreamService extends Service {
+    static final String ACTION_START = "dev.snehit.dhvani.START";
+    static final String ACTION_STOP = "dev.snehit.dhvani.STOP";
+    static final String EXTRA_RESULT_CODE = "resultCode";
+    static final String EXTRA_DATA = "data";
+    static final String EXTRA_HOST = "host";
+    static final String EXTRA_PORT = "port";
+    static final String EXTRA_CODE = "code";
+    static final String EXTRA_SILENCE = "silence";
+    static final String EXTRA_RECONNECT = "reconnect";
+
+    private static final String CHANNEL = "stream";
+    private static final int NOTIFICATION_ID = 1;
+    private static final int CHUNK_MS = 10;
+    private static final int CHUNK_BYTES = Protocol.RATE * Protocol.CHANNELS * 2 * CHUNK_MS / 1000;
+    /** Media playing but capture all zeros this long means muting the phone also mutes the capture. */
+    private static final int SILENCE_PROBE_MS = 3000;
+
+    /** A write stuck this long means the laptop vanished without closing the socket. */
+    private static final long WRITE_STALL_MS = 3000;
+    private static final String STATE_PREFS = "dhvani_state";
+    private static final String KEY_SAVED_VOLUME = "savedVolume";
+
+    private final Handler main = new Handler(Looper.getMainLooper());
+    /** Uptime when the current socket write began, 0 when no write is in flight. */
+    private volatile long writeStartedAt;
+    private WifiManager.WifiLock wifiLock;
+    private final Runnable watchdog = new Runnable() {
+        @Override public void run() {
+            if (!running) return;
+            long t = writeStartedAt;
+            if (t != 0 && SystemClock.uptimeMillis() - t > WRITE_STALL_MS) closeQuietly(socket);
+            main.postDelayed(this, 1000);
+        }
+    };
+    private MediaProjection projection;
+    private AudioRecord record;
+    private Thread worker;
+    private volatile boolean running;
+    private volatile Socket socket;
+
+    private String host;
+    private int port;
+    private String code;
+    private boolean silence;
+    private boolean reconnect;
+
+    private AudioManager audio;
+    private int savedVolume = -1;
+    private boolean silenceBroken;
+
+    private final MediaProjection.Callback projectionCallback = new MediaProjection.Callback() {
+        @Override public void onStop() {
+            main.post(() -> stopStreaming(null));
+        }
+    };
+
+    @Override public IBinder onBind(Intent intent) { return null; }
+
+    @Override public int onStartCommand(Intent intent, int flags, int startId) {
+        if (intent == null || ACTION_STOP.equals(intent.getAction())) {
+            stopStreaming(null);
+            return START_NOT_STICKY;
+        }
+        if (running) stopCapture();
+
+        host = intent.getStringExtra(EXTRA_HOST);
+        port = intent.getIntExtra(EXTRA_PORT, Protocol.AUDIO_PORT);
+        code = intent.getStringExtra(EXTRA_CODE);
+        silence = intent.getBooleanExtra(EXTRA_SILENCE, true);
+        reconnect = intent.getBooleanExtra(EXTRA_RECONNECT, true);
+        silenceBroken = false;
+        audio = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
+        restoreLeftoverVolume();
+
+        // startForeground must come before getMediaProjection on Android 14+.
+        try {
+            startForeground(NOTIFICATION_ID, buildNotification("Connecting to " + host),
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION);
+        } catch (RuntimeException e) {
+            fail("Android blocked the background service: " + e.getMessage());
+            return START_NOT_STICKY;
+        }
+
+        int resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, 0);
+        Intent data = Build.VERSION.SDK_INT >= 34
+                ? intent.getParcelableExtra(EXTRA_DATA, Intent.class)
+                : intent.getParcelableExtra(EXTRA_DATA);
+        MediaProjectionManager mpm = (MediaProjectionManager) getSystemService(MEDIA_PROJECTION_SERVICE);
+        try {
+            projection = data == null ? null : mpm.getMediaProjection(resultCode, data);
+        } catch (RuntimeException e) {
+            projection = null;
+        }
+        if (projection == null) {
+            fail("Audio sharing permission was not granted.");
+            return START_NOT_STICKY;
+        }
+        projection.registerCallback(projectionCallback, main);
+
+        try {
+            record = buildRecorder(projection);
+        } catch (RuntimeException e) {
+            fail("Could not start audio capture: " + e.getMessage());
+            return START_NOT_STICKY;
+        }
+
+        running = true;
+        StreamState.setNotice("");
+        acquireWifiLock();
+        worker = new Thread(this::runLoop, "dhvani-stream");
+        worker.start();
+        main.postDelayed(watchdog, 1000);
+        return START_NOT_STICKY;
+    }
+
+    @Override public void onDestroy() {
+        stopCapture();
+        super.onDestroy();
+    }
+
+    private AudioRecord buildRecorder(MediaProjection mp) {
+        AudioPlaybackCaptureConfiguration cfg = new AudioPlaybackCaptureConfiguration.Builder(mp)
+                .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
+                .addMatchingUsage(AudioAttributes.USAGE_GAME)
+                .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
+                .build();
+        AudioFormat fmt = new AudioFormat.Builder()
+                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                .setSampleRate(Protocol.RATE)
+                .setChannelMask(AudioFormat.CHANNEL_IN_STEREO)
+                .build();
+        int min = AudioRecord.getMinBufferSize(Protocol.RATE, AudioFormat.CHANNEL_IN_STEREO,
+                AudioFormat.ENCODING_PCM_16BIT);
+        AudioRecord r;
+        try {
+            r = new AudioRecord.Builder()
+                    .setAudioFormat(fmt)
+                    .setBufferSizeInBytes(Math.max(min, CHUNK_BYTES * 8))
+                    .setAudioPlaybackCaptureConfig(cfg)
+                    .build();
+        } catch (SecurityException e) {
+            throw new IllegalStateException("microphone permission missing");
+        }
+        if (r.getState() != AudioRecord.STATE_INITIALIZED) {
+            r.release();
+            throw new IllegalStateException("recorder did not initialise");
+        }
+        return r;
+    }
+
+    private void runLoop() {
+        Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO);
+        int backoff = 1000;
+        byte[] buf = new byte[CHUNK_BYTES];
+        final AudioRecord rec = record;
+        while (running) {
+            update(StreamState.Status.CONNECTING, "Connecting to " + host);
+            Socket s = new Socket();
+            socket = s;
+            // stopCapture may have closed the previous socket just before this one was published.
+            if (!running) { closeQuietly(s); break; }
+            boolean streamed = false;
+            try {
+                s.setTcpNoDelay(true);
+                s.setSendBufferSize(CHUNK_BYTES * 8);
+                s.connect(new InetSocketAddress(host, port), 4000);
+                s.setSoTimeout(5000);
+                OutputStream out = s.getOutputStream();
+                out.write(Protocol.hello(code, deviceName()).getBytes(StandardCharsets.UTF_8));
+                out.flush();
+                Protocol.Reply reply = Protocol.parseReply(readLine(s.getInputStream()));
+                if (!reply.ok) {
+                    if (!running) break;
+                    stopFromWorker(Protocol.errorMessage(reply.error));
+                    return;
+                }
+                s.setSoTimeout(0);
+                rec.startRecording();
+                silencePhone();
+                streamed = true;
+                backoff = 1000;
+                update(StreamState.Status.STREAMING, reply.name);
+                int zeroMs = 0;
+                while (running) {
+                    int n = rec.read(buf, 0, buf.length);
+                    if (n < 0) throw new IOException("capture error " + n);
+                    if (n == 0) continue;
+                    writeStartedAt = SystemClock.uptimeMillis();
+                    out.write(buf, 0, n);
+                    writeStartedAt = 0;
+                    if (savedVolume >= 0 && !silenceBroken) {
+                        zeroMs = allZero(buf, n) && audio.isMusicActive() ? zeroMs + CHUNK_MS : 0;
+                        if (zeroMs >= SILENCE_PROBE_MS) {
+                            silenceBroken = true;
+                            restoreVolume();
+                            StreamState.setNotice("This phone mutes the shared audio too, so it keeps "
+                                    + "playing out loud. Turn off \"Silence this phone\".");
+                        }
+                    }
+                }
+            } catch (IOException | RuntimeException e) {
+                if (!running) break;
+                if (!reconnect) {
+                    stopFromWorker(streamed ? "Connection to the laptop was lost." : friendly(e));
+                    return;
+                }
+                update(StreamState.Status.RECONNECTING, streamed
+                        ? "Connection lost. Retrying…" : friendly(e) + " Retrying…");
+            } finally {
+                writeStartedAt = 0;
+                closeQuietly(s);
+                try { rec.stop(); } catch (RuntimeException ignored) {}
+                // While the laptop is away the phone plays on its own speaker again.
+                restoreVolume();
+            }
+            try {
+                Thread.sleep(backoff);
+            } catch (InterruptedException e) {
+                break;
+            }
+            backoff = Math.min(backoff * 2, 8000);
+        }
+    }
+
+    private static boolean allZero(byte[] b, int n) {
+        for (int i = 0; i < n; i++) if (b[i] != 0) return false;
+        return true;
+    }
+
+    private static String friendly(Exception e) {
+        String m = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+        if (m.contains("ECONNREFUSED") || m.contains("refused")) return "Laptop is not running Dhvani.";
+        if (m.contains("timed out") || m.contains("ETIMEDOUT")) return "Laptop did not answer. Same Wi-Fi?";
+        if (m.contains("EHOSTUNREACH") || m.contains("ENETUNREACH")) return "Laptop is unreachable. Same Wi-Fi?";
+        return "Could not connect: " + m;
+    }
+
+    private static String readLine(InputStream in) throws IOException {
+        StringBuilder sb = new StringBuilder();
+        while (sb.length() < 2048) {
+            int c = in.read();
+            if (c < 0) throw new IOException("laptop closed the connection");
+            if (c == '\n') return sb.toString();
+            sb.append((char) c);
+        }
+        throw new IOException("reply too long");
+    }
+
+    private synchronized void silencePhone() {
+        if (!silence || silenceBroken || savedVolume >= 0) return;
+        try {
+            savedVolume = audio.getStreamVolume(AudioManager.STREAM_MUSIC);
+            // Persist first so a crash or force-stop cannot leave the phone muted for good.
+            statePrefs().edit().putInt(KEY_SAVED_VOLUME, savedVolume).commit();
+            audio.setStreamVolume(AudioManager.STREAM_MUSIC, 0, 0);
+        } catch (RuntimeException e) {
+            savedVolume = -1;
+            statePrefs().edit().remove(KEY_SAVED_VOLUME).apply();
+        }
+    }
+
+    private android.content.SharedPreferences statePrefs() {
+        return getSharedPreferences(STATE_PREFS, MODE_PRIVATE);
+    }
+
+    /** Puts back a volume saved by a previous run that died while the phone was silenced. */
+    private synchronized void restoreLeftoverVolume() {
+        int v = statePrefs().getInt(KEY_SAVED_VOLUME, -1);
+        if (v < 0 || savedVolume >= 0) return;
+        savedVolume = v;
+        restoreVolume();
+    }
+
+    private void acquireWifiLock() {
+        try {
+            WifiManager wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+            if (wm == null) return;
+            wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "dhvani:stream");
+            wifiLock.setReferenceCounted(false);
+            wifiLock.acquire();
+        } catch (RuntimeException e) {
+            wifiLock = null;
+        }
+    }
+
+    private void releaseWifiLock() {
+        if (wifiLock != null && wifiLock.isHeld()) {
+            try { wifiLock.release(); } catch (RuntimeException ignored) {}
+        }
+        wifiLock = null;
+    }
+
+    private synchronized void restoreVolume() {
+        int v = savedVolume;
+        if (v < 0) return;
+        savedVolume = -1;
+        statePrefs().edit().remove(KEY_SAVED_VOLUME).apply();
+        try {
+            // Leave it alone if the user changed the volume meanwhile.
+            if (audio.getStreamVolume(AudioManager.STREAM_MUSIC) == 0) {
+                audio.setStreamVolume(AudioManager.STREAM_MUSIC, v, 0);
+            }
+        } catch (RuntimeException ignored) {}
+    }
+
+    private String deviceName() {
+        String n = android.provider.Settings.Global.getString(getContentResolver(), "device_name");
+        if (n == null || n.trim().isEmpty()) n = Build.MANUFACTURER + " " + Build.MODEL;
+        return n.trim();
+    }
+
+    private void update(StreamState.Status s, String detail) {
+        StreamState.set(s, detail);
+        main.post(() -> {
+            if (!running) return;
+            String text;
+            switch (s) {
+                case STREAMING: text = "Playing on " + detail; break;
+                case RECONNECTING: text = detail; break;
+                default: text = "Connecting to " + host; break;
+            }
+            NotificationManager nm = getSystemService(NotificationManager.class);
+            nm.notify(NOTIFICATION_ID, buildNotification(text));
+        });
+    }
+
+    private void fail(String message) {
+        stopCapture();
+        StreamState.set(StreamState.Status.ERROR, message);
+        stopForeground(STOP_FOREGROUND_REMOVE);
+        stopSelf();
+    }
+
+    private void stopFromWorker(String error) {
+        main.post(() -> stopStreaming(error));
+    }
+
+    /** Stops everything; error is shown in the app, null means a normal stop. */
+    private void stopStreaming(String error) {
+        stopCapture();
+        if (error == null) StreamState.set(StreamState.Status.IDLE, "");
+        else StreamState.set(StreamState.Status.ERROR, error);
+        stopForeground(STOP_FOREGROUND_REMOVE);
+        stopSelf();
+    }
+
+    private void stopCapture() {
+        running = false;
+        main.removeCallbacks(watchdog);
+        releaseWifiLock();
+        closeQuietly(socket);
+        // Stopping the recorder unblocks a worker waiting in read().
+        if (record != null) {
+            try { record.stop(); } catch (RuntimeException ignored) {}
+        }
+        Thread w = worker;
+        worker = null;
+        if (w != null && w != Thread.currentThread()) {
+            w.interrupt();
+            try { w.join(1500); } catch (InterruptedException ignored) {}
+        }
+        if (record != null) {
+            record.release();
+            record = null;
+        }
+        restoreVolume();
+        if (projection != null) {
+            projection.unregisterCallback(projectionCallback);
+            projection.stop();
+            projection = null;
+        }
+    }
+
+    private static void closeQuietly(Socket s) {
+        if (s == null) return;
+        try { s.close(); } catch (IOException ignored) {}
+    }
+
+    private Notification buildNotification(String text) {
+        NotificationManager nm = getSystemService(NotificationManager.class);
+        if (nm.getNotificationChannel(CHANNEL) == null) {
+            NotificationChannel ch = new NotificationChannel(CHANNEL, "Streaming",
+                    NotificationManager.IMPORTANCE_LOW);
+            ch.setDescription("Shown while phone audio plays on your laptop");
+            ch.setShowBadge(false);
+            nm.createNotificationChannel(ch);
+        }
+        PendingIntent open = PendingIntent.getActivity(this, 0,
+                new Intent(this, MainActivity.class).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
+                PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+        PendingIntent stop = PendingIntent.getService(this, 1,
+                new Intent(this, StreamService.class).setAction(ACTION_STOP),
+                PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+        return new Notification.Builder(this, CHANNEL)
+                .setSmallIcon(R.drawable.ic_notify)
+                .setContentTitle("Dhvani")
+                .setContentText(text)
+                .setContentIntent(open)
+                .setOngoing(true)
+                .setOnlyAlertOnce(true)
+                .setCategory(Notification.CATEGORY_SERVICE)
+                .addAction(new Notification.Action.Builder(null, "Stop", stop).build())
+                .build();
+    }
+}

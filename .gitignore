@@ -1,0 +1,6 @@
+node_modules/
+laptop/dist/
+android/build/
+android/dist/
+*.keystore
+*.jks
