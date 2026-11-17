@@ -1,7 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { FrameAligner, LeadLimiter, processPcm } from "../src/audio";
+import { FrameAligner, JitterBuffer, processPcm } from "../src/audio";
+import { SessionNotifier } from "../src/notify";
+import { usbSerials } from "../src/usb";
 import { sanitize, defaults } from "../src/config";
-import { FailureLimiter, codesMatch, isDiscoverRequest, parseHello, parsePhoneStats, parsePhoneVolume, phoneGain } from "../src/protocol";
+import { FailureLimiter, codesMatch, isDiscoverRequest, parseHello, parseControl, parsePhoneStats, parsePhoneVolume, phoneGain } from "../src/protocol";
 import { StreamStats } from "../src/stats";
 
 const hello = (o: Record<string, unknown> = {}) =>
@@ -86,19 +88,43 @@ test("sanitize keeps values in range", () => {
   expect(c.code).toBe(base.code);
 });
 
-test("LeadLimiter drops bursts beyond the lead and re-anchors after underruns", () => {
+test("JitterBuffer prefills its target so a Wi-Fi hiccup does not run dry", () => {
   let t = 0;
-  const l = new LeadLimiter(1, 80, 30, () => t); // 1 byte per ms for easy maths
-  // A 200 ms burst arrives at once: only ~80 ms worth (+ the chunk that crosses) is admitted.
-  const admitted = Array.from({ length: 20 }, () => l.admit(10)).filter(Boolean).length;
-  expect(admitted).toBe(9);
-  // Steady real-time flow keeps the lead stable.
-  for (let i = 0; i < 50; i++) { t += 10; expect(l.admit(10)).toBe(true); }
-  expect(l.lead()).toBeCloseTo(90);
-  // A long stall (player played silence) re-anchors rather than letting the deficit carry over.
-  t += 500;
-  expect(l.admit(10)).toBe(true);
-  expect(l.lead()).toBeCloseTo(10);
+  const b = new JitterBuffer(1, { minMs: 100, maxMs: 300 }, () => t); // 1 byte per ms
+  expect(b.admit(10)).toEqual({ play: true, prefillMs: 100 });
+  for (let i = 0; i < 20; i++) { t += 10; b.admit(10); }
+  // 110 ms with nothing, then the backlog arrives at once: no underrun, nothing dropped.
+  t += 110;
+  const burst = Array.from({ length: 11 }, () => b.admit(10));
+  expect(burst.every((a) => a.play && a.prefillMs === 0)).toBe(true);
+  expect(b.underruns).toBe(0);
+});
+
+test("JitterBuffer grows after an audible underrun, ignores ones after silence, and relaxes", () => {
+  let t = 0;
+  const b = new JitterBuffer(1, { minMs: 100, maxMs: 300 }, () => t);
+  b.admit(10);
+  t += 400; // dry after audible audio
+  expect(b.admit(10).prefillMs).toBe(120);
+  expect(b.underruns).toBe(1);
+  b.admit(10, true);
+  t += 2000; // phone paused sending during silence
+  b.admit(10);
+  expect(b.underruns).toBe(1);
+  expect(b.targetMs).toBe(120);
+  for (let i = 0; i < 3100; i++) { t += 10; b.admit(10); }
+  expect(b.targetMs).toBe(110);
+});
+
+test("JitterBuffer sheds excess lead only in quiet chunks, with a hard cap", () => {
+  let t = 0;
+  const b = new JitterBuffer(1, { minMs: 100, maxMs: 300 }, () => t);
+  b.admit(10); // lead 110
+  for (let i = 0; i < 3; i++) b.admit(10); // burst: lead 140
+  expect(b.admit(10, true).play).toBe(false); // quiet and above target + 30: dropped
+  expect(b.admit(10, false).play).toBe(true); // audible: kept
+  const r = Array.from({ length: 20 }, () => b.admit(10, false).play);
+  expect(r.filter(Boolean).length).toBe(6); // 150..200 ms admitted, then capped at target + 100
 });
 
 test("StreamStats summarises arrival gaps, rate and drops per window", () => {
@@ -150,4 +176,58 @@ test("phoneGain: mute and zero are silent, max is unity, steps are monotonic", (
     prev = g;
   }
   expect(phoneGain({ index: 1, max: 15, muted: false })).toBeLessThan(0.01);
+});
+
+test("parseControl clamps volume and needs at least one change", () => {
+  expect(parseControl(JSON.stringify({ dhvani: "control", code: "1", volume: 9 }))).toEqual({ code: "1", volume: 1.5 });
+  expect(parseControl(JSON.stringify({ dhvani: "control", code: "1", muted: true }))).toEqual({ code: "1", muted: true });
+  expect(parseControl(JSON.stringify({ dhvani: "control", code: "1" }))).toBeNull();
+  expect(parseControl(JSON.stringify({ dhvani: "control", volume: 1 }))).toBeNull();
+});
+
+test("usbSerials keeps cable-attached phones only", () => {
+  const out = "List of devices attached\nABC123\tdevice\n192.168.1.5:5555\tdevice\n" +
+    "adb-XYZ._adb-tls-connect._tcp\tdevice\nDEF456\tunauthorized\n";
+  expect(usbSerials(out)).toEqual(["ABC123"]);
+});
+
+test("SessionNotifier: one notice per real change, blips within grace are silent", async () => {
+  const sent: string[] = [];
+  const n = new SessionNotifier((title) => sent.push(title), () => true, 30);
+  n.started("Pixel");
+  n.ended("Pixel", "socket_error");
+  n.started("Pixel"); // reconnected within grace
+  await Bun.sleep(50);
+  expect(sent).toEqual(["Phone connected"]);
+  n.ended("Pixel", "phone_closed");
+  await Bun.sleep(50);
+  expect(sent).toEqual(["Phone connected", "Phone disconnected"]);
+  n.started("Pixel");
+  n.ended("Pixel", "disconnected"); // user pressed Disconnect: no notice
+  await Bun.sleep(50);
+  expect(sent).toEqual(["Phone connected", "Phone disconnected", "Phone connected"]);
+});
+
+test("Analyzer: a 1 kHz tone lights the 1 kHz band, meters read the channel peaks", () => {
+  const { Analyzer, bandEdges, BANDS } = require("../src/analyzer") as typeof import("../src/analyzer");
+  const rate = 48000, n = 4096, pcm = new Uint8Array(n * 4), v = new DataView(pcm.buffer);
+  for (let i = 0; i < n; i++) {
+    const s = Math.round(Math.sin((2 * Math.PI * 1000 * i) / rate) * 16384);
+    v.setInt16(i * 4, s, true);
+    v.setInt16(i * 4 + 2, 0, true); // right channel silent
+  }
+  const a = new Analyzer(rate, 2);
+  a.push(pcm);
+  const f = a.frame(0.5);
+  expect(f.l).toBeCloseTo(0.5, 1);
+  expect(f.r).toBe(0);
+  expect(f.rmsL).toBeCloseTo(0.354, 1);
+  const bin = Math.round((1000 * 2048) / rate);
+  const edges = bandEdges(rate);
+  const band = edges.findIndex((e, i) => bin >= e && bin < edges[i + 1]!);
+  const loudest = f.bands.indexOf(Math.max(...f.bands));
+  expect(f.bands.length).toBe(BANDS);
+  expect(Math.abs(loudest - band)).toBeLessThanOrEqual(1);
+  expect(f.bands[2]!).toBeLessThan(0.3);
+  expect(a.frame(0).l).toBe(0); // meters reset between frames
 });

@@ -4,10 +4,18 @@
 //   phone  -> laptop  one JSON line: {"v":1,"code":"123456","device":"Pixel","rate":48000,"channels":2,"format":"s16le"}
 //   laptop -> phone   one JSON line: {"ok":true,"name":"fedora"} or {"ok":false,"error":"bad_code"}
 //   phone  -> laptop  raw interleaved PCM until either side closes.
+//   laptop -> phone   JSON lines while streaming: {"dhvani":"laptop","volume":1,"muted":false,"addresses":[...]}
+//   A connection whose first line is a discover request gets one discover reply and is closed
+//   (lets a phone find the laptop through `adb reverse` over USB, where UDP does not pass).
 //
 // Discovery (UDP broadcast, DISCOVERY_PORT):
 //   phone  -> 255.255.255.255  {"dhvani":"discover","v":1}
 //   laptop -> phone            {"dhvani":"here","v":1,"name":"fedora","port":47800}
+//
+// Phone reports (UDP to DISCOVERY_PORT, all carry the pairing code):
+//   {"dhvani":"stats",...}    health counters every 10 s
+//   {"dhvani":"volume",...}   phone media volume and mute
+//   {"dhvani":"control","v":1,"code","volume"?:0..1.5,"muted"?:bool}  sets the laptop's own volume
 
 export const PROTOCOL_VERSION = 1;
 export const AUDIO_PORT = 47800;
@@ -180,4 +188,28 @@ export function phoneGain(v: { index: number; max: number; muted: boolean }): nu
   if (v.muted || v.index <= 0) return 0;
   if (v.index >= v.max) return 1;
   return 10 ** ((-PHONE_RANGE_DB * (1 - v.index / v.max)) / 20);
+}
+
+export type PhoneControl = { code: string; volume?: number; muted?: boolean };
+
+/** Phone asking to change the laptop's volume or mute. */
+export function parseControl(msg: string): PhoneControl | null {
+  let o: unknown;
+  try {
+    o = JSON.parse(msg);
+  } catch {
+    return null;
+  }
+  if (!o || typeof o !== "object") return null;
+  const r = o as Record<string, unknown>;
+  if (r.dhvani !== "control" || typeof r.code !== "string") return null;
+  const out: PhoneControl = { code: r.code };
+  if (typeof r.volume === "number" && Number.isFinite(r.volume)) out.volume = Math.min(1.5, Math.max(0, r.volume));
+  if (typeof r.muted === "boolean") out.muted = r.muted;
+  return out.volume === undefined && out.muted === undefined ? null : out;
+}
+
+/** Laptop state pushed down the audio socket so the phone can show and change it. */
+export function laptopState(volume: number, muted: boolean, addresses: string[]): string {
+  return JSON.stringify({ dhvani: "laptop", volume, muted, addresses }) + "\n";
 }

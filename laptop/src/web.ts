@@ -8,6 +8,8 @@ export type WebDeps = {
   updateSettings(input: Record<string, unknown>): Promise<void> | void;
   newCode(): void;
   disconnect(): void;
+  /** Live chart backlog and past sessions for the analytics view. */
+  history?(): unknown;
 };
 
 type Client = { send(event: string, data: unknown): void; close(): void };
@@ -74,6 +76,8 @@ export class WebUI {
         });
       case "GET /api/state":
         return json(await this.deps.state());
+      case "GET /api/history":
+        return json(this.deps.history ? await this.deps.history() : {});
       case "GET /api/events":
         return this.events(req);
       case "POST /api/settings": {

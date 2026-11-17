@@ -5,7 +5,10 @@ import type { Config } from "../src/config";
 import type { Player, PlayerFactory } from "../src/player";
 import { AudioServer } from "../src/server";
 
-const config: Config = { code: "424242", sink: "", volume: 1, muted: false, followPhone: true, name: "testbox" };
+const config: Config = {
+  code: "424242", sink: "", volume: 1, muted: false, followPhone: true, name: "testbox",
+  latency: "stable", notify: false, usb: false,
+};
 
 type FakePlayer = Player & { data: number[]; opts: Parameters<PlayerFactory>[0] };
 let players: FakePlayer[] = [];
@@ -18,6 +21,8 @@ const factory: PlayerFactory = (opts) => {
     write(pcm) { p.data.push(...pcm); return "ok" as const; },
     leadMs: 0,
     underruns: 0,
+    targetMs: 100,
+    setLatency() {},
     close() { closed = true; },
   };
   players.push(p);
@@ -32,8 +37,12 @@ afterEach(() => {
   changes = 0;
 });
 
+let controls: { volume?: number; muted?: boolean }[] = [];
 async function start(cfg = config) {
-  server = new AudioServer(() => cfg, factory, { onChange: () => changes++, onLevel: () => {} }, 500);
+  controls = [];
+  server = new AudioServer(() => cfg, factory, {
+    onChange: () => changes++, onLevel: () => {}, onControl: (c) => controls.push(c), addresses: () => ["10.0.0.5"],
+  }, 500);
   return server.listen(0, "127.0.0.1");
 }
 
@@ -80,7 +89,7 @@ test("accepts the right code and plays aligned PCM", async () => {
   c.sock.write(Buffer.from([4, 0]));
   await until(() => players[0]?.data.length === 8);
   expect(players[0]!.data).toEqual([1, 0, 2, 0, 3, 0, 4, 0]);
-  expect(players[0]!.opts).toEqual({ rate: 48000, channels: 2, sink: "" });
+  expect(players[0]!.opts).toEqual({ rate: 48000, channels: 2, sink: "", latency: "stable" });
   c.sock.end();
   await until(() => server.session === null);
   expect(players[0]!.closed).toBe(true);
@@ -182,5 +191,44 @@ test("followPhone off ignores the phone's volume", async () => {
   c.sock.write(Buffer.from([0x00, 0x40, 0x00, 0x40]));
   await until(() => players[0]?.data.length === 4);
   expect(players[0]!.data).toEqual([0x00, 0x40, 0x00, 0x40]);
+  c.sock.end();
+});
+
+test("laptop pushes its volume to the phone after the reply", async () => {
+  const port = await start({ ...config, volume: 0.8, muted: true });
+  const c = connect(port);
+  c.sock.write(hello("424242"));
+  expect(JSON.parse(await c.line()).ok).toBe(true);
+  expect(JSON.parse(await c.line())).toEqual({ dhvani: "laptop", volume: 0.8, muted: true, addresses: ["10.0.0.5"] });
+  c.sock.end();
+});
+
+test("discover request over TCP gets a reply and no session (USB probe)", async () => {
+  const port = await start();
+  const c = connect(port);
+  c.sock.write(JSON.stringify({ dhvani: "discover", v: 1 }) + "\n");
+  expect(JSON.parse(await c.line())).toEqual({ dhvani: "here", v: 1, name: "testbox", port });
+  await c.closed;
+  expect(server.session).toBeNull();
+});
+
+test("control packet from the streaming phone reaches the hook; wrong code does not", async () => {
+  const port = await start();
+  const probe = dgram.createSocket("udp4");
+  await new Promise<void>((r) => probe.bind(0, "127.0.0.1", () => r()));
+  const discPort = probe.address().port;
+  probe.close();
+  await server.listenDiscovery(discPort, port);
+  const c = connect(port);
+  c.sock.write(hello("424242"));
+  await c.line();
+  await until(() => server.session !== null);
+  const udp = dgram.createSocket("udp4");
+  const send = (o: object) => udp.send(JSON.stringify({ dhvani: "control", v: 1, ...o }), discPort, "127.0.0.1");
+  send({ code: "111111", muted: true });
+  send({ code: "424242", volume: 0.5, muted: true });
+  await until(() => controls.length === 1);
+  expect(controls[0]).toEqual({ volume: 0.5, muted: true });
+  udp.close();
   c.sock.end();
 });

@@ -1,13 +1,17 @@
 import { spawn, execFile } from "node:child_process";
-import { LeadLimiter } from "./audio";
+import { JitterBuffer, LATENCY, type LatencyMode } from "./audio";
 
-export type PlayerOptions = { rate: number; channels: number; sink: string };
+export type PlayerOptions = { rate: number; channels: number; sink: string; latency?: LatencyMode };
 
 /** ok = queued; late = dropped, too far ahead of real time; stalled = pw-cat not reading. */
 export type WriteResult = "ok" | "late" | "stalled" | "closed";
 
 export interface Player {
-  write(pcm: Uint8Array): WriteResult;
+  /** `quiet`: the chunk is near-silent, so it may be dropped to shed delay. */
+  write(pcm: Uint8Array, quiet?: boolean): WriteResult;
+  /** Current jitter-buffer target, ms. */
+  readonly targetMs: number;
+  setLatency(mode: LatencyMode): void;
   close(): void;
   readonly closed: boolean;
   /** Audio queued ahead of real time, ms. */
@@ -23,8 +27,6 @@ export type PlayerFactory = (
 
 /** Hard cap on audio stuck in Node's pipe buffer (pw-cat stalled). */
 export const MAX_BACKLOG_MS = 150;
-/** Target ceiling for audio queued ahead of real time. */
-export const MAX_LEAD_MS = 80;
 
 export const pwCatPlayer: PlayerFactory = (opts, onExit) => {
   const args = [
@@ -46,8 +48,10 @@ export const pwCatPlayer: PlayerFactory = (opts, onExit) => {
 
   const child = spawn("pw-cat", args, { stdio: ["pipe", "ignore", "pipe"] });
   const bytesPerMs = (opts.rate * opts.channels * 2) / 1000;
-  const maxBacklog = Math.round(bytesPerMs * MAX_BACKLOG_MS);
-  const lead = new LeadLimiter(bytesPerMs, MAX_LEAD_MS);
+  const frameBytes = opts.channels * 2;
+  const lead = new JitterBuffer(bytesPerMs, LATENCY[opts.latency ?? "stable"]);
+  // The backlog cap must leave room for the buffer's own prefill.
+  const maxBacklog = Math.round(bytesPerMs * (MAX_BACKLOG_MS + LATENCY.stable.maxMs));
   let closed = false;
   let stderr = "";
   child.stderr.on("data", (d: Buffer) => {
@@ -74,10 +78,21 @@ export const pwCatPlayer: PlayerFactory = (opts, onExit) => {
     get underruns() {
       return lead.underruns;
     },
-    write(pcm) {
+    get targetMs() {
+      return lead.targetMs;
+    },
+    setLatency(mode) {
+      lead.setBounds(LATENCY[mode]);
+    },
+    write(pcm, quiet = false) {
       if (closed) return "closed";
       if (child.stdin.writableLength > maxBacklog) return "stalled";
-      if (!lead.admit(pcm.length)) return "late";
+      const a = lead.admit(pcm.length, quiet);
+      if (a.prefillMs > 0) {
+        const n = Math.round((a.prefillMs * bytesPerMs) / frameBytes) * frameBytes;
+        child.stdin.write(new Uint8Array(n));
+      }
+      if (!a.play) return "late";
       child.stdin.write(pcm);
       return "ok";
     },

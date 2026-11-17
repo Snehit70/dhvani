@@ -1,7 +1,8 @@
 import net from "node:net";
 import dgram from "node:dgram";
 import type { Config } from "./config";
-import { FrameAligner, processPcm } from "./audio";
+import { FrameAligner, QUIET_PEAK, processPcm, type LatencyMode } from "./audio";
+import { Analyzer, type LevelFrame } from "./analyzer";
 import { log } from "./log";
 import type { Player, PlayerFactory } from "./player";
 import { StreamStats } from "./stats";
@@ -14,8 +15,11 @@ import {
   isDiscoverRequest,
   parseHello,
   parsePhoneStats,
+  parseControl,
   parsePhoneVolume,
+  laptopState,
   phoneGain,
+  type PhoneControl,
   type Hello,
 } from "./protocol";
 
@@ -33,9 +37,19 @@ export type Session = {
 export type ServerHooks = {
   /** Session started, ended, or an error worth showing changed. */
   onChange(): void;
-  /** Peak level 0..1, at most ~15 times a second. */
-  onLevel(peak: number): void;
+  /** Meters and spectrum, at most ~15 times a second. */
+  onLevel(frame: LevelFrame): void;
+  /** One-second stream readings for the live charts. */
+  onMetrics?(m: LiveMetrics): void;
+  /** The streaming phone asked to change the laptop's volume or mute. */
+  onControl?(c: { volume?: number; muted?: boolean }): void;
+  onSessionStart?(s: Session): void;
+  onSessionEnd?(s: Session, reason: EndReason): void;
+  /** LAN addresses the phone can send UDP reports to when it streams over USB. */
+  addresses?(): string[];
 };
+
+const isLoopback = (a: string) => a === "127.0.0.1" || a === "::1" || a.startsWith("127.");
 
 const LEVEL_INTERVAL_MS = 66;
 const RESPAWN_INTERVAL_MS = 1000;
@@ -43,6 +57,21 @@ export const STATS_INTERVAL_MS = 10_000;
 
 export type SessionSummary = {
   device: string; start: number; durationS: number; reason: string; drops: number; underruns: number;
+};
+
+export type LiveMetrics = {
+  t: number;
+  /** Kilobits per second received from the phone. */
+  kbps: number;
+  /** Longest pause between arriving packets in this second. */
+  gapMaxMs: number;
+  /** Audio queued ahead of playback, and what the jitter buffer aims for. */
+  leadMs: number;
+  targetMs: number;
+  /** Totals for the session so far. */
+  drops: number;
+  underruns: number;
+  rssi: number | null;
 };
 
 export type EndReason = "phone_closed" | "socket_error" | "replaced" | "disconnected" | "code_changed" | "shutdown";
@@ -61,6 +90,9 @@ type Active = {
   pastUnderruns: number;
   reportedUnderruns: number;
   socketError: string;
+  analyzer: Analyzer;
+  sec: { bytes: number; gapMax: number; lastAt: number };
+  secTimer: ReturnType<typeof setInterval>;
 };
 
 export class AudioServer {
@@ -82,6 +114,7 @@ export class AudioServer {
   private limiter = new FailureLimiter();
   private peak = 0;
   private lastLevelAt = 0;
+  private audioPort = 0;
 
   constructor(
     private getConfig: () => Config,
@@ -98,7 +131,8 @@ export class AudioServer {
     });
     this.tcp.on("error", (e) => this.fail(`Audio server error: ${e.message}`));
     this.listening = true;
-    return (this.tcp.address() as net.AddressInfo).port;
+    this.audioPort = (this.tcp.address() as net.AddressInfo).port;
+    return this.audioPort;
   }
 
   async listenDiscovery(port: number, audioPort: number): Promise<void> {
@@ -111,6 +145,8 @@ export class AudioServer {
       if (stats) return this.phoneStats(stats, rinfo.address);
       const vol = parsePhoneVolume(text);
       if (vol) return this.phoneVolume(vol, rinfo.address);
+      const ctl = parseControl(text);
+      if (ctl) return this.phoneControl(ctl, rinfo.address);
       if (msg.length > 512 || !isDiscoverRequest(text)) return;
       const reply = Buffer.from(discoverReply(this.getConfig().name, audioPort));
       udp.send(reply, rinfo.port, rinfo.address);
@@ -135,6 +171,18 @@ export class AudioServer {
   disconnect(reason: EndReason = "disconnected"): void {
     this.active?.socket.destroy();
     this.endActive(reason);
+  }
+
+  /** Sends the laptop's volume and mute to the streaming phone. */
+  pushLaptopState(): void {
+    const a = this.active;
+    if (!a || a.socket.destroyed) return;
+    const cfg = this.getConfig();
+    a.socket.write(laptopState(cfg.volume, cfg.muted, this.hooks.addresses?.() ?? []));
+  }
+
+  setLatency(mode: LatencyMode): void {
+    this.active?.player?.setLatency(mode);
   }
 
   /** Re-opens playback, e.g. after the output device changed. */
@@ -189,6 +237,13 @@ export class AudioServer {
       }
       const line = buf.subarray(0, nl).toString("utf8");
       const rest = buf.subarray(nl + 1);
+      if (isDiscoverRequest(line)) {
+        // USB probe through adb reverse: answer like UDP discovery, no session, no log noise.
+        done = true;
+        clearTimeout(timer);
+        socket.end(discoverReply(this.getConfig().name, this.audioPort) + "\n");
+        return;
+      }
       if (this.limiter.blocked(address)) return reject({ ok: false, error: "rate_limited" });
       const hello = parseHello(line);
       if ("error" in hello) return reject({ ok: false, error: hello.error });
@@ -229,8 +284,12 @@ export class AudioServer {
       stats: new StreamStats(),
       statsTimer: setInterval(() => this.flushStats(active, bytesPerSec), STATS_INTERVAL_MS),
       totalBytes: 0, totalDrops: 0, pastUnderruns: 0, reportedUnderruns: 0, socketError: "",
+      analyzer: new Analyzer(hello.rate, hello.channels),
+      sec: { bytes: 0, gapMax: 0, lastAt: 0 },
+      secTimer: setInterval(() => this.tickSecond(active), 1000),
     };
     active.statsTimer.unref?.();
+    active.secTimer.unref?.();
     this.active = active;
     log("session_start", {
       session: session.id, device: session.device, address, rate: hello.rate, channels: hello.channels,
@@ -242,20 +301,26 @@ export class AudioServer {
     this.quality = null;
     this.phone = null;
     socket.write(encodeReply({ ok: true, name: this.getConfig().name }));
+    this.pushLaptopState();
 
     const aligner = new FrameAligner(2 * hello.channels);
     const onAudio = (chunk: Uint8Array) => {
       if (this.active !== active) return;
       active.stats.arrival(chunk.length);
       active.totalBytes += chunk.length;
+      const now = performance.now();
+      if (active.sec.lastAt) active.sec.gapMax = Math.max(active.sec.gapMax, now - active.sec.lastAt);
+      active.sec.lastAt = now;
+      active.sec.bytes += chunk.length;
       const frames = aligner.push(chunk);
       if (!frames.length) return;
+      active.analyzer.push(frames);
       const player = this.ensurePlayer(active);
       const cfg = this.getConfig();
       const pv = active.session.phoneVolume;
       const follow = cfg.followPhone && pv ? phoneGain(pv) : 1;
       const { out, peak } = processPcm(frames, cfg.muted ? 0 : cfg.volume * follow);
-      const result = player ? player.write(out) : "closed";
+      const result = player ? player.write(out, peak < QUIET_PEAK) : "closed";
       if (result !== "ok") {
         this.drops++;
         active.totalDrops++;
@@ -264,7 +329,7 @@ export class AudioServer {
         else active.stats.dropNoPlayer++;
       }
       active.stats.chunk(peak, player?.leadMs ?? 0);
-      this.reportLevel(peak);
+      this.reportLevel(active, peak);
     };
     socket.on("data", onAudio);
     socket.on("error", (e) => {
@@ -274,6 +339,7 @@ export class AudioServer {
       if (this.active === active) this.endActive(active.socketError ? "socket_error" : "phone_closed");
     });
     this.hooks.onChange();
+    this.hooks.onSessionStart?.(session);
     if (rest.length) onAudio(rest);
   }
 
@@ -286,7 +352,7 @@ export class AudioServer {
     const sink = this.getConfig().sink;
     log("player_start", { session: active.session.id, sink: sink || "default" });
     const player = this.makePlayer(
-      { rate: active.hello.rate, channels: active.hello.channels, sink },
+      { rate: active.hello.rate, channels: active.hello.channels, sink, latency: this.getConfig().latency },
       (reason) => {
         log("player_exit", { session: active.session.id, reason });
         if (this.active === active && active.player === player) this.fail(reason);
@@ -309,7 +375,11 @@ export class AudioServer {
 
   private flushStats(active: Active, bytesPerSec: number) {
     const u = this.underruns(active);
-    const window = { ...active.stats.flush(bytesPerSec), underruns: u - active.reportedUnderruns };
+    const window = {
+      ...active.stats.flush(bytesPerSec),
+      underruns: u - active.reportedUnderruns,
+      targetMs: Math.round(active.player?.targetMs ?? 0),
+    };
     log("session_stats", { session: active.session.id, ...window });
     active.reportedUnderruns = u;
     if (this.active === active) {
@@ -318,18 +388,30 @@ export class AudioServer {
     }
   }
 
-  private phoneStats(s: { code: string; fields: Record<string, unknown> }, address: string) {
+  /**
+   * The active session, if this UDP packet came from its phone. Over USB the session
+   * address is loopback (adb reverse carries TCP only), so the phone reports over
+   * Wi-Fi instead and only the code can tie the packet to the session.
+   */
+  private sessionFor(address: string, code: string): Active | null {
     const a = this.active;
+    if (!a || !codesMatch(code, this.getConfig().code)) return null;
+    if (a.session.address !== address && !isLoopback(a.session.address)) return null;
+    return a;
+  }
+
+  private phoneStats(s: { code: string; fields: Record<string, unknown> }, address: string) {
     // Only the phone that is currently streaming, with the right code, gets logged.
-    if (!a || a.session.address !== address || !codesMatch(s.code, this.getConfig().code)) return;
+    const a = this.sessionFor(address, s.code);
+    if (!a) return;
     log("phone_stats", { session: a.session.id, ...s.fields });
     this.phone = s.fields;
     this.hooks.onChange();
   }
 
   private phoneVolume(v: { code: string; index: number; max: number; muted: boolean }, address: string) {
-    const a = this.active;
-    if (!a || a.session.address !== address || !codesMatch(v.code, this.getConfig().code)) return;
+    const a = this.sessionFor(address, v.code);
+    if (!a) return;
     const prev = a.session.phoneVolume;
     if (prev && prev.index === v.index && prev.max === v.max && prev.muted === v.muted) return;
     a.session.phoneVolume = { index: v.index, max: v.max, muted: v.muted };
@@ -337,14 +419,43 @@ export class AudioServer {
     this.hooks.onChange();
   }
 
-  private reportLevel(peak: number) {
+  private phoneControl(c: PhoneControl, address: string) {
+    const a = this.sessionFor(address, c.code);
+    if (!a) return;
+    const change: { volume?: number; muted?: boolean } = {};
+    if (c.volume !== undefined) change.volume = c.volume;
+    if (c.muted !== undefined) change.muted = c.muted;
+    log("phone_control", { session: a.session.id, ...change });
+    this.hooks.onControl?.(change);
+  }
+
+  private reportLevel(active: Active, peak: number) {
     if (peak > this.peak) this.peak = peak;
     const now = Date.now();
     if (now - this.lastLevelAt >= LEVEL_INTERVAL_MS) {
       this.lastLevelAt = now;
-      this.hooks.onLevel(this.peak);
+      this.hooks.onLevel(active.analyzer.frame(this.peak));
       this.peak = 0;
     }
+  }
+
+  private tickSecond(active: Active) {
+    if (this.active !== active || !this.hooks.onMetrics) return;
+    const s = active.sec;
+    const rssi = this.phone?.rssi;
+    this.hooks.onMetrics({
+      t: Date.now(),
+      kbps: Math.round((s.bytes * 8) / 1000),
+      // Nothing arrived at all this second: the gap is still running.
+      gapMaxMs: Math.round(s.bytes ? s.gapMax : performance.now() - s.lastAt),
+      leadMs: Math.round(active.player?.leadMs ?? 0),
+      targetMs: Math.round(active.player?.targetMs ?? 0),
+      drops: active.totalDrops,
+      underruns: this.underruns(active),
+      rssi: typeof rssi === "number" ? rssi : null,
+    });
+    s.bytes = 0;
+    s.gapMax = 0;
   }
 
   private endActive(reason: EndReason) {
@@ -353,6 +464,7 @@ export class AudioServer {
     this.active = null;
     this.session = null;
     clearInterval(a.statsTimer);
+    clearInterval(a.secTimer);
     this.flushStats(a, a.hello.rate * a.hello.channels * 2);
     this.quality = null;
     this.phone = null;
@@ -371,7 +483,8 @@ export class AudioServer {
       underruns: this.underruns(a),
     });
     this.retirePlayer(a);
-    this.hooks.onLevel(0);
+    this.hooks.onLevel({ peak: 0, l: 0, r: 0, rmsL: 0, rmsR: 0, bands: [] });
     this.hooks.onChange();
+    this.hooks.onSessionEnd?.(a.session, reason);
   }
 }

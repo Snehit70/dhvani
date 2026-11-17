@@ -3,7 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 type Ev = Record<string, unknown> & { t: string; ev: string };
 type Row = {
   id: number; start: string; device: string; durationS: number; reason: string;
-  drops: number; underruns: number; gapMaxMs: number; gaps100: number;
+  drops: number; underruns: number; targetMaxMs: number; gapMaxMs: number; gaps100: number;
   minRatePct: number; maxLeadMs: number; playerExits: number;
   rssiMin: number | null; linkMin: number | null; writeMaxMs: number; stalls: number; reconnects: number;
 };
@@ -44,11 +44,8 @@ export function recentSessions(file: string, n: number) {
 
 const num = (v: unknown) => (typeof v === "number" ? v : 0);
 
-/** `dhvani report [N]`: one line per recent session plus what went wrong in it. */
-export function report(file: string, args: string[]) {
-  const events = readEvents(file);
-  if (!events.length) return void console.log(`No events yet in ${file}`);
-  const limit = Number(args[0]) > 0 ? Number(args[0]) : 10;
+/** One row per session in the log, oldest first, with what went wrong in it. */
+function buildRows(events: Ev[]): { rows: Row[]; rejected: number } {
   const rows = new Map<number, Row>();
   // Session ids restart with the service, so key on start order instead.
   let current = new Map<number, Row>();
@@ -61,7 +58,7 @@ export function report(file: string, args: string[]) {
     if (e.ev === "session_start") {
       const r: Row = {
         id: ++seq, start: e.t, device: String(e.device ?? "?"), durationS: 0, reason: "running",
-        drops: 0, underruns: 0, gapMaxMs: 0, gaps100: 0, minRatePct: Infinity, maxLeadMs: 0, playerExits: 0,
+        drops: 0, underruns: 0, targetMaxMs: 0, gapMaxMs: 0, gaps100: 0, minRatePct: Infinity, maxLeadMs: 0, playerExits: 0,
         rssiMin: null, linkMin: null, writeMaxMs: 0, stalls: 0, reconnects: 0,
       };
       current.set(sid, r);
@@ -75,6 +72,7 @@ export function report(file: string, args: string[]) {
         r.gapMaxMs = Math.max(r.gapMaxMs, num(e.gapMaxMs));
         r.gaps100 += num(e.gaps100);
         r.maxLeadMs = Math.max(r.maxLeadMs, num(e.leadMaxMs));
+        r.targetMaxMs = Math.max(r.targetMaxMs, num(e.targetMs));
         if (num(e.secs) >= 5) r.minRatePct = Math.min(r.minRatePct, num(e.ratePct));
         break;
       case "player_exit":
@@ -97,7 +95,37 @@ export function report(file: string, args: string[]) {
         break;
     }
   }
-  const list = [...rows.values()].slice(-limit);
+  return { rows: [...rows.values()], rejected };
+}
+
+/** Sessions that started within the last `days` days, newest first, for the panel's history view. */
+export function sessionHistory(file: string, days: number) {
+  const since = Date.now() - days * 86_400_000;
+  return buildRows(readEvents(file))
+    .rows.filter((r) => Date.parse(r.start) >= since)
+    .reverse()
+    .map((r) => ({
+      device: r.device,
+      start: Date.parse(r.start),
+      durationS: r.durationS,
+      reason: r.reason,
+      drops: r.drops,
+      underruns: r.underruns,
+      gaps100: r.gaps100,
+      gapMaxMs: Math.round(r.gapMaxMs),
+      targetMaxMs: r.targetMaxMs,
+      rssiMin: r.rssiMin,
+      reconnects: r.reconnects,
+    }));
+}
+
+/** `dhvani report [N]`: one line per recent session plus what went wrong in it. */
+export function report(file: string, args: string[]) {
+  const events = readEvents(file);
+  if (!events.length) return void console.log(`No events yet in ${file}`);
+  const limit = Number(args[0]) > 0 ? Number(args[0]) : 10;
+  const { rows, rejected } = buildRows(events);
+  const list = rows.slice(-limit);
   const pad = (s: unknown, n: number) => String(s).slice(0, n).padEnd(n);
   console.log(
     pad("when", 17) + pad("device", 18) + pad("mins", 7) + pad("end", 14) + pad("drops", 7) + pad("gaps", 6) +
@@ -106,6 +134,7 @@ export function report(file: string, args: string[]) {
   for (const r of list) {
     const notes: string[] = [];
     if (r.underruns) notes.push(`${r.underruns} underruns`);
+    if (r.targetMaxMs) notes.push(`buffer up to ${Math.round(r.targetMaxMs)} ms`);
     if (r.playerExits) notes.push(`pw-cat died ${r.playerExits}x`);
     if (r.stalls) notes.push(`${r.stalls} phone stalls`);
     if (r.reconnects) notes.push(`${r.reconnects} reconnects`);

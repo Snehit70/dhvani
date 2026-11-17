@@ -2,6 +2,7 @@ import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "n
 import { hostname } from "node:os";
 import { dirname, join } from "node:path";
 import { randomInt } from "node:crypto";
+import type { LatencyMode } from "./audio";
 
 export type Config = {
   /** Six-digit code the phone must present. */
@@ -15,6 +16,12 @@ export type Config = {
   followPhone: boolean;
   /** Name the phone shows for this laptop. */
   name: string;
+  /** "low": smallest delay, more dropouts on busy Wi-Fi. "stable": larger, adaptive buffer. */
+  latency: LatencyMode;
+  /** Desktop notifications when a phone connects or drops. */
+  notify: boolean;
+  /** Set up `adb reverse` for phones plugged in by USB, so audio can skip Wi-Fi. */
+  usb: boolean;
 };
 
 export function configPath(): string {
@@ -27,7 +34,10 @@ export function newCode(): string {
 }
 
 export function defaults(): Config {
-  return { code: newCode(), sink: "", volume: 1, muted: false, followPhone: true, name: hostname() };
+  return {
+    code: newCode(), sink: "", volume: 1, muted: false, followPhone: true, name: hostname(),
+    latency: "stable", notify: true, usb: true,
+  };
 }
 
 export function sanitize(input: Partial<Config>, base: Config): Config {
@@ -40,6 +50,9 @@ export function sanitize(input: Partial<Config>, base: Config): Config {
   if (typeof input.muted === "boolean") c.muted = input.muted;
   if (typeof input.followPhone === "boolean") c.followPhone = input.followPhone;
   if (typeof input.name === "string" && input.name.trim()) c.name = input.name.trim().slice(0, 40);
+  if (input.latency === "low" || input.latency === "stable") c.latency = input.latency;
+  if (typeof input.notify === "boolean") c.notify = input.notify;
+  if (typeof input.usb === "boolean") c.usb = input.usb;
   return c;
 }
 

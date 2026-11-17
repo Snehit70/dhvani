@@ -2,11 +2,13 @@ import { execFile } from "node:child_process";
 import { networkInterfaces } from "node:os";
 import { loadConfig, newCode, sanitize, saveConfig, type Config } from "./config";
 import { LOG_FILE, log } from "./log";
-import { recentSessions, report } from "./report";
+import { recentSessions, report, sessionHistory } from "./report";
 import { listSinks, pwCatPlayer } from "./player";
 import { AUDIO_PORT, DISCOVERY_PORT, UI_PORT } from "./protocol";
-import { AudioServer } from "./server";
+import { AudioServer, type LiveMetrics } from "./server";
 import { WebUI } from "./web";
+import { SessionNotifier, notifySend } from "./notify";
+import { UsbBridge } from "./usb";
 
 const VERSION = "0.1.0";
 let config: Config = loadConfig();
@@ -84,12 +86,30 @@ function setFirewall(next: typeof firewall) {
 
 let ui: WebUI;
 let lastLevelSent = 0;
+/** Last five minutes of one-second readings, so a freshly opened panel has a chart. */
+const METRICS_KEEP = 300;
+const metrics: LiveMetrics[] = [];
+const pushState = () => void state().then((s) => ui?.broadcast("state", s));
+const notifier = new SessionNotifier(notifySend, () => config.notify);
+const usb = new UsbBridge(AUDIO_PORT, () => config.usb, pushState);
 const server = new AudioServer(() => config, pwCatPlayer, {
-  onChange: () => void state().then((s) => ui?.broadcast("state", s)),
-  onLevel: (peak) => {
-    lastLevelSent = peak;
-    ui?.broadcast("level", { peak, drops: server.drops });
+  onChange: pushState,
+  onLevel: (frame) => {
+    lastLevelSent = frame.peak;
+    ui?.broadcast("level", { ...frame, drops: server.drops });
   },
+  onMetrics: (m) => {
+    metrics.push(m);
+    if (metrics.length > METRICS_KEEP) metrics.shift();
+    ui?.broadcast("metrics", m);
+  },
+  onControl: (c) => apply(sanitize(c, config)),
+  onSessionStart: (s) => {
+    metrics.length = 0;
+    notifier.started(s.device);
+  },
+  onSessionEnd: (s, reason) => notifier.ended(s.device, reason),
+  addresses: () => addresses().map((a) => a.address),
 });
 
 // pactl takes ~0.2-0.5 s; volume drags and level-driven state pushes must not wait on it each time.
@@ -110,6 +130,9 @@ async function state() {
     volume: config.volume,
     muted: config.muted,
     followPhone: config.followPhone,
+    latency: config.latency,
+    notify: config.notify,
+    usb: config.usb,
     sinks,
     defaultSink,
     port: AUDIO_PORT,
@@ -126,6 +149,8 @@ async function state() {
       listening: server.listening,
       discovery: server.discovery,
       firewall,
+      adb: usb.available,
+      usbPhones: usb.phones.length,
     },
   };
 }
@@ -134,12 +159,21 @@ function apply(next: Config) {
   const sinkChanged = next.sink !== config.sink;
   const codeChanged = next.code !== config.code;
   const changed: Record<string, unknown> = {};
-  for (const k of ["sink", "volume", "muted", "followPhone", "name"] as const) if (next[k] !== config[k]) changed[k] = next[k];
+  for (const k of ["sink", "volume", "muted", "followPhone", "name", "latency", "notify", "usb"] as const) {
+    if (next[k] !== config[k]) changed[k] = next[k];
+  }
+  const laptopChanged = next.volume !== config.volume || next.muted !== config.muted;
+  const latencyChanged = next.latency !== config.latency;
+  const usbChanged = next.usb !== config.usb;
   if (codeChanged) changed.code = "changed"; // never log the code itself
   config = next;
   saveConfig(config);
   if (Object.keys(changed).length) log("settings", changed);
   if (sinkChanged) server.restartPlayer();
+  if (laptopChanged) server.pushLaptopState();
+  if (latencyChanged) server.setLatency(config.latency);
+  if (usbChanged) void usb.tick();
+  pushState();
   if (codeChanged) server.disconnect("code_changed");
 }
 
@@ -156,7 +190,15 @@ ui = new WebUI({
   disconnect() {
     server.disconnect("disconnected");
   },
+  history() {
+    // Reading ~10 MB of log on every panel load adds up; half a minute stale is fine.
+    if (!historyCache || Date.now() - historyCache.at > 30_000) {
+      historyCache = { at: Date.now(), sessions: sessionHistory(LOG_FILE, 14) };
+    }
+    return { metrics, sessions: historyCache.sessions };
+  },
 });
+let historyCache: { at: number; sessions: ReturnType<typeof sessionHistory> } | null = null;
 
 async function main() {
   if (process.argv.includes("--version")) {
@@ -192,6 +234,7 @@ async function main() {
   } catch (e) {
     console.error(`Control panel unavailable on ${UI_PORT}: ${(e as Error).message}`);
   }
+  usb.start();
   await checkFirewall();
   setInterval(checkFirewall, 60_000).unref();
   console.log(`Dhvani ${VERSION} listening on TCP ${AUDIO_PORT}, panel http://127.0.0.1:${UI_PORT}`);
@@ -200,6 +243,8 @@ async function main() {
 
   const stop = () => {
     server.close();
+    usb.stop();
+    notifier.close();
     log("stop");
     ui.close();
     process.exit(0);
