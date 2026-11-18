@@ -99,7 +99,8 @@ On the phone: `adb logcat -s Dhvani`.
 
 - Apps that opt out of capture (some banking and DRM video apps) and calls are not shared. That is Android policy.
 - Latency is roughly 50-70 ms through laptop speakers or a jack. Android captures in fixed
-  21 ms blocks, so the buffer cannot go much below 30 ms. Bluetooth headphones add their own
+  21 ms blocks, so the buffer cannot go much below 50 ms
+  without PipeWire running dry. Bluetooth headphones add their own
   delay on top (SBC is about 130 ms); the panel's Latency tile includes it.
 - Audio is not encrypted on the LAN. The pairing code stops strangers from playing to your laptop; it does not hide what you stream. Use it on networks you trust.
 

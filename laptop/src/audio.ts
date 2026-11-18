@@ -53,9 +53,11 @@ export type LatencyMode = "low" | "stable";
  * Buffer bounds per mode. Logs from real sessions: arrival gaps over 10 s windows
  * are p50 55 ms, p90 125 ms (Wi-Fi power save), so a fixed 80 ms ceiling ran dry
  * in about one window in six. "stable" starts above p90 and grows on demand.
+ * "low" starts at 50 ms: the phone hands over 21 ms blocks and PipeWire pulls 10 ms at a time,
+ * so at 30 ms the pw-cat stream briefly ran empty and crackled even with a clean network.
  */
 export const LATENCY: Record<LatencyMode, { minMs: number; maxMs: number }> = {
-  low: { minMs: 30, maxMs: 120 },
+  low: { minMs: 50, maxMs: 120 },
   stable: { minMs: 100, maxMs: 300 },
 };
 
