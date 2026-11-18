@@ -1,6 +1,16 @@
 # Dhvani
 
-Plays your Android phone's audio on your Linux laptop over Wi-Fi: music, videos, games. Only playback audio is sent, never the microphone or the screen.
+![Dhvani control panel](docs/panel.png)
+
+Plays your Android phone's audio on your Linux laptop over Wi-Fi: music, videos, games. Only playback audio is sent, never the microphone or the screen. A free, open alternative to AudioRelay for Android to Linux (PipeWire).
+
+## Quick start
+
+1. On the laptop: `git clone https://github.com/Snehit70/dhvani && cd dhvani && ./install.sh`, then open <http://127.0.0.1:47801>.
+2. On the phone: install `dhvani.apk` from the [latest release](https://github.com/Snehit70/dhvani/releases/latest).
+3. Open Dhvani on the phone, tap your laptop, enter the 6-digit code from the panel, tap **Start**.
+
+## How it works
 
 ```
 phone (Android 10+)  --UDP 47802, raw 48 kHz stereo PCM, each packet sent twice-->  laptop (PipeWire)
@@ -41,11 +51,13 @@ Logs: `journalctl --user -u dhvani -f`
 
 ## Phone
 
+Get `dhvani.apk` from [Releases](https://github.com/Snehit70/dhvani/releases/latest), or build it:
+
 ```sh
 android/build.sh   # -> android/dist/dhvani.apk, about 40 KB; no Gradle
 ```
 
-It needs only an Android SDK (platform + build-tools) and a JDK 17+.
+Building needs only an Android SDK (platform + build-tools) and a JDK 17+.
 
 1. Install the APK, open Dhvani.
 2. Tap your laptop in the list or type its IP, then enter the 6-digit code from the panel.
