@@ -5,12 +5,22 @@
 //   laptop -> phone   one JSON line: {"ok":true,"name":"fedora"} or {"ok":false,"error":"bad_code"}
 //   phone  -> laptop  raw interleaved PCM until either side closes.
 //   laptop -> phone   JSON lines while streaming: {"dhvani":"laptop","volume":1,"muted":false,"addresses":[...]}
+//   Phone hello may carry "udp":1. The laptop then answers {"ok":true,"name","udp":{"port","token"}}
+//   and the PCM travels as UDP audio packets (below) instead of over this socket, which stays
+//   open as the session's control channel. The laptop writes {"dhvani":"ping"} on it every second,
+//   and {"dhvani":"transport","udp":false} if no UDP audio arrives; the phone then sends PCM here.
 //   A connection whose first line is a discover request gets one discover reply and is closed
 //   (lets a phone find the laptop through `adb reverse` over USB, where UDP does not pass).
 //
 // Discovery (UDP broadcast, DISCOVERY_PORT):
 //   phone  -> 255.255.255.255  {"dhvani":"discover","v":1}
 //   laptop -> phone            {"dhvani":"here","v":1,"name":"fedora","port":47800}
+//
+// UDP audio (to DISCOVERY_PORT, which the firewall already opens), big-endian header:
+//   0 'D' 'H' | 2 version 1 | 3 flags (bit 0: late copy of an earlier packet) | 4 token, 8 bytes
+//   12 seq u32 | 16 phone clock ms u32 | 20 PCM, 5 ms (960 bytes at 48 kHz stereo)
+//   Every packet is sent again REDUNDANT_DELAY_MS later, so a Wi-Fi loss shorter than that
+//   costs nothing; a packet lost twice becomes 5 ms of silence instead of a TCP stall.
 //
 // Phone reports (UDP to DISCOVERY_PORT, all carry the pairing code):
 //   {"dhvani":"stats",...}    health counters every 10 s
@@ -32,6 +42,8 @@ export type Hello = {
   rate: number;
   channels: 1 | 2;
   format: "s16le";
+  /** The phone can send audio over UDP. */
+  udp: boolean;
 };
 
 export type HelloError =
@@ -42,7 +54,7 @@ export type HelloError =
   | "rate_limited";
 
 export type HelloReply =
-  | { ok: true; name: string }
+  | { ok: true; name: string; udp?: { port: number; token: string } }
   | { ok: false; error: HelloError };
 
 export function parseHello(line: string): Hello | { error: HelloError } {
@@ -74,6 +86,7 @@ export function parseHello(line: string): Hello | { error: HelloError } {
     rate: o.rate as number,
     channels: o.channels as 1 | 2,
     format: "s16le",
+    udp: o.udp === 1 || o.udp === true,
   };
 }
 
@@ -213,3 +226,44 @@ export function parseControl(msg: string): PhoneControl | null {
 export function laptopState(volume: number, muted: boolean, addresses: string[]): string {
   return JSON.stringify({ dhvani: "laptop", volume, muted, addresses }) + "\n";
 }
+
+export const UDP_HEADER = 20;
+export const UDP_VERSION = 1;
+export const UDP_TOKEN_BYTES = 8;
+/** How long after the first copy the phone resends a packet. */
+export const REDUNDANT_DELAY_MS = 20;
+
+export type AudioPacket = { token: Uint8Array; seq: number; sentMs: number; late: boolean; pcm: Uint8Array };
+
+export function isAudioPacket(b: Uint8Array): boolean {
+  return b.length > UDP_HEADER && b[0] === 0x44 && b[1] === 0x48 && b[2] === UDP_VERSION;
+}
+
+export function parseAudioPacket(b: Uint8Array): AudioPacket | null {
+  if (!isAudioPacket(b)) return null;
+  const v = new DataView(b.buffer, b.byteOffset, b.length);
+  return {
+    token: b.subarray(4, 4 + UDP_TOKEN_BYTES),
+    seq: v.getUint32(12),
+    sentMs: v.getUint32(16),
+    late: (b[3]! & 1) === 1,
+    pcm: b.subarray(UDP_HEADER),
+  };
+}
+
+export function encodeAudioPacket(p: { token: Uint8Array; seq: number; sentMs: number; late?: boolean; pcm: Uint8Array }): Uint8Array {
+  const out = new Uint8Array(UDP_HEADER + p.pcm.length);
+  const v = new DataView(out.buffer);
+  out[0] = 0x44;
+  out[1] = 0x48;
+  out[2] = UDP_VERSION;
+  out[3] = p.late ? 1 : 0;
+  out.set(p.token.subarray(0, UDP_TOKEN_BYTES), 4);
+  v.setUint32(12, p.seq >>> 0);
+  v.setUint32(16, p.sentMs >>> 0);
+  out.set(p.pcm, UDP_HEADER);
+  return out;
+}
+
+export const PING_LINE = JSON.stringify({ dhvani: "ping" }) + "\n";
+export const TCP_FALLBACK_LINE = JSON.stringify({ dhvani: "transport", udp: false }) + "\n";

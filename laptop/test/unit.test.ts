@@ -244,3 +244,75 @@ test("Analyzer: a 1 kHz tone lights the 1 kHz band, meters read the channel peak
   expect(f.bands[2]!).toBeLessThan(0.3);
   expect(a.frame(0).l).toBe(0); // meters reset between frames
 });
+
+import { Reorder, HOLE_WAIT_MS, type Delivered } from "../src/udp";
+import { encodeAudioPacket, parseAudioPacket, isAudioPacket } from "../src/protocol";
+import { spread } from "../src/stats";
+import { parseOutputDelay } from "../src/player";
+
+describe("UDP audio", () => {
+  const pcm = (v: number) => new Uint8Array(4).fill(v);
+  const setup = () => {
+    let t = 0;
+    const out: Delivered[] = [];
+    const r = new Reorder((d) => out.push(d), () => t);
+    return { r, out, vals: () => out.map((d) => d.pcm[0]), advance: (ms: number) => { t += ms; r.tick(); } };
+  };
+
+  test("packet header round-trips", () => {
+    const token = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
+    const b = encodeAudioPacket({ token, seq: 2 ** 32 - 1, sentMs: 123456, late: true, pcm: pcm(9) });
+    expect(isAudioPacket(b)).toBe(true);
+    expect(isAudioPacket(new TextEncoder().encode('{"dhvani":"stats"}'))).toBe(false);
+    const p = parseAudioPacket(b)!;
+    expect([...p.token]).toEqual([...token]);
+    expect(p).toMatchObject({ seq: 2 ** 32 - 1, sentMs: 123456, late: true });
+    expect([...p.pcm]).toEqual([9, 9, 9, 9]);
+  });
+
+  test("reorders, ignores duplicates and uses a late copy for a lost packet", () => {
+    const { r, out, vals } = setup();
+    r.push(10, 0, false, pcm(10));
+    r.push(12, 0, false, pcm(12));
+    r.push(10, 0, true, pcm(10)); // copy of one that arrived: ignored
+    expect(vals()).toEqual([10]);
+    r.push(11, 0, true, pcm(11)); // first copy of 11 was lost
+    expect(vals()).toEqual([10, 11, 12]);
+    expect(out[1]!.recovered).toBe(true);
+    expect(r.recovered).toBe(1);
+    expect(r.lost).toBe(0);
+  });
+
+  test("a packet lost twice becomes silence once its copy is overdue", () => {
+    const { r, out, vals, advance } = setup();
+    r.push(0, 0, false, pcm(1));
+    r.push(2, 0, false, pcm(3));
+    advance(HOLE_WAIT_MS - 1);
+    expect(vals()).toEqual([1]);
+    advance(2);
+    expect(vals()).toEqual([1, 0, 3]);
+    expect(out[1]!.concealed).toBe(true);
+    expect(r.lost).toBe(1);
+    r.push(1, 0, true, pcm(2)); // too late now
+    expect(out.length).toBe(3);
+  });
+
+  test("network jitter spread survives the phone clock wrapping", () => {
+    const w = 2 ** 32;
+    // arrival - sent: phone clock wrapped between samples 2 and 3.
+    expect(spread([100 - (w - 10), 105 - (w - 5), 112 - 2, 120 - 9])).toEqual([0, 0, 0, 1]);
+  });
+});
+
+test("output delay reads the sink's latency behind Dhvani's node", () => {
+  const dump = [
+    { id: 89, type: "PipeWire:Interface:Node", info: { props: { "node.name": "dhvani" } } },
+    { id: 7, type: "PipeWire:Interface:Link", info: { "output-node-id": 89, "input-node-id": 101 } },
+    { id: 101, type: "PipeWire:Interface:Node", info: {
+      props: { "node.name": "bluez_output.41_42.1", "node.description": "Wireless" },
+      params: { Latency: [{ direction: "Input", minNs: 134520833 }] },
+    } },
+  ];
+  expect(parseOutputDelay(dump, 10)).toEqual({ ms: 145, device: "Wireless", bluetooth: true });
+  expect(parseOutputDelay(dump.slice(1), 10)).toBeNull();
+});

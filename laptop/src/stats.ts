@@ -16,7 +16,12 @@ export class StreamStats {
   peakMax = 0;
   /** Time the phone held back data during silence (battery saver), excluded from gaps and rate. */
   idleMs = 0;
+  /** UDP packets lost on the first try but saved by their late copy, and lost twice. */
+  recovered = 0;
+  lost = 0;
   private lastSilent = false;
+  /** arrival - phone send time per UDP packet; its spread is the network's own jitter. */
+  private transits: number[] = [];
   private gaps: number[] = [];
   private lastAt = 0;
   private windowStart: number;
@@ -40,6 +45,11 @@ export class StreamStats {
     }
     this.lastAt = t;
     this.bytes += bytes;
+  }
+
+  /** One UDP packet's arrival, with the phone's send clock (ms, wraps at 2^32). */
+  transit(sentMs: number, at = this.now()) {
+    this.transits.push(at - sentMs);
   }
 
   /** `silent`: the incoming chunk was all zeros (before laptop volume). */
@@ -76,12 +86,44 @@ export class StreamStats {
       leadMaxMs: r(this.leadMaxMs),
       peakMax: Math.round(this.peakMax * 1000) / 1000,
       silentPct: this.chunks ? r((this.silentChunks / this.chunks) * 100) : 0,
+      ...this.jitter(r),
     };
     this.bytes = this.chunks = this.silentChunks = this.idleMs = 0;
     this.dropLate = this.dropStalled = this.dropNoPlayer = 0;
     this.gapMaxMs = this.gaps50 = this.gaps100 = this.leadMaxMs = this.peakMax = 0;
     this.gaps = [];
+    this.transits = [];
+    this.recovered = this.lost = 0;
     this.windowStart = t;
     return out;
   }
+
+  /** Network jitter: how much later than its fastest packet each packet took (UDP only). */
+  private jitter(r: (n: number) => number): Record<string, number> {
+    if (this.transits.length < 2) return {};
+    const d = spread(this.transits);
+    return {
+      netJitterMs: r(d[Math.min(d.length - 1, Math.floor(d.length * 0.95))]!),
+      netJitterMaxMs: r(d[d.length - 1]!),
+      recovered: this.recovered,
+      lost: this.lost,
+    };
+  }
+}
+
+/**
+ * Each transit minus the smallest, sorted. The phone's clock wraps at 2^32 ms, so the
+ * offsets are unwrapped against the first sample first.
+ */
+export function spread(transits: number[]): number[] {
+  const base = transits[0]!;
+  const wrap = 2 ** 32;
+  const rel = transits.map((x) => {
+    let d = (x - base) % wrap;
+    if (d > wrap / 2) d -= wrap;
+    if (d < -wrap / 2) d += wrap;
+    return d;
+  });
+  const min = Math.min(...rel);
+  return rel.map((x) => x - min).sort((a, b) => a - b);
 }

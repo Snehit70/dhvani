@@ -51,7 +51,7 @@ export class SessionNotifier {
       if (!this.enabled()) return;
       this.send(
         "Phone disconnected",
-        reason === "socket_error" ? `Lost the connection to ${device}.` : `${device} stopped streaming.`,
+        reason === "socket_error" || reason === "timeout" ? `Lost the connection to ${device}.` : `${device} stopped streaming.`,
       );
     }, this.graceMs);
     timer.unref?.();

@@ -3,7 +3,7 @@ import { networkInterfaces } from "node:os";
 import { loadConfig, newCode, sanitize, saveConfig, type Config } from "./config";
 import { LOG_FILE, log } from "./log";
 import { recentSessions, report, sessionHistory } from "./report";
-import { listSinks, pwCatPlayer } from "./player";
+import { listSinks, outputDelay, pwCatPlayer, type OutputDelay } from "./player";
 import { AUDIO_PORT, DISCOVERY_PORT, UI_PORT } from "./protocol";
 import { AudioServer, type LiveMetrics } from "./server";
 import { WebUI } from "./web";
@@ -85,6 +85,15 @@ function setFirewall(next: typeof firewall) {
 }
 
 let ui: WebUI;
+/** What the output device adds after Dhvani's own buffer (Bluetooth can add 100-250 ms). */
+let output: OutputDelay | null = null;
+async function probeOutput() {
+  const next = server.session ? await outputDelay(config.latency) : null;
+  if (JSON.stringify(next) === JSON.stringify(output)) return;
+  output = next;
+  if (next) log("output_delay", { ...next });
+  pushState();
+}
 let lastLevelSent = 0;
 /** Last five minutes of one-second readings, so a freshly opened panel has a chart. */
 const METRICS_KEEP = 300;
@@ -106,6 +115,7 @@ const server = new AudioServer(() => config, pwCatPlayer, {
   onControl: (c) => apply(sanitize(c, config)),
   onSessionStart: (s) => {
     metrics.length = 0;
+    setTimeout(probeOutput, 2000);
     notifier.started(s.device);
   },
   onSessionEnd: (s, reason) => notifier.ended(s.device, reason),
@@ -144,6 +154,7 @@ async function state() {
     quality: server.quality,
     phone: server.phone,
     recent: server.recent,
+    output,
     firewallFix: `sudo firewall-cmd --permanent --add-port=${AUDIO_PORT}/tcp --add-port=${DISCOVERY_PORT}/udp && sudo firewall-cmd --reload`,
     health: {
       listening: server.listening,
@@ -170,6 +181,7 @@ function apply(next: Config) {
   saveConfig(config);
   if (Object.keys(changed).length) log("settings", changed);
   if (sinkChanged) server.restartPlayer();
+  if (sinkChanged || latencyChanged) setTimeout(probeOutput, 2000);
   if (laptopChanged) server.pushLaptopState();
   if (latencyChanged) server.setLatency(config.latency);
   if (usbChanged) void usb.tick();
@@ -237,6 +249,7 @@ async function main() {
   usb.start();
   await checkFirewall();
   setInterval(checkFirewall, 60_000).unref();
+  setInterval(probeOutput, 10_000).unref();
   console.log(`Dhvani ${VERSION} listening on TCP ${AUDIO_PORT}, panel http://127.0.0.1:${UI_PORT}`);
   console.log(`Pairing code ${config.code}. Addresses: ${addresses().map((a) => a.address).join(", ") || "none"}`);
 

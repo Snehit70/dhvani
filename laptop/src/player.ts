@@ -25,6 +25,12 @@ export type PlayerFactory = (
   onExit: (reason: string) => void,
 ) => Player;
 
+/**
+ * PipeWire buffer pw-cat asks for. It sets the graph period while Dhvani plays, so it adds
+ * that much delay after the jitter buffer: 30 ms was a 1440-frame period.
+ */
+export const PW_LATENCY_MS: Record<LatencyMode, number> = { low: 10, stable: 20 };
+
 /** Hard cap on audio stuck in Node's pipe buffer (pw-cat stalled). */
 export const MAX_BACKLOG_MS = 150;
 
@@ -35,7 +41,7 @@ export const pwCatPlayer: PlayerFactory = (opts, onExit) => {
     "--format", "s16",
     "--rate", String(opts.rate),
     "--channels", String(opts.channels),
-    "--latency", "30ms",
+    "--latency", `${PW_LATENCY_MS[opts.latency ?? "stable"]}ms`,
     "-P", JSON.stringify({
       "media.name": "Phone audio",
       "application.name": "Dhvani",
@@ -124,4 +130,42 @@ export function listSinks(): Promise<{ sinks: Sink[]; defaultSink: string }> {
       });
     });
   });
+}
+
+export type OutputDelay = { ms: number; device: string; bluetooth: boolean };
+
+/**
+ * Delay after Dhvani hands audio to PipeWire: its own period plus what the output device
+ * reports (Bluetooth codecs add 100-250 ms). Null when Dhvani is not playing or pw-dump fails.
+ */
+export function outputDelay(latency: LatencyMode): Promise<OutputDelay | null> {
+  return new Promise((resolve) => {
+    execFile("pw-dump", [], { timeout: 3000, maxBuffer: 16 << 20 }, (err, out) => {
+      if (err) return resolve(null);
+      try {
+        resolve(parseOutputDelay(JSON.parse(out), PW_LATENCY_MS[latency]));
+      } catch {
+        resolve(null);
+      }
+    });
+  });
+}
+
+type PwObject = { id: number; type: string; info?: { props?: Record<string, unknown>; params?: Record<string, unknown[]>; [k: string]: unknown } };
+
+export function parseOutputDelay(dump: PwObject[], periodMs: number): OutputDelay | null {
+  const nodes = dump.filter((o) => o.type === "PipeWire:Interface:Node");
+  const me = nodes.find((n) => n.info?.props?.["node.name"] === "dhvani");
+  if (!me) return null;
+  const link = dump.find((o) => o.type === "PipeWire:Interface:Link" && o.info?.["output-node-id"] === me.id);
+  const sink = link && nodes.find((n) => n.id === link.info?.["input-node-id"]);
+  if (!sink) return null;
+  const lat = (sink.info?.params?.Latency ?? []) as { direction?: string; minNs?: number }[];
+  const ns = lat.find((l) => l.direction === "Input")?.minNs ?? 0;
+  const name = String(sink.info?.props?.["node.name"] ?? "");
+  return {
+    ms: Math.round(periodMs + ns / 1e6),
+    device: String(sink.info?.props?.["node.description"] ?? name),
+    bluetooth: name.startsWith("bluez_"),
+  };
 }

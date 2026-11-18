@@ -183,6 +183,7 @@ details.first[open] summary svg { rotate: 180deg; }
 .kpi .v { font-size: 24px; line-height: 30px; font-weight: 600; letter-spacing: -.02em; font-variant-numeric: tabular-nums; }
 .kpi .v small { font-size: 13px; font-weight: 400; color: var(--muted-fg); margin-left: 2px; letter-spacing: 0; }
 .kpi .s { font-size: 12px; color: var(--muted-fg); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.kpi .s.warn { color: var(--warn); }
 .kpi canvas { width: 100%; height: 28px; margin-top: 6px; }
 .kpi .lab { display: flex; align-items: center; gap: 6px; }
 .bars { display: inline-flex; gap: 2px; align-items: flex-end; height: 11px; }
@@ -609,13 +610,16 @@ function pushMetric(m) { series.push(m); if (series.length > 300) series.shift()
 const CHARTS = {
   buffer: { unit: "ms", lines: [{ k: "leadMs", name: "Queued", color: "c1", area: true }, { k: "targetMs", name: "Target", color: "c2", dash: true }] },
   network: { unit: "ms", bars: { k: "gapMaxMs", name: "Longest pause", color: "c3" }, ref: { v: 100, name: "100 ms (audible without buffer)" } },
+  // Over UDP the phone stamps each packet, so this shows the network alone, not the phone's 20 ms capture bursts.
+  jitter: { unit: "ms", bars: { k: "jitterMs", name: "Network jitter", color: "c3" }, ref: { v: () => series[series.length - 1]?.targetMs || 30, name: "Buffer target" } },
   signal: { unit: "dBm", lines: [{ k: "rssi", name: "Phone Wi-Fi signal", color: "c2", area: true }], min: -90, max: -30 },
   rate: { unit: "kbps", lines: [{ k: "kbps", name: "Received", color: "c1", area: true }], ref: { v: () => expectedKbps(), name: "Real time" } },
 };
 function visible() { const cut = Date.now() - rangeS * 1000; return series.filter((p) => p.t >= cut); }
 function drawChart() {
   const cv = $("chart"); const [c, w, h] = ctx2d(cv);
-  const cfg = CHARTS[tab], pts = visible();
+  const pts = visible();
+  const cfg = CHARTS[tab === "network" && pts.some((p) => typeof p.jitterMs === "number") ? "jitter" : tab];
   const padL = 44, padR = 10, padT = 10, padB = 22, W = w - padL - padR, H = h - padT - padB;
   const now = Date.now(), t0 = now - rangeS * 1000;
   const keys = cfg.lines ? cfg.lines.map((l) => l.k) : [cfg.bars.k];
@@ -636,12 +640,16 @@ function drawChart() {
     c.fillText(state?.session ? "Collecting readings…" : "Readings appear here while a phone streams.", padL + W / 2, padT + H / 2);
     $("legend").replaceChildren(); return;
   }
+  // Silence: the phone sends only a keepalive, so the buffer empties on purpose.
+  const slot = W / rangeS;
+  c.fillStyle = C.grid;
+  for (const p of pts) if (p.idle) c.fillRect(X(p.t) - slot / 2, padT, slot + 0.5, H);
   // Reference line
   if (refV != null && refV >= lo && refV <= hi) { c.setLineDash([4, 4]); c.strokeStyle = C.muted; c.beginPath(); c.moveTo(padL, Y(refV)); c.lineTo(w - padR, Y(refV)); c.stroke(); c.setLineDash([]); }
   // Bars
   if (cfg.bars) {
     const bw = Math.max(1, W / rangeS - 1);
-    for (const p of pts) { const v = p[cfg.bars.k]; if (typeof v !== "number") continue; c.fillStyle = v > 100 ? C.bad : C[cfg.bars.color]; c.fillRect(X(p.t) - bw / 2, Y(v), bw, Y(lo) - Y(v)); }
+    for (const p of pts) { const v = p[cfg.bars.k]; if (typeof v !== "number") continue; c.fillStyle = v > (refV ?? 100) ? C.bad : C[cfg.bars.color]; c.fillRect(X(p.t) - bw / 2, Y(v), bw, Y(lo) - Y(v)); }
   }
   // Lines
   for (const l of cfg.lines || []) {
@@ -672,6 +680,8 @@ function drawChart() {
       const ev = []; const prev = pts[pts.indexOf(best) - 1];
       if (prev && best.underruns > prev.underruns) ev.push("Ran dry");
       if (prev && best.drops > prev.drops) ev.push(`${best.drops - prev.drops} chunks skipped`);
+      if (prev && best.lost > prev.lost) ev.push(`${best.lost - prev.lost} packets lost`);
+      if (best.idle) ev.push("Silence, phone resting");
       if (ev.length) tip.append(el("div", "xs", ev.join(" · ")));
       const tw = tip.offsetWidth; tip.style.left = Math.min(w - tw - 4, Math.max(4, x + 12)) + "px"; tip.style.top = "8px";
     } else tip.hidden = true;
@@ -682,6 +692,7 @@ function drawChart() {
   if (cfg.ref) { const s = el("span"); const sw = el("i", "sw"); sw.style.cssText = `background:none;border-top:2px dashed ${C.muted};height:0`; s.append(sw, cfg.ref.name); lg.append(s); }
   const mk = (col, t) => { const s = el("span"); const sw = el("i", "sw"); sw.style.cssText = `background:${col};border-radius:50%`; s.append(sw, t); return s; };
   lg.append(mk(C.bad, "Ran dry"), mk(C.warn, "Skipped audio"));
+  if (pts.some((p) => p.idle)) { const s = el("span"); const sw = el("i", "sw"); sw.style.background = C.grid; s.append(sw, "Silence"); lg.append(s); }
 }
 function niceTicks(lo, hi, n) {
   const span = hi - lo || 1, raw = span / n, mag = 10 ** Math.floor(Math.log10(raw)), st = [1, 2, 2.5, 5, 10].map((x) => x * mag).find((x) => span / x <= n) || raw;
@@ -702,7 +713,7 @@ function spark(id, key, color, opt = {}) {
 function drawAll() {
   drawChart();
   spark("sp-lat", "leadMs", "c1", { min: 0, span: 50 });
-  spark("sp-jit", "gapMaxMs", "c3", { min: 0, span: 50 });
+  spark("sp-jit", typeof series[series.length - 1]?.jitterMs === "number" ? "jitterMs" : "gapMaxMs", "c3", { min: 0, span: 50 });
   spark("sp-wifi", "rssi", "c2", { span: 5 });
   spark("sp-rate", "kbps", "c1", { min: 0, span: 200 });
   spark("sp-drop", "underruns", "bad", { delta: true });
@@ -718,7 +729,8 @@ function grade(q, p) {
   if (q.gaps100 > 0) tips.push(`Wi-Fi paused ${q.gaps100}× for over 100 ms.`);
   if (q.dropStalled > 0) tips.push("The laptop's audio output stalled. Try another output or reconnect the headset.");
   if (rssi !== null && rssi < -70) tips.push("Weak Wi-Fi on the phone. Move closer to the router, or use a USB cable.");
-  if (p && p.freqMHz && p.freqMHz < 3000 && (q.gaps100 > 0 || (rssi ?? 0) < -67)) tips.push("The phone is on 2.4 GHz; a 5 GHz network is usually steadier.");
+  if (p && p.freqMHz && p.freqMHz < 3000) tips.push("The phone is on 2.4 GHz, which is crowded and slower here. Move it closer to the router so it switches to 5 GHz, or turn Wi-Fi off and on.");
+  if (q.lost > 0) tips.push(`${q.lost} packets were lost twice and played as 5 ms of silence each.`);
   if (q.ratePct < 90) tips.push("Audio is arriving slower than real time.");
   let level = "ok";
   if (q.gaps100 > 0 || drops > 0 || q.underruns > 0 || q.gaps50 > 5 || (rssi !== null && rssi < -67)) level = "warn";
@@ -732,21 +744,27 @@ function renderKpis() {
   const s = state; if (!s) return;
   const last = series[series.length - 1], live = !!s.session, q = s.quality, p = s.phone;
   if (!live) { for (const id of ["k-lat", "k-jit", "k-wifi", "k-rate", "k-drop"]) setV(id, "–"); $("k-lat-s").textContent = "Buffered ahead of playback"; return; }
-  if (last) { setV("k-lat", last.leadMs, " ms"); $("k-lat-s").textContent = `Target ${last.targetMs} ms · ${s.latency === "low" ? "Low" : "Stable"}`; }
+  if (last && s.output) {
+    // What you hear: the jitter buffer plus PipeWire and the output device (Bluetooth adds a lot).
+    setV("k-lat", last.leadMs + s.output.ms, " ms");
+    $("k-lat-s").textContent = `Buffer ${last.leadMs} + ${s.output.bluetooth ? "Bluetooth" : "output"} ${s.output.ms} ms`;
+  } else if (last) { setV("k-lat", last.leadMs, " ms"); $("k-lat-s").textContent = `Target ${last.targetMs} ms · ${s.latency === "low" ? "Low" : "Stable"}`; }
   else { setV("k-lat", "…"); $("k-lat-s").textContent = s.latency === "low" ? "Low delay mode" : "Stable mode"; }
-  if (q) { setV("k-jit", Math.round(q.gapMaxMs), " ms"); $("k-jit-s").textContent = `Typical ${Math.round(q.gapP50Ms ?? 0)} ms · p95 ${Math.round(q.gapP95Ms ?? 0)} ms`; }
+  if (q && typeof q.netJitterMs === "number") { setV("k-jit", Math.round(q.netJitterMs), " ms"); $("k-jit-s").textContent = `Network, p95 · max ${Math.round(q.netJitterMaxMs ?? 0)} ms`; }
+  else if (q) { setV("k-jit", Math.round(q.gapMaxMs), " ms"); $("k-jit-s").textContent = `Typical ${Math.round(q.gapP50Ms ?? 0)} ms · p95 ${Math.round(q.gapP95Ms ?? 0)} ms`; }
   else if (last) { setV("k-jit", last.gapMaxMs, " ms"); $("k-jit-s").textContent = "Longest pause, last second"; }
   if (p && typeof p.rssi === "number") {
     setV("k-wifi", p.rssi, " dBm");
     const band = p.freqMHz ? (p.freqMHz > 5900 ? "6 GHz" : p.freqMHz > 3000 ? "5 GHz" : "2.4 GHz") : "";
     $("k-wifi-s").textContent = [band, p.linkMbps ? `${p.linkMbps} Mbps link` : ""].filter(Boolean).join(" · ") || "Phone signal";
+    $("k-wifi-s").classList.toggle("warn", band === "2.4 GHz");
     const n = p.rssi >= -55 ? 4 : p.rssi >= -67 ? 3 : p.rssi >= -75 ? 2 : 1;
     [...$("k-bars").children].forEach((b, i) => b.classList.toggle("on", i < n));
   } else { setV("k-wifi", "–"); $("k-wifi-s").textContent = /(^|:)127\./.test(s.session.address || "") ? "USB cable" : "Waiting for the phone"; }
-  if (last) { setV("k-rate", last.kbps, " kbps"); $("k-rate-s").textContent = last.idle && last.kbps < expectedKbps() * 0.5 ? "Phone idle during silence" : `${Math.round(last.kbps / expectedKbps() * 100)}% of real time`; }
+  if (last) { setV("k-rate", last.kbps, " kbps"); $("k-rate-s").textContent = last.idle && last.kbps < expectedKbps() * 0.5 ? "Phone idle during silence" : `${Math.round(last.kbps / expectedKbps() * 100)}% of real time · ${(s.session.transport || "tcp").toUpperCase()}`; }
   const ur = last?.underruns ?? 0;
   setV("k-drop", ur, ur === 1 ? " gap" : " gaps");
-  $("k-drop-s").textContent = `${s.drops} chunks skipped`;
+  $("k-drop-s").textContent = [`${s.drops} chunks skipped`, last?.recovered ? `${last.recovered} packets resent` : "", last?.lost ? `${last.lost} lost` : ""].filter(Boolean).join(" · ");
 }
 
 // ---------- History ----------

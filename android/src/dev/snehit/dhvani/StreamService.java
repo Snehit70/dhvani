@@ -73,8 +73,20 @@ public final class StreamService extends Service {
     /** After this much digital silence, send only a short keepalive so the Wi-Fi radio can rest. */
     private static final int IDLE_AFTER_MS = 2000;
     private static final long KEEPALIVE_MS = 250;
+    /** Over UDP the laptop pings the TCP socket every second; silence this long means it is gone. */
+    private static final long LAPTOP_SILENT_MS = 5000;
+    /** DSCP EF: Wi-Fi sends these in its video queue, ahead of bulk traffic. */
+    private static final int TOS_EF = 0xB8;
 
     private final Handler main = new Handler(Looper.getMainLooper());
+    /** Audio goes as UDP packets; false means it is written to the TCP socket. */
+    private volatile boolean useUdp;
+    /** Uptime when the laptop last wrote anything on the TCP socket. */
+    private volatile long lastHeardAt;
+    private int udpSeq;
+    private int udpErrors;
+    private final java.util.ArrayDeque<byte[]> lateCopies = new java.util.ArrayDeque<>();
+    private final java.util.ArrayDeque<Long> lateDue = new java.util.ArrayDeque<>();
     /** Uptime when the current socket write began, 0 when no write is in flight. */
     private volatile long writeStartedAt;
     /** Times the watchdog killed a stuck connection this run. */
@@ -94,6 +106,13 @@ public final class StreamService extends Service {
             if (t != 0 && SystemClock.uptimeMillis() - t > WRITE_STALL_MS) {
                 stalls++;
                 Log.w(TAG, "write stuck " + (SystemClock.uptimeMillis() - t) + " ms, dropping connection");
+                closeQuietly(socket);
+            }
+            long heard = lastHeardAt;
+            if (useUdp && heard != 0 && SystemClock.uptimeMillis() - heard > LAPTOP_SILENT_MS) {
+                stalls++;
+                Log.w(TAG, "laptop silent " + (SystemClock.uptimeMillis() - heard) + " ms, dropping connection");
+                lastHeardAt = 0;
                 closeQuietly(socket);
             }
             main.postDelayed(this, 1000);
@@ -238,9 +257,12 @@ public final class StreamService extends Service {
             if (!running) { closeQuietly(s); break; }
             boolean streamed = false;
             DatagramSocket statsSock = null;
+            DatagramSocket audioSock = null;
             try {
                 s.setTcpNoDelay(true);
-                s.setSendBufferSize(CHUNK_BYTES * 8);
+                // Small on purpose: after a stall a big buffer bursts stale audio the laptop must drop.
+                s.setSendBufferSize(CHUNK_BYTES * 3);
+                try { s.setTrafficClass(TOS_EF); } catch (IOException ignored) {}
                 s.connect(new InetSocketAddress(host, port), 4000);
                 s.setSoTimeout(5000);
                 OutputStream out = s.getOutputStream();
@@ -256,6 +278,19 @@ public final class StreamService extends Service {
                 Log.i(TAG, "streaming to " + reply.name);
                 s.setSoTimeout(0);
                 udpTarget = s.getInetAddress();
+                // adb reverse carries TCP only, so over USB the audio stays on the socket.
+                useUdp = reply.udpToken != null && !s.getInetAddress().isLoopbackAddress();
+                if (useUdp) {
+                    audioSock = new DatagramSocket();
+                    try { audioSock.setTrafficClass(TOS_EF); } catch (IOException ignored) {}
+                    audioSock.connect(new InetSocketAddress(s.getInetAddress(), reply.udpPort));
+                }
+                udpSeq = 0;
+                udpErrors = 0;
+                lateCopies.clear();
+                lateDue.clear();
+                lastHeardAt = SystemClock.uptimeMillis();
+                Log.i(TAG, "audio over " + (useUdp ? "udp" : "tcp"));
                 startLaptopReader(s);
                 rec.startRecording();
                 silencePhone();
@@ -279,6 +314,10 @@ public final class StreamService extends Service {
                     if (readMs > 50) slowReads++;
                     if (n < 0) throw new IOException("capture error " + n);
                     if (n == 0) continue;
+                    // Over UDP nothing writes to the socket, so a closed one shows up only here.
+                    if (s.isClosed()) throw new IOException("laptop closed the connection");
+                    boolean udpNow = useUdp && audioSock != null;
+                    if (udpNow) sendLateCopies(audioSock, SystemClock.uptimeMillis());
                     boolean zero = allZero(buf, n);
                     quietMs = zero ? quietMs + CHUNK_MS : 0;
                     long w0 = SystemClock.uptimeMillis();
@@ -286,9 +325,13 @@ public final class StreamService extends Service {
                     boolean send = quietMs < IDLE_AFTER_MS || w0 >= nextKeepalive;
                     if (send) {
                         if (quietMs >= IDLE_AFTER_MS) nextKeepalive = w0 + KEEPALIVE_MS;
-                        writeStartedAt = w0;
-                        out.write(buf, 0, n);
-                        writeStartedAt = 0;
+                        if (udpNow) {
+                            sendUdp(audioSock, reply.udpToken, buf, n, w0);
+                        } else {
+                            writeStartedAt = w0;
+                            out.write(buf, 0, n);
+                            writeStartedAt = 0;
+                        }
                         long writeMs = SystemClock.uptimeMillis() - w0;
                         if (writeMs > writeMax) writeMax = writeMs;
                         if (writeMs > 20) slowWrites++;
@@ -335,6 +378,9 @@ public final class StreamService extends Service {
             } finally {
                 writeStartedAt = 0;
                 udpTarget = null;
+                useUdp = false;
+                lastHeardAt = 0;
+                if (audioSock != null) audioSock.close();
                 StreamState.clearLaptop();
                 if (statsSock != null) statsSock.close();
                 closeQuietly(s);
@@ -356,6 +402,35 @@ public final class StreamService extends Service {
      * scales its output by this. While the app holds the phone silent, report full
      * volume so the laptop keeps its own level.
      */
+    /** Sends one capture read as 5 ms packets and queues each one's late copy. */
+    private void sendUdp(DatagramSocket ds, byte[] token, byte[] buf, int n, long now) {
+        for (int off = 0; off < n; off += Protocol.UDP_PCM_BYTES) {
+            int len = Math.min(Protocol.UDP_PCM_BYTES, n - off);
+            byte[] p = Protocol.audioPacket(token, udpSeq++, (int) now, buf, off, len);
+            sendPacket(ds, p);
+            byte[] late = p.clone();
+            late[3] = 1;
+            lateCopies.add(late);
+            lateDue.add(now + Protocol.REDUNDANT_DELAY_MS);
+        }
+    }
+
+    private void sendLateCopies(DatagramSocket ds, long now) {
+        while (!lateDue.isEmpty() && lateDue.peek() <= now) {
+            lateDue.poll();
+            sendPacket(ds, lateCopies.poll());
+        }
+    }
+
+    /** A failed send loses one packet; the TCP socket decides whether the laptop is still there. */
+    private void sendPacket(DatagramSocket ds, byte[] p) {
+        try {
+            ds.send(new DatagramPacket(p, p.length));
+        } catch (IOException e) {
+            udpErrors++;
+        }
+    }
+
     private int[] phoneVolume() {
         if (savedVolume >= 0) return new int[] {1, 1, 0};
         int max = Math.max(1, audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC));
@@ -386,7 +461,14 @@ public final class StreamService extends Service {
                 InputStream in = s.getInputStream();
                 boolean first = true, wasMuted = false;
                 while (running && socket == s) {
-                    Protocol.Laptop l = Protocol.parseLaptop(readLine(in));
+                    String line = readLine(in);
+                    lastHeardAt = SystemClock.uptimeMillis();
+                    if (Protocol.isTcpFallback(line)) {
+                        Log.w(TAG, "laptop got no UDP audio, switching to tcp");
+                        useUdp = false;
+                        continue;
+                    }
+                    Protocol.Laptop l = Protocol.parseLaptop(line);
                     if (l == null) continue;
                     if (s.getInetAddress().isLoopbackAddress()) {
                         for (String a : l.addresses) {
@@ -402,7 +484,8 @@ public final class StreamService extends Service {
                     wasMuted = l.muted;
                 }
             } catch (IOException | RuntimeException ignored) {
-                // Socket closed; the stream loop handles reconnects.
+                // Laptop closed the socket; make sure the stream loop sees it and reconnects.
+                closeQuietly(s);
             }
         }, "dhvani-laptop");
         t.setDaemon(true);
@@ -441,6 +524,8 @@ public final class StreamService extends Service {
             o.put("slowReads", slowReads);
             o.put("slowWrites", slowWrites);
             o.put("stalls", stalls);
+            o.put("transport", useUdp ? "udp" : "tcp");
+            o.put("udpErrors", udpErrors);
             o.put("reconnects", reconnects);
             o.put("silenced", savedVolume >= 0);
             o.put("musicActive", audio.isMusicActive());

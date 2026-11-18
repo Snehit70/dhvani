@@ -10,7 +10,34 @@ final class Protocol {
     static final int DISCOVERY_PORT = 47802;
     static final int RATE = 48000;
     static final int CHANNELS = 2;
-    static final String APP_VERSION = "0.2.0";
+    static final String APP_VERSION = "0.3.0";
+
+    /** UDP audio packet: 'D' 'H', version, flags (bit 0 = late copy), 8-byte token, seq, phone ms, PCM. */
+    static final int UDP_HEADER = 20;
+    static final int UDP_VERSION = 1;
+    /** 5 ms of 48 kHz stereo s16, so a packet stays under one Wi-Fi frame. */
+    static final int UDP_PCM_BYTES = RATE * CHANNELS * 2 * 5 / 1000;
+    /** Every packet goes out again this much later; a loss shorter than this is filled from the copy. */
+    static final int REDUNDANT_DELAY_MS = 20;
+
+    static byte[] audioPacket(byte[] token, int seq, int sentMs, byte[] pcm, int off, int len) {
+        byte[] p = new byte[UDP_HEADER + len];
+        p[0] = 'D';
+        p[1] = 'H';
+        p[2] = UDP_VERSION;
+        System.arraycopy(token, 0, p, 4, 8);
+        putInt(p, 12, seq);
+        putInt(p, 16, sentMs);
+        System.arraycopy(pcm, off, p, UDP_HEADER, len);
+        return p;
+    }
+
+    private static void putInt(byte[] b, int at, int v) {
+        b[at] = (byte) (v >>> 24);
+        b[at + 1] = (byte) (v >>> 16);
+        b[at + 2] = (byte) (v >>> 8);
+        b[at + 3] = (byte) v;
+    }
 
     private Protocol() {}
 
@@ -23,6 +50,7 @@ final class Protocol {
             o.put("rate", RATE);
             o.put("channels", CHANNELS);
             o.put("format", "s16le");
+            o.put("udp", 1);
             return o.toString() + "\n";
         } catch (JSONException e) {
             throw new IllegalStateException(e);
@@ -33,6 +61,9 @@ final class Protocol {
         final boolean ok;
         final String name;
         final String error;
+        /** Set when the laptop wants audio over UDP; null means send it on the TCP socket. */
+        byte[] udpToken;
+        int udpPort;
 
         Reply(boolean ok, String name, String error) {
             this.ok = ok;
@@ -44,7 +75,18 @@ final class Protocol {
     static Reply parseReply(String line) {
         try {
             JSONObject o = new JSONObject(line);
-            if (o.optBoolean("ok", false)) return new Reply(true, o.optString("name", "Laptop"), null);
+            if (o.optBoolean("ok", false)) {
+                Reply r = new Reply(true, o.optString("name", "Laptop"), null);
+                JSONObject u = o.optJSONObject("udp");
+                String tok = u == null ? "" : u.optString("token", "");
+                int port = u == null ? 0 : u.optInt("port", 0);
+                if (tok.matches("[0-9a-f]{16}") && port > 0 && port <= 65535) {
+                    r.udpToken = new byte[8];
+                    for (int i = 0; i < 8; i++) r.udpToken[i] = (byte) Integer.parseInt(tok.substring(i * 2, i * 2 + 2), 16);
+                    r.udpPort = port;
+                }
+                return r;
+            }
             return new Reply(false, null, o.optString("error", "unknown"));
         } catch (JSONException e) {
             return new Reply(false, null, "bad_reply");
@@ -128,6 +170,16 @@ final class Protocol {
             return new Laptop(o.optDouble("volume", 1), o.optBoolean("muted", false), addrs);
         } catch (JSONException e) {
             return null;
+        }
+    }
+
+    /** The laptop got no UDP audio and asks for it on the TCP socket instead. */
+    static boolean isTcpFallback(String line) {
+        try {
+            JSONObject o = new JSONObject(line);
+            return "transport".equals(o.optString("dhvani")) && !o.optBoolean("udp", true);
+        } catch (JSONException e) {
+            return false;
         }
     }
 

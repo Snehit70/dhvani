@@ -3,9 +3,16 @@
 Plays your Android phone's audio on your Linux laptop over Wi-Fi: music, videos, games. Only playback audio is sent, never the microphone or the screen.
 
 ```
-phone (Android 10+)  --TCP 47800, raw 48 kHz stereo PCM-->  laptop (PipeWire)
-                     <--UDP 47802 discovery-->
+phone (Android 10+)  --UDP 47802, raw 48 kHz stereo PCM, each packet sent twice-->  laptop (PipeWire)
+                     <--TCP 47800 pairing, laptop volume, keepalive-->
+                     <--UDP 47802 discovery and phone reports-->
 ```
+
+Over Wi-Fi the audio goes as 5 ms UDP packets, each one sent again 20 ms later. A lost
+packet is filled from its copy, and one lost twice plays as 5 ms of silence. Over TCP the
+same loss stalled the stream for one to three seconds while the packet was resent. If UDP
+does not get through, the laptop asks the phone to send on the TCP socket instead. Over USB
+(`adb reverse` carries TCP only) audio always uses TCP.
 
 ## Laptop
 
@@ -91,7 +98,9 @@ On the phone: `adb logcat -s Dhvani`.
 ## Limits
 
 - Apps that opt out of capture (some banking and DRM video apps) and calls are not shared. That is Android policy.
-- Latency is roughly 50-100 ms. Fine for music and video, noticeable for rhythm games.
+- Latency is roughly 50-70 ms through laptop speakers or a jack. Android captures in fixed
+  21 ms blocks, so the buffer cannot go much below 30 ms. Bluetooth headphones add their own
+  delay on top (SBC is about 130 ms); the panel's Latency tile includes it.
 - Audio is not encrypted on the LAN. The pairing code stops strangers from playing to your laptop; it does not hide what you stream. Use it on networks you trust.
 
 ## Develop

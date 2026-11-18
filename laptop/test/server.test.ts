@@ -232,3 +232,56 @@ test("control packet from the streaming phone reaches the hook; wrong code does 
   udp.close();
   c.sock.end();
 });
+
+import { encodeAudioPacket, TCP_FALLBACK_LINE } from "../src/protocol";
+
+async function startUdp() {
+  controls = [];
+  server = new AudioServer(() => config, factory, {
+    onChange: () => changes++, onLevel: () => {}, addresses: () => [], allowUdp: () => true,
+  }, 500);
+  const port = await server.listen(0, "127.0.0.1");
+  await server.listenDiscovery(0, port);
+  return port;
+}
+const helloUdp = JSON.stringify({ v: 1, code: "424242", device: "Pixel", rate: 48000, channels: 2, format: "s16le", udp: 1 }) + "\n";
+
+test("UDP audio: offered on hello, reordered, late copy fills a loss", async () => {
+  const port = await startUdp();
+  const c = connect(port);
+  c.sock.write(helloUdp);
+  const reply = JSON.parse(await c.line());
+  expect(reply.ok).toBe(true);
+  expect(reply.udp.token).toMatch(/^[0-9a-f]{16}$/);
+  expect(server.session?.transport).toBe("udp");
+  const token = Buffer.from(reply.udp.token, "hex");
+  const udp = dgram.createSocket("udp4");
+  const send = (seq: number, v: number, late = false, tok: Uint8Array = token) =>
+    udp.send(encodeAudioPacket({ token: tok, seq, sentMs: 1000 + seq * 5, late, pcm: new Uint8Array(4).fill(v) }), reply.udp.port, "127.0.0.1");
+  send(0, 1);
+  send(2, 3);
+  send(5, 9, false, Buffer.alloc(8)); // wrong token: ignored
+  await Bun.sleep(5);
+  send(1, 2, true);
+  await until(() => players[0]?.data.length === 12);
+  expect(players[0]!.data).toEqual([1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3]);
+  // TCP bytes are not audio while UDP carries it.
+  c.sock.write(Buffer.from([7, 7, 7, 7]));
+  await Bun.sleep(30);
+  expect(players[0]!.data.length).toBe(12);
+  udp.close();
+  c.sock.end();
+});
+
+test("UDP that never arrives falls back to TCP audio", async () => {
+  const port = await startUdp();
+  const c = connect(port);
+  c.sock.write(helloUdp);
+  expect(JSON.parse(await c.line()).udp).toBeDefined();
+  let l = "";
+  while ((l = await c.line()) !== TCP_FALLBACK_LINE.trim()) {}
+  expect(server.session?.transport).toBe("tcp");
+  c.sock.write(Buffer.from([5, 0, 6, 0]));
+  await until(() => players[0]?.data.length === 4);
+  c.sock.end();
+}, 6000);

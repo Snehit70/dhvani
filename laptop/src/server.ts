@@ -1,4 +1,5 @@
 import net from "node:net";
+import { randomBytes } from "node:crypto";
 import dgram from "node:dgram";
 import type { Config } from "./config";
 import { FrameAligner, QUIET_PEAK, processPcm, type LatencyMode } from "./audio";
@@ -6,6 +7,7 @@ import { Analyzer, type LevelFrame } from "./analyzer";
 import { log } from "./log";
 import type { Player, PlayerFactory } from "./player";
 import { StreamStats } from "./stats";
+import { Reorder, type Delivered } from "./udp";
 import {
   FailureLimiter,
   MAX_HELLO_BYTES,
@@ -19,6 +21,10 @@ import {
   parsePhoneVolume,
   laptopState,
   phoneGain,
+  isAudioPacket,
+  parseAudioPacket,
+  PING_LINE,
+  TCP_FALLBACK_LINE,
   type PhoneControl,
   type Hello,
 } from "./protocol";
@@ -30,6 +36,8 @@ export type Session = {
   since: number;
   rate: number;
   channels: number;
+  /** How the audio travels: UDP with late copies, or the TCP control socket itself. */
+  transport: "udp" | "tcp";
   /** Phone media volume as last reported (null until the phone app sends it). */
   phoneVolume: { index: number; max: number; muted: boolean } | null;
 };
@@ -47,12 +55,18 @@ export type ServerHooks = {
   onSessionEnd?(s: Session, reason: EndReason): void;
   /** LAN addresses the phone can send UDP reports to when it streams over USB. */
   addresses?(): string[];
+  /** Whether a phone at this address may stream over UDP. Default: anything but loopback (USB). */
+  allowUdp?(address: string): boolean;
 };
 
 const isLoopback = (a: string) => a === "127.0.0.1" || a === "::1" || a.startsWith("127.");
 
 const LEVEL_INTERVAL_MS = 66;
 const RESPAWN_INTERVAL_MS = 1000;
+/** No UDP audio this long after the session starts: the path is blocked, fall back to TCP. */
+export const UDP_FALLBACK_MS = 2500;
+/** UDP audio stopped this long (the phone sends a keepalive at least every 250 ms): phone is gone. */
+export const UDP_TIMEOUT_MS = 5000;
 export const STATS_INTERVAL_MS = 10_000;
 
 export type SessionSummary = {
@@ -74,9 +88,14 @@ export type LiveMetrics = {
   drops: number;
   underruns: number;
   rssi: number | null;
+  /** Spread of UDP packet travel times this second (null over TCP). */
+  jitterMs: number | null;
+  /** UDP packets saved by their late copy, and lost twice, session totals. */
+  recovered: number;
+  lost: number;
 };
 
-export type EndReason = "phone_closed" | "socket_error" | "replaced" | "disconnected" | "code_changed" | "shutdown";
+export type EndReason = "phone_closed" | "socket_error" | "timeout" | "replaced" | "disconnected" | "code_changed" | "shutdown";
 
 type Active = {
   session: Session;
@@ -93,8 +112,14 @@ type Active = {
   reportedUnderruns: number;
   socketError: string;
   analyzer: Analyzer;
-  sec: { bytes: number; gapMax: number; lastAt: number; lastSilent: boolean; idle: boolean };
+  sec: { bytes: number; gapMax: number; lastAt: number; lastSilent: boolean; idle: boolean; tMin: number; tMax: number };
   secTimer: ReturnType<typeof setInterval>;
+  udp: {
+    token: Buffer;
+    reorder: Reorder;
+    lastAt: number;
+    timers: ReturnType<typeof setInterval>[];
+  } | null;
 };
 
 export class AudioServer {
@@ -117,6 +142,7 @@ export class AudioServer {
   private peak = 0;
   private lastLevelAt = 0;
   private audioPort = 0;
+  private discoveryPort = 0;
 
   constructor(
     private getConfig: () => Config,
@@ -141,6 +167,7 @@ export class AudioServer {
     const udp = dgram.createSocket({ type: "udp4", reuseAddr: true });
     this.udp = udp;
     udp.on("message", (msg, rinfo) => {
+      if (isAudioPacket(msg)) return this.udpAudio(msg);
       if (msg.length > 1024) return;
       const text = msg.toString();
       const stats = parsePhoneStats(text);
@@ -159,6 +186,7 @@ export class AudioServer {
     });
     udp.on("error", (e) => this.fail(`Discovery error: ${e.message}`));
     this.discovery = true;
+    this.discoveryPort = udp.address().port;
   }
 
   close(): void {
@@ -183,8 +211,10 @@ export class AudioServer {
     a.socket.write(laptopState(cfg.volume, cfg.muted, this.hooks.addresses?.() ?? []));
   }
 
+  /** New bounds take effect at once; the player restarts so PipeWire's period follows the mode. */
   setLatency(mode: LatencyMode): void {
     this.active?.player?.setLatency(mode);
+    this.restartPlayer();
   }
 
   /** Re-opens playback, e.g. after the output device changed. */
@@ -278,8 +308,12 @@ export class AudioServer {
       since: Date.now(),
       rate: hello.rate,
       channels: hello.channels,
+      transport: "tcp",
       phoneVolume: null,
     };
+    const allowUdp = this.hooks.allowUdp ? this.hooks.allowUdp(address) : !isLoopback(address);
+    const useUdp = hello.udp && allowUdp && this.discovery;
+    if (useUdp) session.transport = "udp";
     const bytesPerSec = hello.rate * hello.channels * 2;
     const active: Active = {
       session, socket, hello, player: null, lastSpawn: 0,
@@ -287,14 +321,16 @@ export class AudioServer {
       statsTimer: setInterval(() => this.flushStats(active, bytesPerSec), STATS_INTERVAL_MS),
       totalBytes: 0, totalDrops: 0, pastUnderruns: 0, reportedUnderruns: 0, socketError: "",
       analyzer: new Analyzer(hello.rate, hello.channels),
-      sec: { bytes: 0, gapMax: 0, lastAt: 0, lastSilent: false, idle: true },
+      sec: { bytes: 0, gapMax: 0, lastAt: 0, lastSilent: false, idle: true, tMin: Infinity, tMax: -Infinity },
       secTimer: setInterval(() => this.tickSecond(active), 1000),
+      udp: null,
     };
     active.statsTimer.unref?.();
     active.secTimer.unref?.();
     this.active = active;
     log("session_start", {
       session: session.id, device: session.device, address, rate: hello.rate, channels: hello.channels,
+      transport: session.transport,
       sink: this.getConfig().sink || "default", volume: this.getConfig().volume, muted: this.getConfig().muted,
     });
     this.session = session;
@@ -302,15 +338,28 @@ export class AudioServer {
     this.lastError = "";
     this.quality = null;
     this.phone = null;
-    socket.write(encodeReply({ ok: true, name: this.getConfig().name }));
+    const token = useUdp ? randomBytes(8) : null;
+    socket.write(encodeReply({
+      ok: true,
+      name: this.getConfig().name,
+      ...(token ? { udp: { port: this.discoveryPort, token: token.toString("hex") } } : {}),
+    }));
     this.pushLaptopState();
 
     const aligner = new FrameAligner(2 * hello.channels);
-    const onAudio = (chunk: Uint8Array) => {
+    const onAudio = (chunk: Uint8Array, d?: Delivered) => {
       if (this.active !== active) return;
-      active.stats.arrival(chunk.length);
-      active.totalBytes += chunk.length;
       const now = performance.now();
+      if (d?.concealed) active.stats.lost++;
+      else active.stats.arrival(chunk.length);
+      if (d?.recovered) active.stats.recovered++;
+      if (d && d.sentMs !== null && !d.recovered) {
+        active.stats.transit(d.sentMs, now);
+        const tr = now - d.sentMs;
+        if (tr < active.sec.tMin) active.sec.tMin = tr;
+        if (tr > active.sec.tMax) active.sec.tMax = tr;
+      }
+      active.totalBytes += chunk.length;
       if (active.sec.lastAt && !active.sec.lastSilent) active.sec.gapMax = Math.max(active.sec.gapMax, now - active.sec.lastAt);
       active.sec.lastAt = now;
       active.sec.bytes += chunk.length;
@@ -337,7 +386,24 @@ export class AudioServer {
       active.stats.chunk(peak, player?.leadMs ?? 0, silent);
       this.reportLevel(active, peak);
     };
-    socket.on("data", onAudio);
+    if (token) {
+      const u: NonNullable<Active["udp"]> = {
+        token,
+        reorder: new Reorder((d) => onAudio(d.pcm, d)),
+        lastAt: 0,
+        timers: [],
+      };
+      active.udp = u;
+      u.timers.push(
+        setInterval(() => u.reorder.tick(), 5),
+        setInterval(() => this.udpHousekeeping(active), 1000),
+      );
+      for (const t of u.timers) t.unref?.();
+    }
+    // Over UDP the socket carries no audio until the laptop asks for the TCP fallback.
+    socket.on("data", (chunk: Uint8Array) => {
+      if (active.session.transport === "tcp") onAudio(chunk);
+    });
     socket.on("error", (e) => {
       active.socketError = e.message;
     });
@@ -346,7 +412,39 @@ export class AudioServer {
     });
     this.hooks.onChange();
     this.hooks.onSessionStart?.(session);
-    if (rest.length) onAudio(rest);
+    if (rest.length && session.transport === "tcp") onAudio(rest);
+  }
+
+  private udpAudio(msg: Buffer) {
+    const a = this.active;
+    const u = a?.udp;
+    if (!a || !u || a.session.transport !== "udp") return;
+    const p = parseAudioPacket(msg);
+    if (!p || !u.token.equals(p.token)) return;
+    u.lastAt = performance.now();
+    u.reorder.push(p.seq, p.sentMs, p.late, p.pcm);
+  }
+
+  /** Once a second over UDP: keep the phone's watchdog fed, fall back to TCP, notice a vanished phone. */
+  private udpHousekeeping(active: Active) {
+    const u = active.udp;
+    if (this.active !== active || !u || active.socket.destroyed) return;
+    if (active.session.transport !== "udp") return;
+    const age = performance.now() - u.lastAt;
+    if (!u.reorder.received && Date.now() - active.session.since >= UDP_FALLBACK_MS) {
+      active.session.transport = "tcp";
+      log("udp_fallback", { session: active.session.id });
+      active.socket.write(TCP_FALLBACK_LINE);
+      this.hooks.onChange();
+      return;
+    }
+    if (u.reorder.received && age > UDP_TIMEOUT_MS) {
+      log("udp_timeout", { session: active.session.id, ms: Math.round(age) });
+      active.socket.destroy();
+      this.endActive("timeout");
+      return;
+    }
+    active.socket.write(PING_LINE);
   }
 
   private ensurePlayer(active: Active): Player | null {
@@ -460,10 +558,15 @@ export class AudioServer {
       drops: active.totalDrops,
       underruns: this.underruns(active),
       rssi: typeof rssi === "number" ? rssi : null,
+      jitterMs: s.tMax >= s.tMin ? Math.round((s.tMax - s.tMin) * 10) / 10 : null,
+      recovered: active.udp?.reorder.recovered ?? 0,
+      lost: active.udp?.reorder.lost ?? 0,
     });
     s.bytes = 0;
     s.gapMax = 0;
     s.idle = true;
+    s.tMin = Infinity;
+    s.tMax = -Infinity;
   }
 
   private endActive(reason: EndReason) {
@@ -473,6 +576,7 @@ export class AudioServer {
     this.session = null;
     clearInterval(a.statsTimer);
     clearInterval(a.secTimer);
+    for (const t of a.udp?.timers ?? []) clearInterval(t);
     this.flushStats(a, a.hello.rate * a.hello.channels * 2);
     this.quality = null;
     this.phone = null;
@@ -489,6 +593,9 @@ export class AudioServer {
       mb: Math.round(a.totalBytes / 1e4) / 100,
       drops: a.totalDrops,
       underruns: this.underruns(a),
+      transport: a.session.transport,
+      recovered: a.udp?.reorder.recovered,
+      lost: a.udp?.reorder.lost,
     });
     this.retirePlayer(a);
     this.hooks.onLevel({ peak: 0, l: 0, r: 0, rmsL: 0, rmsR: 0, bands: [] });
