@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { FrameAligner, JitterBuffer, processPcm } from "../src/audio";
+import { FrameAligner, JitterBuffer, Limiter, processPcm } from "../src/audio";
 import { SessionNotifier } from "../src/notify";
 import { usbSerials } from "../src/usb";
 import { sanitize, defaults } from "../src/config";
@@ -63,11 +63,22 @@ describe("audio", () => {
     const v = new DataView(b.buffer, b.byteOffset, b.length);
     return Array.from({ length: b.length / 2 }, (_, i) => v.getInt16(i * 2, true));
   };
-  test("gain clamps and reports peak", () => {
-    const { out, peak } = processPcm(pcm(1000, -20000, 30000), 1.5);
-    expect(read(out)).toEqual([1500, -30000, 32767]);
-    expect(peak).toBeCloseTo(32767 / 32768);
+  test("gain above unity limits peaks instead of clipping", () => {
+    const { out, peak } = processPcm(pcm(1000, -20000), 1.5);
+    expect(read(out)).toEqual([1500, -30000]);
+    const loud = read(processPcm(pcm(30000, -30000), 1.5).out);
+    expect(Math.max(...loud.map(Math.abs))).toBeLessThanOrEqual(31130);
+    expect(loud.every((s) => Math.abs(s) > 31000)).toBe(true);
+    expect(peak).toBeCloseTo(30000 / 32768);
     expect(read(processPcm(pcm(1000, -1000), 0).out)).toEqual([0, 0]);
+  });
+  test("limiter recovers gain after a peak", () => {
+    const l = new Limiter(1, 48000);
+    l.process(pcm(32000), 1.5);
+    const quiet = pcm(...Array(48000).fill(1000));
+    const after = read(l.process(quiet, 1.5).out);
+    expect(after[0]).toBeLessThan(1000);
+    expect(after[after.length - 1]).toBe(1500);
   });
   test("FrameAligner keeps frames whole across chunks", () => {
     const a = new FrameAligner(4);

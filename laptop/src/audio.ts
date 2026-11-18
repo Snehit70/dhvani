@@ -1,29 +1,67 @@
+/** Loudest sample the limiter lets through, about -0.4 dBFS. */
+const LIMIT_CEIL = 31_130;
+/** How long the limiter takes to give gain back after a peak. */
+const LIMIT_RELEASE_MS = 80;
+
 /**
- * Applies gain to s16le PCM in place-safe fashion (returns a new buffer)
- * and reports the post-gain peak in 0..1 for the level meter.
+ * Applies gain to s16le PCM and reports the post-gain peak in 0..1 for the level meter.
+ * Above unity gain, loud peaks would clip, and hard clipping is heard as crackle. So a
+ * limiter turns the gain down at once on any frame that would pass LIMIT_CEIL and lets
+ * it recover smoothly. One instance per stream keeps that state across chunks.
  */
-export function processPcm(
-  chunk: Uint8Array,
-  gain: number,
-): { out: Uint8Array; peak: number } {
-  const samples = chunk.length >> 1;
-  const out = new Uint8Array(samples * 2);
-  const src = new DataView(chunk.buffer, chunk.byteOffset, samples * 2);
-  const dst = new DataView(out.buffer);
-  let peak = 0;
-  const unity = gain === 1;
-  for (let i = 0; i < samples; i++) {
-    let s = src.getInt16(i * 2, true);
-    if (!unity) {
-      s = Math.round(s * gain);
-      if (s > 32767) s = 32767;
-      else if (s < -32768) s = -32768;
-    }
-    const a = s < 0 ? -s : s;
-    if (a > peak) peak = a;
-    dst.setInt16(i * 2, s, true);
+export class Limiter {
+  /** Gain reduction currently applied, 1 when idle. */
+  private env = 1;
+  private readonly release: number;
+  constructor(private readonly channels: number, rate: number) {
+    this.release = 1 - Math.exp(-1 / ((LIMIT_RELEASE_MS / 1000) * rate));
   }
-  return { out, peak: Math.min(1, peak / 32768) };
+  process(chunk: Uint8Array, gain: number): { out: Uint8Array; peak: number } {
+    const ch = Math.max(1, this.channels);
+    const frames = Math.floor(chunk.length / (2 * ch));
+    const out = new Uint8Array(frames * ch * 2);
+    const src = new DataView(chunk.buffer, chunk.byteOffset, frames * ch * 2);
+    const dst = new DataView(out.buffer);
+    let peak = 0;
+    const unity = gain === 1 && this.env === 1;
+    for (let f = 0; f < frames; f++) {
+      const base = f * ch * 2;
+      if (unity) {
+        for (let c = 0; c < ch; c++) {
+          const s = src.getInt16(base + c * 2, true);
+          const a = s < 0 ? -s : s;
+          if (a > peak) peak = a;
+          dst.setInt16(base + c * 2, s, true);
+        }
+        continue;
+      }
+      let loud = 0;
+      for (let c = 0; c < ch; c++) {
+        const s = src.getInt16(base + c * 2, true);
+        const a = s < 0 ? -s : s;
+        if (a > loud) loud = a;
+      }
+      const want = loud * gain > LIMIT_CEIL ? LIMIT_CEIL / (loud * gain) : 1;
+      if (want < this.env) this.env = want;
+      else this.env += (want - this.env) * this.release;
+      if (this.env > 0.99999) this.env = 1;
+      const g = gain * this.env;
+      for (let c = 0; c < ch; c++) {
+        let s = Math.round(src.getInt16(base + c * 2, true) * g);
+        if (s > 32767) s = 32767;
+        else if (s < -32768) s = -32768;
+        const a = s < 0 ? -s : s;
+        if (a > peak) peak = a;
+        dst.setInt16(base + c * 2, s, true);
+      }
+    }
+    return { out, peak: Math.min(1, peak / 32768) };
+  }
+}
+
+/** One-off gain with a fresh limiter, for callers without a stream. */
+export function processPcm(chunk: Uint8Array, gain: number, channels = 2): { out: Uint8Array; peak: number } {
+  return new Limiter(channels, 48_000).process(chunk, gain);
 }
 
 /**

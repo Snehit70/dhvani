@@ -2,7 +2,7 @@ import net from "node:net";
 import { randomBytes } from "node:crypto";
 import dgram from "node:dgram";
 import type { Config } from "./config";
-import { FrameAligner, QUIET_PEAK, processPcm, type LatencyMode } from "./audio";
+import { FrameAligner, Limiter, QUIET_PEAK, type LatencyMode } from "./audio";
 import { Analyzer, type LevelFrame } from "./analyzer";
 import { log } from "./log";
 import type { Player, PlayerFactory } from "./player";
@@ -112,6 +112,7 @@ type Active = {
   reportedUnderruns: number;
   socketError: string;
   analyzer: Analyzer;
+  limiter: Limiter;
   sec: { bytes: number; gapMax: number; lastAt: number; lastSilent: boolean; idle: boolean; tMin: number; tMax: number };
   secTimer: ReturnType<typeof setInterval>;
   udp: {
@@ -321,6 +322,7 @@ export class AudioServer {
       statsTimer: setInterval(() => this.flushStats(active, bytesPerSec), STATS_INTERVAL_MS),
       totalBytes: 0, totalDrops: 0, pastUnderruns: 0, reportedUnderruns: 0, socketError: "",
       analyzer: new Analyzer(hello.rate, hello.channels),
+      limiter: new Limiter(hello.channels, hello.rate),
       sec: { bytes: 0, gapMax: 0, lastAt: 0, lastSilent: false, idle: true, tMin: Infinity, tMax: -Infinity },
       secTimer: setInterval(() => this.tickSecond(active), 1000),
       udp: null,
@@ -370,7 +372,7 @@ export class AudioServer {
       const cfg = this.getConfig();
       const pv = active.session.phoneVolume;
       const follow = cfg.followPhone && pv ? phoneGain(pv) : 1;
-      const { out, peak } = processPcm(frames, cfg.muted ? 0 : cfg.volume * follow);
+      const { out, peak } = active.limiter.process(frames, cfg.muted ? 0 : cfg.volume * follow);
       const result = player ? player.write(out, peak < QUIET_PEAK) : "closed";
       if (result !== "ok") {
         this.drops++;
