@@ -89,10 +89,18 @@ jq 'select(.ev=="session_stats")' ~/.local/state/dhvani/events.jsonl
 
 Events: `start`, `stop`, `firewall`, `settings`, `hello_rejected`, `session_start`,
 `session_stats` (every 10 s: arrival gaps p50/p95/max, rate vs real time, drops
-by cause, queued lead, underruns, peak, silence %), `phone_stats` (every 10 s
-from the phone: socket write/read stalls, watchdog trips, reconnects, Wi-Fi
-RSSI/link speed/band), `player_start`, `player_exit`, `session_end` (reason,
-duration, totals). The pairing code is never logged.
+by cause, queued lead, underruns, peak, silence %; `dropQuiet` counts silent
+chunks shed on purpose, `compressedMs` the audio removed by briefly playing
+faster, `stale` UDP packets held over a second), `phone_stats` (every 10 s
+from the phone, and at once when its screen turns on or off: socket write/read
+stalls, watchdog trips, reconnects, Wi-Fi RSSI/link speed/band, screen),
+`phone_screen`, `player_start`, `player_exit`, `session_end` (reason,
+duration, totals).
+
+When audio piles up after a Wi-Fi hiccup, Dhvani drops silent bits first and
+otherwise catches up by playing up to about 20% faster for a moment, with pitch
+kept, instead of skipping audio. While the phone screen is off, Android may let
+Wi-Fi doze, so Low mode holds at least 80 ms. The pairing code is never logged.
 
 On the phone: `adb logcat -s Dhvani`.
 

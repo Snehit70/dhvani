@@ -99,10 +99,24 @@ export const LATENCY: Record<LatencyMode, { minMs: number; maxMs: number }> = {
   stable: { minMs: 100, maxMs: 300 },
 };
 
+/** Buffer floor while the phone screen is off and Android lets Wi-Fi power save kick in. */
+export const SCREEN_OFF_FLOOR_MS = 80;
+
+export function latencyBounds(mode: LatencyMode, screenOff = false): { minMs: number; maxMs: number } {
+  const b = LATENCY[mode];
+  if (!screenOff) return b;
+  return { minMs: Math.max(b.minMs, SCREEN_OFF_FLOOR_MS), maxMs: Math.max(b.maxMs, SCREEN_OFF_FLOOR_MS + 70) };
+}
+
 /** Post-gain peak below this (about -54 dBFS) counts as silence. */
 export const QUIET_PEAK = 0.002;
 
-export type Admit = { play: boolean; prefillMs: number };
+/**
+ * play: write it. compress: write it through the Accelerator and report what was written
+ * with `wrote()`. quiet: near-silent excess, dropped unheard. late: past the hard cap.
+ */
+export type AdmitMode = "play" | "compress" | "quiet" | "late";
+export type Admit = { play: boolean; prefillMs: number; mode: AdmitMode };
 
 /**
  * Adaptive jitter buffer in front of the player. It tracks how far the audio
@@ -110,11 +124,13 @@ export type Admit = { play: boolean; prefillMs: number };
  *
  * - Start, and restart after the player ran dry: write `targetMs` of silence
  *   first, so the next Wi-Fi hiccup up to that size is absorbed instead of heard.
+ *   Later, a quiet chunk well short of target tops the buffer back up the same way.
  * - A dry spell after audible audio counts as an underrun and raises the target
  *   (one after silence is the phone pausing to save battery and is ignored).
  * - The target relaxes back toward the minimum after a calm spell.
- * - Excess lead is shed in quiet chunks, where dropping is inaudible, and hard
- *   capped at target + headroom so a burst cannot pile up delay.
+ * - Excess lead is shed in quiet chunks, where dropping is inaudible. Audible excess is
+ *   played slightly faster (see Accelerator), and only a burst past target + headroom
+ *   is dropped outright.
  */
 export class JitterBuffer {
   private anchor = -1;
@@ -130,7 +146,7 @@ export class JitterBuffer {
   static readonly RELAX_STEP_MS = 10;
   static readonly DRY_MS = 20;
   static readonly DRAIN_MS = 30;
-  static readonly HEADROOM_MS = 100;
+  static readonly HEADROOM_MS = 200;
 
   constructor(
     private bytesPerMs: number,
@@ -163,11 +179,24 @@ export class JitterBuffer {
       this.lastChange = t;
     }
     this.lastQuiet = quiet;
+    // Short of target (it was just raised): top up with silence where it can't be heard.
+    if (quiet && prefillMs === 0 && this.lead(t) < this.targetMs - JitterBuffer.DRAIN_MS) {
+      prefillMs = this.targetMs - this.lead(t);
+      this.writtenMs += prefillMs;
+    }
     const lead = this.lead(t);
-    if (lead > this.targetMs + JitterBuffer.HEADROOM_MS) return { play: false, prefillMs };
-    if (quiet && lead > this.targetMs + JitterBuffer.DRAIN_MS) return { play: false, prefillMs };
+    if (lead > this.targetMs + JitterBuffer.HEADROOM_MS) return { play: false, prefillMs, mode: "late" };
+    if (lead > this.targetMs + JitterBuffer.DRAIN_MS) {
+      if (quiet) return { play: false, prefillMs, mode: "quiet" };
+      return { play: true, prefillMs, mode: "compress" };
+    }
     this.writtenMs += bytes / this.bytesPerMs;
-    return { play: true, prefillMs };
+    return { play: true, prefillMs, mode: "play" };
+  }
+
+  /** Accounts audio written outside admit(), after compression. */
+  wrote(bytes: number) {
+    this.writtenMs += bytes / this.bytesPerMs;
   }
 
   /** Milliseconds of audio queued ahead of real time. */

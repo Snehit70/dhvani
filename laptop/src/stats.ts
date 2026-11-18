@@ -1,12 +1,17 @@
 /** A gap this long after an all-zero chunk is the phone idling, not the network. */
 export const IDLE_GAP_MS = 60;
 
+/** A packet this much later than the window's fastest is an outage, not jitter. */
+export const STALE_MS = 1000;
+
 /** Per-window stream health counters, flushed to the log every few seconds. */
 export class StreamStats {
   bytes = 0;
   chunks = 0;
   silentChunks = 0;
   dropLate = 0;
+  /** Near-silent chunks dropped on purpose to shed delay; inaudible. */
+  dropQuiet = 0;
   dropStalled = 0;
   dropNoPlayer = 0;
   gapMaxMs = 0;
@@ -81,6 +86,7 @@ export class StreamStats {
       gaps50: this.gaps50,
       gaps100: this.gaps100,
       dropLate: this.dropLate,
+      dropQuiet: this.dropQuiet,
       dropStalled: this.dropStalled,
       dropNoPlayer: this.dropNoPlayer,
       leadMaxMs: r(this.leadMaxMs),
@@ -89,7 +95,7 @@ export class StreamStats {
       ...this.jitter(r),
     };
     this.bytes = this.chunks = this.silentChunks = this.idleMs = 0;
-    this.dropLate = this.dropStalled = this.dropNoPlayer = 0;
+    this.dropLate = this.dropQuiet = this.dropStalled = this.dropNoPlayer = 0;
     this.gapMaxMs = this.gaps50 = this.gaps100 = this.leadMaxMs = this.peakMax = 0;
     this.gaps = [];
     this.transits = [];
@@ -101,10 +107,16 @@ export class StreamStats {
   /** Network jitter: how much later than its fastest packet each packet took (UDP only). */
   private jitter(r: (n: number) => number): Record<string, number> {
     if (this.transits.length < 2) return {};
-    const d = spread(this.transits);
+    const all = spread(this.transits);
+    // Packets held for seconds (a Wi-Fi outage, the phone waking) are counted, not
+    // averaged in: one outage would otherwise read as seconds of "jitter".
+    const d = all.filter((x) => x <= STALE_MS);
+    const stale = all.length - d.length;
+    if (!d.length) return { stale, recovered: this.recovered, lost: this.lost };
     return {
       netJitterMs: r(d[Math.min(d.length - 1, Math.floor(d.length * 0.95))]!),
       netJitterMaxMs: r(d[d.length - 1]!),
+      stale,
       recovered: this.recovered,
       lost: this.lost,
     };

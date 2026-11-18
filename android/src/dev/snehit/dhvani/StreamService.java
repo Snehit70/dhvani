@@ -163,12 +163,32 @@ public final class StreamService extends Service {
         }
     };
 
+    /** Set when the screen turns on or off, so the stream loop reports it right away. */
+    private volatile boolean statsNow;
+
+    /**
+     * Android keeps Wi-Fi out of power save only while the screen is on, so with it off the
+     * laptop should hold a little more audio. The laptop learns the state from phone stats.
+     */
+    private final android.content.BroadcastReceiver screenChanged = new android.content.BroadcastReceiver() {
+        @Override public void onReceive(Context c, Intent i) {
+            statsNow = true;
+        }
+    };
+
     @Override public void onCreate() {
         super.onCreate();
         instance = this;
         android.content.IntentFilter f = new android.content.IntentFilter("android.media.VOLUME_CHANGED_ACTION");
-        if (Build.VERSION.SDK_INT >= 33) registerReceiver(volumeChanged, f, Context.RECEIVER_NOT_EXPORTED);
-        else registerReceiver(volumeChanged, f);
+        android.content.IntentFilter sf = new android.content.IntentFilter(Intent.ACTION_SCREEN_OFF);
+        sf.addAction(Intent.ACTION_SCREEN_ON);
+        if (Build.VERSION.SDK_INT >= 33) {
+            registerReceiver(volumeChanged, f, Context.RECEIVER_NOT_EXPORTED);
+            registerReceiver(screenChanged, sf, Context.RECEIVER_NOT_EXPORTED);
+        } else {
+            registerReceiver(volumeChanged, f);
+            registerReceiver(screenChanged, sf);
+        }
     }
 
     private boolean holdsPhoneSilent() {
@@ -273,6 +293,7 @@ public final class StreamService extends Service {
     @Override public void onDestroy() {
         instance = null;
         try { unregisterReceiver(volumeChanged); } catch (RuntimeException ignored) {}
+        try { unregisterReceiver(screenChanged); } catch (RuntimeException ignored) {}
         stopCapture();
         sender.shutdown();
         super.onDestroy();
@@ -415,7 +436,8 @@ public final class StreamService extends Service {
                             volumeResendAt = now + VOLUME_RESEND_MS;
                         }
                     }
-                    if (SystemClock.uptimeMillis() >= nextStats) {
+                    if (statsNow || SystemClock.uptimeMillis() >= nextStats) {
+                        statsNow = false;
                         sendStats(statsSock, s, readMax, writeMax, slowReads, slowWrites);
                         readMax = writeMax = 0;
                         slowReads = slowWrites = 0;
@@ -601,6 +623,8 @@ public final class StreamService extends Service {
             o.put("reconnects", reconnects);
             o.put("silenced", savedVolume >= 0);
             o.put("musicActive", audio.isMusicActive());
+            android.os.PowerManager pm = (android.os.PowerManager) getSystemService(Context.POWER_SERVICE);
+            if (pm != null) o.put("screenOn", pm.isInteractive());
             o.put("sdk", Build.VERSION.SDK_INT);
             o.put("model", Build.MODEL);
             o.put("app", Protocol.APP_VERSION);

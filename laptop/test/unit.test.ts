@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { FrameAligner, JitterBuffer, Limiter, processPcm } from "../src/audio";
+import { FrameAligner, JitterBuffer, Limiter, latencyBounds, processPcm } from "../src/audio";
+import { Accelerator } from "../src/stretch";
 import { SessionNotifier } from "../src/notify";
 import { usbSerials } from "../src/usb";
 import { sanitize, defaults } from "../src/config";
@@ -102,7 +103,7 @@ test("sanitize keeps values in range", () => {
 test("JitterBuffer prefills its target so a Wi-Fi hiccup does not run dry", () => {
   let t = 0;
   const b = new JitterBuffer(1, { minMs: 100, maxMs: 300 }, () => t); // 1 byte per ms
-  expect(b.admit(10)).toEqual({ play: true, prefillMs: 100 });
+  expect(b.admit(10)).toEqual({ play: true, prefillMs: 100, mode: "play" });
   for (let i = 0; i < 20; i++) { t += 10; b.admit(10); }
   // 110 ms with nothing, then the backlog arrives at once: no underrun, nothing dropped.
   t += 110;
@@ -127,15 +128,21 @@ test("JitterBuffer grows after an audible underrun, ignores ones after silence, 
   expect(b.targetMs).toBe(110);
 });
 
-test("JitterBuffer sheds excess lead only in quiet chunks, with a hard cap", () => {
+test("JitterBuffer drops quiet excess, compresses audible excess, caps bursts", () => {
   let t = 0;
   const b = new JitterBuffer(1, { minMs: 100, maxMs: 300 }, () => t);
   b.admit(10); // lead 110
   for (let i = 0; i < 3; i++) b.admit(10); // burst: lead 140
-  expect(b.admit(10, true).play).toBe(false); // quiet and above target + 30: dropped
-  expect(b.admit(10, false).play).toBe(true); // audible: kept
-  const r = Array.from({ length: 20 }, () => b.admit(10, false).play);
-  expect(r.filter(Boolean).length).toBe(6); // 150..200 ms admitted, then capped at target + 100
+  expect(b.admit(10, true).mode).toBe("quiet"); // quiet and above target + 30: dropped
+  expect(b.admit(10, false).mode).toBe("compress"); // audible: kept, played faster
+  b.wrote(60); // the burst piles on: lead 200, then 210 ...
+  const r = Array.from({ length: 20 }, () => {
+    const a = b.admit(10, false);
+    if (a.mode === "compress") b.wrote(10);
+    return a.mode;
+  });
+  expect(r.filter((m) => m === "compress").length).toBe(11); // up to target + 200
+  expect(r.at(-1)).toBe("late");
 });
 
 test("StreamStats does not count battery-saver idle as network gaps", () => {
@@ -326,4 +333,80 @@ test("output delay reads the sink's latency behind Dhvani's node", () => {
   ];
   expect(parseOutputDelay(dump, 10)).toEqual({ ms: 145, device: "Wireless", bluetooth: true });
   expect(parseOutputDelay(dump.slice(1), 10)).toBeNull();
+});
+
+describe("Accelerator", () => {
+  const RATE = 48000;
+  const tone = (ms: number, hz: number, amp = 12000, ch = 2) => {
+    const frames = (ms * RATE) / 1000;
+    const b = new Uint8Array(frames * ch * 2);
+    const v = new DataView(b.buffer);
+    for (let f = 0; f < frames; f++)
+      for (let c = 0; c < ch; c++) v.setInt16((f * ch + c) * 2, Math.round(amp * Math.sin((2 * Math.PI * hz * f) / RATE)), true);
+    return b;
+  };
+  test("holds audio until a block is full, then shortens it", () => {
+    const a = new Accelerator(2, RATE);
+    for (let i = 0; i < 7; i++) expect(a.push(tone(5, 440)).length).toBe(0);
+    const out = a.push(tone(5, 440));
+    const block = 40 * 48 * 4;
+    expect(out.length).toBeLessThan(block);
+    expect(out.length).toBeGreaterThanOrEqual(block - 10 * 48 * 4);
+    expect(a.removedMs).toBeGreaterThanOrEqual(2.5);
+  });
+  test("a cut in a tone lands on whole periods, so the splice is smooth", () => {
+    const a = new Accelerator(1, RATE);
+    const out = a.shorten(tone(40, 400, 12000, 1)); // period 120 frames
+    const cut = 1920 - out.length / 2;
+    expect(cut % 120).toBe(0);
+    const v = new DataView(out.buffer);
+    let jump = 0;
+    for (let i = 1; i < out.length / 2; i++) jump = Math.max(jump, Math.abs(v.getInt16(i * 2, true) - v.getInt16((i - 1) * 2, true)));
+    expect(jump).toBeLessThan(700); // a 400 Hz sine at 12000 moves at most ~630 per sample
+  });
+  test("noise with no good match plays unchanged", () => {
+    const a = new Accelerator(1, RATE);
+    const b = new Uint8Array(960 * 2);
+    const v = new DataView(b.buffer);
+    let x = 1;
+    for (let i = 0; i < 960; i++) { x = (x * 1103515245 + 12345) & 0x7fffffff; v.setInt16(i * 2, (x % 20000) - 10000, true); }
+    expect(a.shorten(b).length).toBe(b.length);
+  });
+  test("flush returns held audio untouched", () => {
+    const a = new Accelerator(2, RATE);
+    const t = tone(5, 440);
+    a.push(t);
+    expect(Array.from(a.flush())).toEqual(Array.from(t));
+    expect(a.flush().length).toBe(0);
+  });
+});
+
+test("JitterBuffer tops up a raised target in quiet chunks only", () => {
+  let t = 0;
+  const b = new JitterBuffer(1, { minMs: 50, maxMs: 120 }, () => t);
+  b.admit(10); // lead 60
+  b.setBounds(latencyBounds("low", true)); // floor 80
+  expect(b.targetMs).toBe(80);
+  t += 25; // lead 35, more than 30 short of target
+  expect(b.admit(10, false).prefillMs).toBe(0); // audible: never padded
+  t += 10; // lead 35
+  const q = b.admit(10, true);
+  expect(q.prefillMs).toBe(45);
+  expect(b.lead()).toBe(90);
+});
+
+test("latencyBounds raises only the low floor when the phone screen is off", () => {
+  expect(latencyBounds("low", false)).toEqual({ minMs: 50, maxMs: 120 });
+  expect(latencyBounds("low", true)).toEqual({ minMs: 80, maxMs: 150 });
+  expect(latencyBounds("stable", true)).toEqual({ minMs: 100, maxMs: 300 });
+});
+
+test("StreamStats counts packets held for seconds as stale, not jitter", () => {
+  let t = 0;
+  const s = new StreamStats(() => t);
+  for (let i = 0; i < 40; i++) s.transit(i * 5, i * 5 + 3);
+  s.transit(200, 5200); // held 5 s by a Wi-Fi outage
+  const w = s.flush(192000);
+  expect(w.stale).toBe(1);
+  expect(w.netJitterMaxMs).toBe(0);
 });

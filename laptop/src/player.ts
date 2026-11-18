@@ -1,23 +1,30 @@
 import { spawn, execFile } from "node:child_process";
-import { JitterBuffer, LATENCY, type LatencyMode } from "./audio";
+import { JitterBuffer, LATENCY, latencyBounds, type LatencyMode } from "./audio";
+import { Accelerator } from "./stretch";
 
-export type PlayerOptions = { rate: number; channels: number; sink: string; latency?: LatencyMode };
+export type PlayerOptions = { rate: number; channels: number; sink: string; latency?: LatencyMode; screenOff?: boolean };
 
-/** ok = queued; late = dropped, too far ahead of real time; stalled = pw-cat not reading. */
-export type WriteResult = "ok" | "late" | "stalled" | "closed";
+/**
+ * ok = queued (maybe shortened); quiet = near-silent excess dropped unheard;
+ * late = dropped, too far ahead of real time; stalled = pw-cat not reading.
+ */
+export type WriteResult = "ok" | "quiet" | "late" | "stalled" | "closed";
 
 export interface Player {
   /** `quiet`: the chunk is near-silent, so it may be dropped to shed delay. */
   write(pcm: Uint8Array, quiet?: boolean): WriteResult;
   /** Current jitter-buffer target, ms. */
   readonly targetMs: number;
-  setLatency(mode: LatencyMode): void;
+  /** `screenOff`: the phone screen is off, so Wi-Fi may doze; hold more audio. */
+  setLatency(mode: LatencyMode, screenOff?: boolean): void;
   close(): void;
   readonly closed: boolean;
   /** Audio queued ahead of real time, ms. */
   readonly leadMs: number;
   /** Times playback ran dry since this player started. */
   readonly underruns: number;
+  /** Audio removed by playing faster to shed delay, ms, since this player started. */
+  readonly compressedMs: number;
 }
 
 export type PlayerFactory = (
@@ -55,7 +62,8 @@ export const pwCatPlayer: PlayerFactory = (opts, onExit) => {
   const child = spawn("pw-cat", args, { stdio: ["pipe", "ignore", "pipe"] });
   const bytesPerMs = (opts.rate * opts.channels * 2) / 1000;
   const frameBytes = opts.channels * 2;
-  const lead = new JitterBuffer(bytesPerMs, LATENCY[opts.latency ?? "stable"]);
+  const lead = new JitterBuffer(bytesPerMs, latencyBounds(opts.latency ?? "stable", opts.screenOff));
+  const accel = new Accelerator(opts.channels, opts.rate);
   // The backlog cap must leave room for the buffer's own prefill.
   const maxBacklog = Math.round(bytesPerMs * (MAX_BACKLOG_MS + LATENCY.stable.maxMs));
   let closed = false;
@@ -87,8 +95,11 @@ export const pwCatPlayer: PlayerFactory = (opts, onExit) => {
     get targetMs() {
       return lead.targetMs;
     },
-    setLatency(mode) {
-      lead.setBounds(LATENCY[mode]);
+    get compressedMs() {
+      return accel.removedMs;
+    },
+    setLatency(mode, screenOff = false) {
+      lead.setBounds(latencyBounds(mode, screenOff));
     },
     write(pcm, quiet = false) {
       if (closed) return "closed";
@@ -98,7 +109,22 @@ export const pwCatPlayer: PlayerFactory = (opts, onExit) => {
         const n = Math.round((a.prefillMs * bytesPerMs) / frameBytes) * frameBytes;
         child.stdin.write(new Uint8Array(n));
       }
-      if (!a.play) return "late";
+      if (a.mode === "late") return "late";
+      if (a.mode === "quiet") return "quiet";
+      if (a.mode === "compress") {
+        const out = accel.push(pcm);
+        if (out.length) {
+          child.stdin.write(out);
+          lead.wrote(out.length);
+        }
+        return "ok";
+      }
+      // Back on target: anything held for compression plays first, unchanged.
+      const held = accel.flush();
+      if (held.length) {
+        child.stdin.write(held);
+        lead.wrote(held.length);
+      }
       child.stdin.write(pcm);
       return "ok";
     },

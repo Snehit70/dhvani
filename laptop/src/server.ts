@@ -110,6 +110,11 @@ type Active = {
   /** Underruns from players that already exited, plus the live player's count. */
   pastUnderruns: number;
   reportedUnderruns: number;
+  /** Same bookkeeping for audio shortened to shed delay, ms. */
+  pastCompressedMs: number;
+  reportedCompressedMs: number;
+  /** The phone said its screen is off (Wi-Fi may doze), so the buffer floor is higher. */
+  screenOff: boolean;
   socketError: string;
   analyzer: Analyzer;
   limiter: Limiter;
@@ -214,7 +219,7 @@ export class AudioServer {
 
   /** New bounds take effect at once; the player restarts so PipeWire's period follows the mode. */
   setLatency(mode: LatencyMode): void {
-    this.active?.player?.setLatency(mode);
+    this.active?.player?.setLatency(mode, this.active.screenOff);
     this.restartPlayer();
   }
 
@@ -320,7 +325,7 @@ export class AudioServer {
       session, socket, hello, player: null, lastSpawn: 0,
       stats: new StreamStats(),
       statsTimer: setInterval(() => this.flushStats(active, bytesPerSec), STATS_INTERVAL_MS),
-      totalBytes: 0, totalDrops: 0, pastUnderruns: 0, reportedUnderruns: 0, socketError: "",
+      totalBytes: 0, totalDrops: 0, pastUnderruns: 0, reportedUnderruns: 0, pastCompressedMs: 0, reportedCompressedMs: 0, screenOff: false, socketError: "",
       analyzer: new Analyzer(hello.rate, hello.channels),
       limiter: new Limiter(hello.channels, hello.rate),
       sec: { bytes: 0, gapMax: 0, lastAt: 0, lastSilent: false, idle: true, tMin: Infinity, tMax: -Infinity },
@@ -374,7 +379,8 @@ export class AudioServer {
       const follow = cfg.followPhone && pv ? phoneGain(pv) : 1;
       const { out, peak } = active.limiter.process(frames, cfg.muted ? 0 : cfg.volume * follow);
       const result = player ? player.write(out, peak < QUIET_PEAK) : "closed";
-      if (result !== "ok") {
+      if (result === "quiet") active.stats.dropQuiet++;
+      else if (result !== "ok") {
         this.drops++;
         active.totalDrops++;
         if (result === "late") active.stats.dropLate++;
@@ -458,7 +464,7 @@ export class AudioServer {
     const sink = this.getConfig().sink;
     log("player_start", { session: active.session.id, sink: sink || "default" });
     const player = this.makePlayer(
-      { rate: active.hello.rate, channels: active.hello.channels, sink, latency: this.getConfig().latency },
+      { rate: active.hello.rate, channels: active.hello.channels, sink, latency: this.getConfig().latency, screenOff: active.screenOff },
       (reason) => {
         log("player_exit", { session: active.session.id, reason });
         if (this.active === active && active.player === player) this.fail(reason);
@@ -471,6 +477,7 @@ export class AudioServer {
   private retirePlayer(active: Active) {
     if (!active.player) return;
     active.pastUnderruns += active.player.underruns;
+    active.pastCompressedMs += active.player.compressedMs;
     active.player.close();
     active.player = null;
   }
@@ -481,13 +488,16 @@ export class AudioServer {
 
   private flushStats(active: Active, bytesPerSec: number) {
     const u = this.underruns(active);
+    const c = active.pastCompressedMs + (active.player?.compressedMs ?? 0);
     const window = {
       ...active.stats.flush(bytesPerSec),
       underruns: u - active.reportedUnderruns,
+      compressedMs: Math.round(c - active.reportedCompressedMs),
       targetMs: Math.round(active.player?.targetMs ?? 0),
     };
     log("session_stats", { session: active.session.id, ...window });
     active.reportedUnderruns = u;
+    active.reportedCompressedMs = c;
     if (this.active === active) {
       this.quality = window;
       this.hooks.onChange();
@@ -511,6 +521,11 @@ export class AudioServer {
     const a = this.sessionFor(address, s.code);
     if (!a) return;
     log("phone_stats", { session: a.session.id, ...s.fields });
+    if (typeof s.fields.screenOn === "boolean" && a.screenOff === s.fields.screenOn) {
+      a.screenOff = !s.fields.screenOn;
+      log("phone_screen", { session: a.session.id, on: s.fields.screenOn });
+      a.player?.setLatency(this.getConfig().latency, a.screenOff);
+    }
     this.phone = s.fields;
     this.hooks.onChange();
   }

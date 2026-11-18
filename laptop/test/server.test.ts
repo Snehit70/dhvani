@@ -21,6 +21,7 @@ const factory: PlayerFactory = (opts) => {
     write(pcm) { p.data.push(...pcm); return "ok" as const; },
     leadMs: 0,
     underruns: 0,
+    compressedMs: 0,
     targetMs: 100,
     setLatency() {},
     close() { closed = true; },
@@ -89,7 +90,7 @@ test("accepts the right code and plays aligned PCM", async () => {
   c.sock.write(Buffer.from([4, 0]));
   await until(() => players[0]?.data.length === 8);
   expect(players[0]!.data).toEqual([1, 0, 2, 0, 3, 0, 4, 0]);
-  expect(players[0]!.opts).toEqual({ rate: 48000, channels: 2, sink: "", latency: "stable" });
+  expect(players[0]!.opts).toEqual({ rate: 48000, channels: 2, sink: "", latency: "stable", screenOff: false });
   c.sock.end();
   await until(() => server.session === null);
   expect(players[0]!.closed).toBe(true);
