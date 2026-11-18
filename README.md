@@ -130,3 +130,7 @@ On the phone: `adb logcat -s Dhvani`.
 ```sh
 cd laptop && bun install && bun test && bunx tsc --noEmit && bun src/main.ts
 ```
+
+## License
+
+MIT, see [LICENSE](LICENSE).
