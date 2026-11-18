@@ -570,7 +570,8 @@ export class AudioServer {
       // Nothing arrived at all this second: the gap is still running.
       gapMaxMs: Math.round(s.bytes || s.lastSilent ? s.gapMax : performance.now() - s.lastAt),
       idle: s.idle,
-      leadMs: Math.round(active.player?.leadMs ?? 0),
+      // Below zero only means nothing is queued (the phone idles during silence).
+      leadMs: Math.max(0, Math.round(active.player?.leadMs ?? 0)),
       targetMs: Math.round(active.player?.targetMs ?? 0),
       drops: active.totalDrops,
       underruns: this.underruns(active),
