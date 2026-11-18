@@ -87,6 +87,7 @@ public final class MainActivity extends Activity implements StreamState.Listener
     private View fieldsDivider;
     private EditText addressField, codeField;
     private Switch silenceSwitch, reconnectSwitch, autoSwitch;
+    private TextView keysSub, keysAction;
     private LinearLayout volumeCard;
     private SeekBar volumeBar;
     private TextView volumeValue;
@@ -139,6 +140,7 @@ public final class MainActivity extends Activity implements StreamState.Listener
         super.onResume();
         StreamState.add(this);
         onState();
+        renderVolumeKeys();
         startDiscovery();
     }
 
@@ -365,6 +367,42 @@ public final class MainActivity extends Activity implements StreamState.Listener
         return sw;
     }
 
+    /** Row that opens Accessibility settings so the volume buttons can drive the laptop. */
+    private void volumeKeysRow(LinearLayout parent) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setMinimumHeight(dp(72));
+        row.setPadding(dp(16), dp(12), dp(16), dp(12));
+        row.setBackground(pressable(null, onSurface, 0));
+        LinearLayout texts = new LinearLayout(this);
+        texts.setOrientation(LinearLayout.VERTICAL);
+        texts.addView(text("Volume buttons control the laptop", 16, onSurface, false));
+        keysSub = text("", 14, onSurfaceVariant, false);
+        keysSub.setPadding(0, dp(2), dp(16), 0);
+        texts.addView(keysSub);
+        row.addView(texts, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+        keysAction = text("", 14, primary, true);
+        row.addView(keysAction);
+        row.setOnClickListener(v -> {
+            try {
+                startActivity(new Intent(android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS));
+            } catch (RuntimeException ignored) {}
+        });
+        parent.addView(row, fullWidth());
+    }
+
+    private void renderVolumeKeys() {
+        if (keysSub == null) return;
+        boolean on = VolumeKeyService.enabled(this);
+        keysSub.setText(on
+                ? "On. While the phone is silenced, its volume buttons change the laptop and the phone stays quiet."
+                : "In Accessibility, open Dhvani volume buttons and turn it on. If it is greyed out: App info, "
+                        + "⋮ menu, Allow restricted settings. Until then a press may be heard on the phone for a moment.");
+        keysAction.setText(on ? "On" : "Set up");
+        keysAction.setTextColor(on ? onSurfaceVariant : primary);
+    }
+
     // ---------- Screen ----------
 
     private View buildUi() {
@@ -487,7 +525,7 @@ public final class MainActivity extends Activity implements StreamState.Listener
         LinearLayout.LayoutParams vblp = fullWidth();
         vblp.topMargin = dp(8);
         volumeCard.addView(volumeBar, vblp);
-        TextView vnote = text("Changes the laptop's own output. Phone volume buttons still work too.",
+        TextView vnote = text("Changes the laptop's own output. While the phone is silenced, its volume buttons do too.",
                 12, onSurfaceVariant, false);
         vnote.setPadding(0, dp(4), dp(8), 0);
         volumeCard.addView(vnote);
@@ -531,6 +569,7 @@ public final class MainActivity extends Activity implements StreamState.Listener
         silenceSwitch = switchRow(opts, "Silence this phone",
                 "Mutes the phone speaker while the laptop plays. Restored when you stop.",
                 prefs.getBoolean("silence", true));
+        volumeKeysRow(opts);
         reconnectSwitch = switchRow(opts, "Reconnect automatically",
                 "Keeps trying if Wi-Fi drops or the laptop restarts.",
                 prefs.getBoolean("reconnect", true));

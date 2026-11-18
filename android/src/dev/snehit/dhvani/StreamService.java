@@ -131,14 +131,76 @@ public final class StreamService extends Service {
     private boolean reconnect;
 
     private AudioManager audio;
-    private int savedVolume = -1;
-    private boolean silenceBroken;
+    private volatile int savedVolume = -1;
+    private volatile boolean silenceBroken;
 
     private final MediaProjection.Callback projectionCallback = new MediaProjection.Callback() {
         @Override public void onStop() {
             main.post(() -> stopStreaming(null));
         }
     };
+
+    /** The live service, for the volume-key Accessibility service. */
+    static volatile StreamService instance;
+    /** Laptop volume change per volume-button press (the range is 0..1.5). */
+    private static final double KEY_STEP = 0.05;
+    private android.widget.Toast keyToast;
+
+    /**
+     * Fallback without the Accessibility service: the phone's volume rose while Dhvani holds it
+     * silent (a button press, the shade slider, a headset). Put it back to 0 at once and move the
+     * laptop instead. The phone may be heard for a moment; volume down can't be seen at 0.
+     */
+    private final android.content.BroadcastReceiver volumeChanged = new android.content.BroadcastReceiver() {
+        @Override public void onReceive(Context c, Intent i) {
+            if (i.getIntExtra("android.media.EXTRA_VOLUME_STREAM_TYPE", -1) != AudioManager.STREAM_MUSIC) return;
+            int value = i.getIntExtra("android.media.EXTRA_VOLUME_STREAM_VALUE", 0);
+            int prev = i.getIntExtra("android.media.EXTRA_PREV_VOLUME_STREAM_VALUE", 0);
+            if (value <= 0 || !holdsPhoneSilent()) return;
+            try { audio.setStreamVolume(AudioManager.STREAM_MUSIC, 0, 0); } catch (RuntimeException ignored) {}
+            Log.i(TAG, "phone volume rose to " + value + " while silenced; moved to laptop");
+            for (int n = Math.max(1, value - prev); n > 0; n--) volumeKey(1);
+        }
+    };
+
+    @Override public void onCreate() {
+        super.onCreate();
+        instance = this;
+        android.content.IntentFilter f = new android.content.IntentFilter("android.media.VOLUME_CHANGED_ACTION");
+        if (Build.VERSION.SDK_INT >= 33) registerReceiver(volumeChanged, f, Context.RECEIVER_NOT_EXPORTED);
+        else registerReceiver(volumeChanged, f);
+    }
+
+    private boolean holdsPhoneSilent() {
+        return running && audio != null && savedVolume >= 0 && !silenceBroken;
+    }
+
+    /** True while volume buttons should drive the laptop: streaming with the phone held silent. */
+    boolean ownsVolumeKeys() {
+        return holdsPhoneSilent() && StreamState.status == StreamState.Status.STREAMING
+                && StreamState.laptopVolume >= 0 && udpTarget != null;
+    }
+
+    /** One volume-button press: +1 up, -1 down, 0 mute toggle. Runs on the main thread. */
+    void volumeKey(int direction) {
+        if (!ownsVolumeKeys()) return;
+        double v = StreamState.laptopVolume;
+        boolean muted = StreamState.laptopMuted;
+        if (direction == 0) {
+            laptopControl(null, !muted);
+        } else {
+            double next = Math.max(0, Math.min(1.5, Math.round((v + direction * KEY_STEP) * 100) / 100.0));
+            // Pressing up on a muted laptop unmutes it, like the phone does.
+            laptopControl(next, muted && direction > 0 ? Boolean.FALSE : null);
+        }
+        boolean nowMuted = StreamState.laptopMuted;
+        String msg = nowMuted ? "Laptop muted" : "Laptop volume " + Math.round(StreamState.laptopVolume * 100) + "%";
+        main.post(() -> {
+            if (keyToast != null) keyToast.cancel();
+            keyToast = android.widget.Toast.makeText(this, msg, android.widget.Toast.LENGTH_SHORT);
+            keyToast.show();
+        });
+    }
 
     @Override public IBinder onBind(Intent intent) { return null; }
 
@@ -209,6 +271,8 @@ public final class StreamService extends Service {
     }
 
     @Override public void onDestroy() {
+        instance = null;
+        try { unregisterReceiver(volumeChanged); } catch (RuntimeException ignored) {}
         stopCapture();
         sender.shutdown();
         super.onDestroy();
@@ -339,6 +403,9 @@ public final class StreamService extends Service {
                     long now = SystemClock.uptimeMillis();
                     if (now >= nextVolumeCheck) {
                         nextVolumeCheck = now + VOLUME_POLL_MS;
+                        if (holdsPhoneSilent() && audio.getStreamVolume(AudioManager.STREAM_MUSIC) > 0) {
+                            audio.setStreamVolume(AudioManager.STREAM_MUSIC, 0, 0);
+                        }
                         int[] v = phoneVolume();
                         String key = v[0] + "/" + v[1] + (v[2] == 1 ? " muted" : "");
                         if (!key.equals(lastVolume) || now >= volumeResendAt) {
@@ -497,6 +564,11 @@ public final class StreamService extends Service {
                 ? (double) Math.max(0f, Math.min(1.5f, intent.getFloatExtra(EXTRA_VOLUME, 1f))) : null;
         Boolean muted = intent.hasExtra(EXTRA_MUTED) ? intent.getBooleanExtra(EXTRA_MUTED, false)
                 : intent.getBooleanExtra(EXTRA_TOGGLE_MUTE, false) ? !StreamState.laptopMuted : null;
+        laptopControl(volume, muted);
+    }
+
+    /** Sets the laptop's volume and/or mute. Null leaves a field unchanged. */
+    private void laptopControl(Double volume, Boolean muted) {
         if (volume == null && muted == null) return;
         final java.net.InetAddress t = udpTarget;
         final String c = code;

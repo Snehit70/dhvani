@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="volume_keys_label">Dhvani volume buttons</string>
+    <string name="volume_keys_description">While Dhvani plays this phone on a laptop with the phone silenced, the volume buttons change the laptop volume instead of turning the phone speaker back on. At all other times they work as usual. Dhvani reads no screen content and no other keys.</string>
+</resources>
