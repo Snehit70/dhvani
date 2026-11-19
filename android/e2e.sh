@@ -39,6 +39,8 @@ adb wait-for-device
 adb shell settings put global window_animation_scale 0
 adb shell settings put global transition_animation_scale 0
 adb shell settings put global animator_duration_scale 0
+# System ANR dialogs on a cold emulator cover the app. Dhvani's own crashes still reach logcat.
+adb shell settings put global hide_error_dialogs 1
 adb shell input keyevent WAKEUP
 adb shell wm dismiss-keyguard || true
 

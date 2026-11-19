@@ -90,10 +90,21 @@ const same = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
 const find = (label: string | RegExp, nodes = screen()) =>
   nodes.find((n) => (typeof label === "string" ? same(n.text, label) || same(n.desc, label) : label.test(n.text) || label.test(n.desc)));
 const visible = () => screen().map((n) => n.text || n.desc).filter(Boolean).join(" | ");
+/** A cold emulator often shows "X isn't responding" for system apps; wait past it. */
+function dismissSystemDialog(nodes: Node[]): boolean {
+  if (!nodes.some((n) => /isn.t responding|keeps stopping|has stopped/i.test(n.text))) return false;
+  const wait = nodes.find((n) => /^(wait|close app|ok)$/i.test(n.text));
+  if (wait) tap(wait);
+  return true;
+}
 async function waitFor(label: string | RegExp, ms = 10_000): Promise<Node> {
   let n: Node | undefined;
   try {
-    await until(`"${label}" on screen`, () => !!(n = find(label)), ms);
+    await until(`"${label}" on screen`, () => {
+      const nodes = screen();
+      if (dismissSystemDialog(nodes)) return false;
+      return !!(n = find(label, nodes));
+    }, ms);
   } catch (e) {
     const top = sh("dumpsys activity activities | grep -m1 -E 'topResumedActivity|mResumedActivity' || true").trim();
     throw new Error(`${(e as Error).message}\n  top: ${top}\n  screen: ${visible()}`);
@@ -102,7 +113,9 @@ async function waitFor(label: string | RegExp, ms = 10_000): Promise<Node> {
 }
 async function scrollTo(label: string | RegExp): Promise<Node> {
   for (let i = 0; i < 6; i++) {
-    const n = find(label);
+    const nodes = screen();
+    if (dismissSystemDialog(nodes)) { i--; await Bun.sleep(500); continue; }
+    const n = find(label, nodes);
     if (n) return n;
     sh("input swipe 540 1600 540 900 300");
   }
