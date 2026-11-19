@@ -95,7 +95,7 @@ export type LatencyMode = "low" | "stable";
  * so at 30 ms the pw-cat stream briefly ran empty and crackled even with a clean network.
  */
 export const LATENCY: Record<LatencyMode, { minMs: number; maxMs: number }> = {
-  low: { minMs: 50, maxMs: 120 },
+  low: { minMs: 50, maxMs: 200 },
   stable: { minMs: 100, maxMs: 300 },
 };
 
@@ -142,6 +142,7 @@ export class JitterBuffer {
   targetMs: number;
 
   static readonly STEP_MS = 20;
+  static readonly MAX_STEP_MS = 60;
   static readonly RELAX_AFTER_MS = 30_000;
   static readonly RELAX_STEP_MS = 10;
   static readonly DRY_MS = 20;
@@ -169,7 +170,10 @@ export class JitterBuffer {
     if (this.anchor < 0 || this.lead(t) < -JitterBuffer.DRY_MS) {
       if (this.anchor >= 0 && !this.lastQuiet) {
         this.underruns++;
-        this.targetMs = Math.min(this.bounds.maxMs, this.targetMs + JitterBuffer.STEP_MS);
+        // Grow by how long the output actually ran dry, so one deep stall is covered next time
+        // instead of after several more underruns of 20 ms steps.
+        const dry = Math.min(JitterBuffer.MAX_STEP_MS, Math.max(JitterBuffer.STEP_MS, -this.lead(t)));
+        this.targetMs = Math.min(this.bounds.maxMs, this.targetMs + Math.round(dry));
         this.lastChange = t;
       }
       this.anchor = t;

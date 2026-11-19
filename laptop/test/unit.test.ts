@@ -116,16 +116,21 @@ test("JitterBuffer grows after an audible underrun, ignores ones after silence, 
   let t = 0;
   const b = new JitterBuffer(1, { minMs: 100, maxMs: 300 }, () => t);
   b.admit(10);
-  t += 400; // dry after audible audio
-  expect(b.admit(10).prefillMs).toBe(120);
+  t += 400; // dry for ~290 ms after audible audio: grows by the dry spell, capped at 60
+  expect(b.admit(10).prefillMs).toBe(160);
   expect(b.underruns).toBe(1);
   b.admit(10, true);
   t += 2000; // phone paused sending during silence
   b.admit(10);
   expect(b.underruns).toBe(1);
-  expect(b.targetMs).toBe(120);
+  expect(b.targetMs).toBe(160);
   for (let i = 0; i < 3100; i++) { t += 10; b.admit(10); }
-  expect(b.targetMs).toBe(110);
+  expect(b.targetMs).toBe(150);
+  t += 220; // shallow dry spell (~40-50 ms): grows by about that much
+  b.admit(10);
+  expect(b.underruns).toBe(2);
+  expect(b.targetMs).toBeGreaterThanOrEqual(180);
+  expect(b.targetMs).toBeLessThanOrEqual(210);
 });
 
 test("JitterBuffer drops quiet excess, compresses audible excess, caps bursts", () => {
@@ -396,8 +401,8 @@ test("JitterBuffer tops up a raised target in quiet chunks only", () => {
 });
 
 test("latencyBounds raises only the low floor when the phone screen is off", () => {
-  expect(latencyBounds("low", false)).toEqual({ minMs: 50, maxMs: 120 });
-  expect(latencyBounds("low", true)).toEqual({ minMs: 80, maxMs: 150 });
+  expect(latencyBounds("low", false)).toEqual({ minMs: 50, maxMs: 200 });
+  expect(latencyBounds("low", true)).toEqual({ minMs: 80, maxMs: 200 });
   expect(latencyBounds("stable", true)).toEqual({ minMs: 100, maxMs: 300 });
 });
 
