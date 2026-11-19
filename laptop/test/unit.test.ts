@@ -268,7 +268,8 @@ test("Analyzer: a 1 kHz tone lights the 1 kHz band, meters read the channel peak
   expect(a.frame(0).l).toBe(0); // meters reset between frames
 });
 
-import { Reorder, HOLE_WAIT_MS, type Delivered } from "../src/udp";
+import { Reorder, HOLE_WAIT_MS, MAX_CONCEAL, StaleGate, type Delivered } from "../src/udp";
+import { declick } from "../src/audio";
 import { encodeAudioPacket, parseAudioPacket, isAudioPacket } from "../src/protocol";
 import { spread } from "../src/stats";
 import { parseOutputDelay } from "../src/player";
@@ -306,18 +307,104 @@ describe("UDP audio", () => {
     expect(r.lost).toBe(0);
   });
 
-  test("a packet lost twice becomes silence once its copy is overdue", () => {
+  test("a packet lost twice is concealed once its copy is overdue", () => {
     const { r, out, vals, advance } = setup();
     r.push(0, 0, false, pcm(1));
     r.push(2, 0, false, pcm(3));
     advance(HOLE_WAIT_MS - 1);
     expect(vals()).toEqual([1]);
     advance(2);
-    expect(vals()).toEqual([1, 0, 3]);
+    expect(out.length).toBe(3);
     expect(out[1]!.concealed).toBe(true);
     expect(r.lost).toBe(1);
     r.push(1, 0, true, pcm(2)); // too late now
     expect(out.length).toBe(3);
+  });
+
+  // Stereo s16 frames, one value per frame on both channels.
+  const frames = (vals: number[]) => {
+    const b = new Uint8Array(vals.length * 4);
+    const v = new DataView(b.buffer);
+    vals.forEach((x, i) => { v.setInt16(i * 4, x, true); v.setInt16(i * 4 + 2, x, true); });
+    return b;
+  };
+  const left = (b: Uint8Array) => {
+    const v = new DataView(b.buffer, b.byteOffset, b.length);
+    return Array.from({ length: b.length / 4 }, (_, i) => v.getInt16(i * 4, true));
+  };
+
+  test("concealment fades out from where the audio stopped, and the next packet fades in", () => {
+    let t = 0;
+    const out: Delivered[] = [];
+    const r = new Reorder((d) => out.push(d), () => t);
+    r.push(0, 0, false, frames([100, 200, 300, 400]));
+    r.push(2, 0, false, frames([1000, 1000, 1000, 1000]));
+    t += HOLE_WAIT_MS + 1;
+    r.tick();
+    // Backwards from 400, down to silence: no jump at the start of the hole.
+    expect(left(out[1]!.pcm)).toEqual([300, 150, 50, 0]);
+    expect(left(out[2]!.pcm)[0]).toBe(0);
+    expect(left(out[2]!.pcm)[3]).toBe(750);
+  });
+
+  test("a long hole is not filled with seconds of silence", () => {
+    let t = 0;
+    const out: Delivered[] = [];
+    const r = new Reorder((d) => out.push(d), () => t);
+    r.push(0, 0, false, pcm(1));
+    r.push(500, 0, false, pcm(2));
+    t += HOLE_WAIT_MS + 1;
+    r.tick();
+    expect(out.length).toBe(1 + MAX_CONCEAL + 1);
+    expect(r.lost).toBe(499);
+  });
+
+  test("reset forgets the sequence so a new run does not count as a giant hole", () => {
+    const { r, out } = setup();
+    r.push(0, 0, false, pcm(1));
+    r.reset();
+    r.push(900, 0, false, pcm(2));
+    expect(out.length).toBe(2);
+    expect(r.lost).toBe(0);
+  });
+
+  test("declick ramps from the last sample written into the new audio", () => {
+    const b = frames([1000, 1000, 1000, 1000]);
+    declick(b, [0, 0], 2, 4);
+    expect(left(b)).toEqual([0, 250, 500, 750]);
+  });
+
+  test("stale gate drops a stall's backlog but keeps live audio", () => {
+    const g = new StaleGate();
+    // Normal flow: transit 30 ms, phone clock offset arbitrary.
+    let now = 1_000;
+    for (let i = 0; i < 50; i++, now += 5) expect(g.stale(now - 30 - 5_000_000, now, 250)).toBe(false);
+    // A 2 s stall, then the backlog arrives at once: old packets are stale, the newest are not.
+    now += 2000;
+    expect(g.stale(now - 2000 - 30 - 5_000_000, now, 250)).toBe(true);
+    expect(g.stale(now - 1000 - 30 - 5_000_000, now, 250)).toBe(true);
+    expect(g.stale(now - 100 - 30 - 5_000_000, now, 250)).toBe(false);
+    expect(g.dropped).toBe(2);
+  });
+
+  test("stale gate follows a phone clock jump instead of dropping forever", () => {
+    const g = new StaleGate();
+    let now = 0;
+    for (let i = 0; i < 10; i++, now += 5) g.stale(now - 30, now, 250);
+    // The phone clock fell 5 s behind (deep sleep): every packet looks late at first.
+    let dropped = 0;
+    for (let i = 0; i < 400; i++, now += 5) if (g.stale(now - 5030, now, 250)) dropped++;
+    expect(dropped).toBeGreaterThan(150);
+    expect(dropped).toBeLessThan(250);
+    expect(g.stale(now - 5030, now, 250)).toBe(false);
+  });
+
+  test("stale gate survives the phone clock wrapping", () => {
+    const g = new StaleGate();
+    const w = 2 ** 32;
+    expect(g.stale(w - 10, 1000, 250)).toBe(false);
+    expect(g.stale(5, 1015, 250)).toBe(false);
+    expect(g.stale(w - 1000, 1020, 250)).toBe(true);
   });
 
   test("network jitter spread survives the phone clock wrapping", () => {

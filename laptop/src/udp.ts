@@ -4,6 +4,13 @@ import { REDUNDANT_DELAY_MS } from "./protocol";
 export const HOLE_WAIT_MS = REDUNDANT_DELAY_MS + 15;
 /** Never hold more than this many packets behind a hole, whatever the clock says. */
 const MAX_HELD = 32;
+/**
+ * Most silence put in for one hole, in packets (100 ms). A longer hole means the output
+ * already ran dry, and the jitter buffer restarts cleanly without it.
+ */
+export const MAX_CONCEAL = 20;
+/** Fade-in on the first real packet after concealed ones, in frames (2.5 ms at 48 kHz). */
+const FADE_IN_FRAMES = 120;
 
 export type Delivered = {
   pcm: Uint8Array;
@@ -24,6 +31,9 @@ export class Reorder {
   private next = -1;
   private held = new Map<number, { pcm: Uint8Array; sentMs: number; late: boolean; at: number }>();
   private lastSize = 0;
+  private lastPcm: Uint8Array | null = null;
+  /** The previous delivery was concealment, so the next real packet fades in. */
+  private afterHole = false;
   /** Totals since creation. */
   received = 0;
   recovered = 0;
@@ -32,7 +42,15 @@ export class Reorder {
   constructor(
     private deliver: (d: Delivered) => void,
     private now: () => number = () => performance.now(),
+    private channels = 2,
   ) {}
+
+  /** Forget the sequence (the phone switched transports and back); totals stay. */
+  reset() {
+    this.next = -1;
+    this.held.clear();
+    this.lastPcm = null;
+  }
 
   push(seq: number, sentMs: number, late: boolean, pcm: Uint8Array) {
     if (this.next < 0) this.next = seq;
@@ -65,9 +83,13 @@ export class Reorder {
     if (first === Infinity) return;
     const missing = first - this.next;
     this.lost += missing;
-    for (let i = 0; i < missing; i++) {
-      this.deliver({ pcm: new Uint8Array(this.lastSize), sentMs: null, recovered: false, concealed: true });
+    for (let i = 0; i < Math.min(missing, MAX_CONCEAL); i++) {
+      // The first stand-in plays the last packet backwards, fading out: it starts on the sample
+      // the audio stopped at, so the hole is heard as a short dip instead of a click.
+      const pcm = i === 0 && this.lastPcm ? fadeOutReversed(this.lastPcm, this.channels) : new Uint8Array(this.lastSize);
+      this.deliver({ pcm, sentMs: null, recovered: false, concealed: true });
     }
+    this.afterHole = true;
     this.next = first;
     this.drain();
   }
@@ -82,6 +104,96 @@ export class Reorder {
 
   private emit(pcm: Uint8Array, sentMs: number, late: boolean) {
     if (late) this.recovered++;
+    if (this.afterHole) {
+      pcm = fadeIn(pcm, this.channels, FADE_IN_FRAMES);
+      this.afterHole = false;
+    }
+    this.lastPcm = pcm;
     this.deliver({ pcm, sentMs, recovered: late, concealed: false });
+  }
+}
+
+/** The packet's frames in reverse order, faded linearly to silence. */
+export function fadeOutReversed(pcm: Uint8Array, channels: number): Uint8Array {
+  const frames = Math.floor(pcm.length / (2 * channels));
+  const out = new Uint8Array(pcm.length);
+  const src = new DataView(pcm.buffer, pcm.byteOffset, pcm.length);
+  const dst = new DataView(out.buffer);
+  for (let f = 0; f < frames; f++) {
+    const g = 1 - (f + 1) / frames;
+    const from = (frames - 1 - f) * channels * 2;
+    for (let c = 0; c < channels; c++) {
+      dst.setInt16(f * channels * 2 + c * 2, Math.round(src.getInt16(from + c * 2, true) * g), true);
+    }
+  }
+  return out;
+}
+
+/** A copy with the first `n` frames faded in from silence. */
+export function fadeIn(pcm: Uint8Array, channels: number, n: number): Uint8Array {
+  const out = pcm.slice();
+  const frames = Math.min(n, Math.floor(pcm.length / (2 * channels)));
+  const v = new DataView(out.buffer);
+  for (let f = 0; f < frames; f++) {
+    const g = f / frames;
+    for (let c = 0; c < channels; c++) {
+      const o = f * channels * 2 + c * 2;
+      v.setInt16(o, Math.round(v.getInt16(o, true) * g), true);
+    }
+  }
+  return out;
+}
+
+/** Packets this far behind for this long mean the phone's clock jumped, not a backlog. */
+const STALE_STREAK_MS = 1000;
+/** The transit floor is the smallest of the last two windows of this length (clock drift). */
+const FLOOR_WINDOW_MS = 10_000;
+
+/**
+ * Spots packets that arrive long after they were sent, such as the backlog a Wi-Fi stall
+ * releases at once. Playing those first means hearing old audio and then skipping ahead;
+ * dropping them jumps straight back to live audio. Delay is measured against the smallest
+ * transit seen recently, so the two clocks need not agree.
+ */
+export class StaleGate {
+  private ref: number | null = null;
+  private cur = Infinity;
+  private prev = Infinity;
+  private rotateAt = 0;
+  private streakSince = -1;
+  /** Packets dropped as stale, total. */
+  dropped = 0;
+
+  /** True when the packet sent at phone time `sentMs` is more than `limitMs` behind. */
+  stale(sentMs: number, now: number, limitMs: number): boolean {
+    const tr = now - sentMs;
+    if (this.ref === null) {
+      this.ref = tr;
+      this.rotateAt = now + FLOOR_WINDOW_MS;
+    }
+    // The phone clock is 32-bit and wraps; keep transits relative to the first one.
+    const wrap = 2 ** 32;
+    let d = (tr - this.ref) % wrap;
+    if (d > wrap / 2) d -= wrap;
+    if (d < -wrap / 2) d += wrap;
+    if (now >= this.rotateAt) {
+      this.prev = this.cur;
+      this.cur = Infinity;
+      this.rotateAt = now + FLOOR_WINDOW_MS;
+    }
+    if (d < this.cur) this.cur = d;
+    const floor = Math.min(this.cur, this.prev);
+    if (d - floor <= limitMs) {
+      this.streakSince = -1;
+      return false;
+    }
+    if (this.streakSince < 0) this.streakSince = now;
+    if (now - this.streakSince > STALE_STREAK_MS) {
+      this.cur = this.prev = d;
+      this.streakSince = -1;
+      return false;
+    }
+    this.dropped++;
+    return true;
   }
 }

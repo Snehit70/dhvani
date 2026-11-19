@@ -1,5 +1,5 @@
 import { spawn, execFile } from "node:child_process";
-import { JitterBuffer, LATENCY, latencyBounds, type LatencyMode } from "./audio";
+import { JitterBuffer, LATENCY, declick, lastFrame, latencyBounds, type LatencyMode } from "./audio";
 import { Accelerator } from "./stretch";
 
 export type PlayerOptions = { rate: number; channels: number; sink: string; latency?: LatencyMode; screenOff?: boolean };
@@ -17,6 +17,8 @@ export interface Player {
   readonly targetMs: number;
   /** `screenOff`: the phone screen is off, so Wi-Fi may doze; hold more audio. */
   setLatency(mode: LatencyMode, screenOff?: boolean): void;
+  /** Audio was skipped before the next write: smooth the join. */
+  gap?(): void;
   close(): void;
   readonly closed: boolean;
   /** Audio queued ahead of real time, ms. */
@@ -68,6 +70,14 @@ export const pwCatPlayer: PlayerFactory = (opts, onExit) => {
   const maxBacklog = Math.round(bytesPerMs * (MAX_BACKLOG_MS + LATENCY.stable.maxMs));
   let closed = false;
   let stderr = "";
+  // Last samples handed to pw-cat, and whether the next write follows a skip or inserted silence.
+  let last: number[] = new Array(opts.channels).fill(0);
+  let splice = false;
+  const put = (b: Uint8Array) => {
+    if (!b.length) return;
+    child.stdin.write(b);
+    last = lastFrame(b, opts.channels) ?? last;
+  };
   child.stderr.on("data", (d: Buffer) => {
     stderr = (stderr + d.toString()).slice(-500);
   });
@@ -101,20 +111,35 @@ export const pwCatPlayer: PlayerFactory = (opts, onExit) => {
     setLatency(mode, screenOff = false) {
       lead.setBounds(latencyBounds(mode, screenOff));
     },
+    gap() {
+      splice = true;
+    },
     write(pcm, quiet = false) {
       if (closed) return "closed";
-      if (child.stdin.writableLength > maxBacklog) return "stalled";
+      if (child.stdin.writableLength > maxBacklog) {
+        splice = true;
+        return "stalled";
+      }
       const a = lead.admit(pcm.length, quiet);
       if (a.prefillMs > 0) {
         const n = Math.round((a.prefillMs * bytesPerMs) / frameBytes) * frameBytes;
-        child.stdin.write(new Uint8Array(n));
+        put(new Uint8Array(n));
+        splice = true;
       }
-      if (a.mode === "late") return "late";
-      if (a.mode === "quiet") return "quiet";
+      if (a.mode === "late" || a.mode === "quiet") {
+        splice = true;
+        return a.mode;
+      }
+      const smooth = () => {
+        if (!splice) return;
+        declick(pcm, last, opts.channels);
+        splice = false;
+      };
       if (a.mode === "compress") {
+        smooth();
         const out = accel.push(pcm);
         if (out.length) {
-          child.stdin.write(out);
+          put(out);
           lead.wrote(out.length);
         }
         return "ok";
@@ -122,10 +147,11 @@ export const pwCatPlayer: PlayerFactory = (opts, onExit) => {
       // Back on target: anything held for compression plays first, unchanged.
       const held = accel.flush();
       if (held.length) {
-        child.stdin.write(held);
+        put(held);
         lead.wrote(held.length);
       }
-      child.stdin.write(pcm);
+      smooth();
+      put(pcm);
       return "ok";
     },
     close() {

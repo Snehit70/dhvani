@@ -723,10 +723,11 @@ function drawAll() {
 // ---------- Connection grade (10 s window + phone report) ----------
 function grade(q, p) {
   if (!q) return null;
-  const drops = (q.dropLate || 0) + (q.dropStalled || 0), rssi = p && typeof p.rssi === "number" ? p.rssi : null, tips = [];
+  const drops = (q.dropLate || 0) + (q.dropStalled || 0) + (q.dropStale || 0), rssi = p && typeof p.rssi === "number" ? p.rssi : null, tips = [];
   if (q.silentPct >= 95) tips.push("The phone is sending silence. Play something; some apps block audio capture.");
   if (q.underruns > 0) tips.push(`Playback ran dry ${q.underruns}× in the last 10 s. The buffer grows by itself; switch Delay to Stable if you picked Low.`);
   if (q.gaps100 > 0) tips.push(`Wi-Fi paused ${q.gaps100}× for over 100 ms.`);
+  if (q.dropStale > 0) tips.push("Wi-Fi stalled and then delivered a backlog at once. Dhvani skipped the old audio to stay in time.");
   if (q.dropStalled > 0) tips.push("The laptop's audio output stalled. Try another output or reconnect the headset.");
   if (rssi !== null && rssi < -70) tips.push("Weak Wi-Fi on the phone. Move closer to the router, or use a USB cable.");
   if (p && p.freqMHz && p.freqMHz < 3000) tips.push("The phone is on 2.4 GHz, which is crowded and slower here. Move it closer to the router so it switches to 5 GHz, or turn Wi-Fi off and on.");

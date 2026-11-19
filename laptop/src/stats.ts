@@ -10,6 +10,8 @@ export class StreamStats {
   chunks = 0;
   silentChunks = 0;
   dropLate = 0;
+  /** UDP packets that arrived too long after they were sent and were skipped to stay live. */
+  dropStale = 0;
   /** Near-silent chunks dropped on purpose to shed delay; inaudible. */
   dropQuiet = 0;
   dropStalled = 0;
@@ -86,6 +88,7 @@ export class StreamStats {
       gaps50: this.gaps50,
       gaps100: this.gaps100,
       dropLate: this.dropLate,
+      dropStale: this.dropStale,
       dropQuiet: this.dropQuiet,
       dropStalled: this.dropStalled,
       dropNoPlayer: this.dropNoPlayer,
@@ -95,7 +98,7 @@ export class StreamStats {
       ...this.jitter(r),
     };
     this.bytes = this.chunks = this.silentChunks = this.idleMs = 0;
-    this.dropLate = this.dropQuiet = this.dropStalled = this.dropNoPlayer = 0;
+    this.dropLate = this.dropStale = this.dropQuiet = this.dropStalled = this.dropNoPlayer = 0;
     this.gapMaxMs = this.gaps50 = this.gaps100 = this.leadMaxMs = this.peakMax = 0;
     this.gaps = [];
     this.transits = [];

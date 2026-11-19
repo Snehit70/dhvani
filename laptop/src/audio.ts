@@ -85,6 +85,40 @@ export class FrameAligner {
   }
 }
 
+/** How long a splice is smoothed over, in frames (2 ms at 48 kHz). */
+export const DECLICK_FRAMES = 96;
+
+/**
+ * Smooths a join where audio was skipped or silence was put in. The jump from the last
+ * sample written to the first new one would click, so an offset that starts at that jump
+ * and fades to zero is added over the first `n` frames. Changes `pcm` in place.
+ */
+export function declick(pcm: Uint8Array, last: number[], channels: number, n = DECLICK_FRAMES) {
+  const frames = Math.min(n, Math.floor(pcm.length / (2 * channels)));
+  if (!frames) return;
+  const v = new DataView(pcm.buffer, pcm.byteOffset, pcm.length);
+  const jump = last.map((x, c) => x - v.getInt16(c * 2, true));
+  for (let f = 0; f < frames; f++) {
+    const g = 1 - f / frames;
+    for (let c = 0; c < channels; c++) {
+      const o = f * channels * 2 + c * 2;
+      let s = Math.round(v.getInt16(o, true) + jump[c]! * g);
+      if (s > 32767) s = 32767;
+      else if (s < -32768) s = -32768;
+      v.setInt16(o, s, true);
+    }
+  }
+}
+
+/** The last frame's samples, one per channel. */
+export function lastFrame(pcm: Uint8Array, channels: number): number[] | null {
+  const frames = Math.floor(pcm.length / (2 * channels));
+  if (!frames) return null;
+  const v = new DataView(pcm.buffer, pcm.byteOffset, pcm.length);
+  const base = (frames - 1) * channels * 2;
+  return Array.from({ length: channels }, (_, c) => v.getInt16(base + c * 2, true));
+}
+
 export type LatencyMode = "low" | "stable";
 
 /**
