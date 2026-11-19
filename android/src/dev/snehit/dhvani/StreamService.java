@@ -231,7 +231,10 @@ public final class StreamService extends Service {
     @Override public int onStartCommand(Intent intent, int flags, int startId) {
         if (intent != null && ACTION_CONTROL.equals(intent.getAction())) {
             if (running) control(intent);
-            else if (worker == null) stopSelf(startId);
+            else {
+                Log.d(TAG, "control ignored, not streaming");
+                if (worker == null) stopSelf(startId);
+            }
             return START_NOT_STICKY;
         }
         if (intent == null || ACTION_STOP.equals(intent.getAction())) {
@@ -630,6 +633,7 @@ public final class StreamService extends Service {
         if (volume == null && muted == null) return;
         final java.net.InetAddress t = udpTarget;
         final String c = code;
+        Log.d(TAG, "control volume=" + volume + " muted=" + muted + (t == null ? " (no laptop address)" : " to port " + reportPort));
         if (t == null || c == null) return;
         // Shown right away; the laptop confirms with its own update over TCP.
         if (volume != null) StreamState.laptopVolume = volume;

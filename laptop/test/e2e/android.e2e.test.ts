@@ -217,7 +217,8 @@ describe.skipIf(!E2E)("Android app end to end", () => {
     try {
       await until("a volume control", () => controls.some((c) => c.volume !== undefined && c.muted === undefined));
     } catch (e) {
-      throw new Error(`${(e as Error).message}; slider at ${JSON.stringify(bar)}; got ${JSON.stringify(controls)}; screen: ${visible()}`);
+      const log = adb("logcat", "-d", "-s", "Dhvani").split("\n").slice(-25).join("\n");
+      throw new Error(`${(e as Error).message}; slider at ${JSON.stringify(bar)}; got ${JSON.stringify(controls)}; screen: ${visible()}\n${log}`);
     }
     await Bun.sleep(500);
     healthy();
