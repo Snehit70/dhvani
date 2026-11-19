@@ -6,7 +6,11 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import type { Config } from "../../src/config";
 import type { Player, PlayerFactory } from "../../src/player";
+import { configureLog } from "../../src/log";
+import { isAudioPacket } from "../../src/protocol";
 import { AudioServer } from "../../src/server";
+
+configureLog({ stdout: true, file: false });
 
 const E2E = !!process.env.DHVANI_E2E;
 const PKG = "dev.snehit.dhvani";
@@ -47,7 +51,14 @@ async function startServer() {
   });
   await server.listen(AUDIO_PORT, "127.0.0.1");
   await server.listenDiscovery(UDP_PORT, AUDIO_PORT);
+  // Keep every non-audio datagram, so a lost control can be told apart from an ignored one.
+  (server as unknown as { udp: import("node:dgram").Socket }).udp.on("message", (msg, rinfo) => {
+    if (isAudioPacket(msg)) return;
+    datagrams.push(`${new Date().toISOString().slice(11, 23)} ${rinfo.address}:${rinfo.port} ${msg.toString().replace(/"code":"\d+"/, '"code":"…"').slice(0, 120)}`);
+    if (datagrams.length > 40) datagrams.shift();
+  });
 }
+const datagrams: string[] = [];
 
 // ---- adb helpers ----
 function adb(...args: string[]): string {
@@ -218,7 +229,7 @@ describe.skipIf(!E2E)("Android app end to end", () => {
       await until("a volume control", () => controls.some((c) => c.volume !== undefined && c.muted === undefined));
     } catch (e) {
       const log = adb("logcat", "-d", "-s", "Dhvani").split("\n").slice(-25).join("\n");
-      throw new Error(`${(e as Error).message}; slider at ${JSON.stringify(bar)}; got ${JSON.stringify(controls)}; screen: ${visible()}\n${log}`);
+      throw new Error(`${(e as Error).message}; slider at ${JSON.stringify(bar)}; got ${JSON.stringify(controls)}; session ${JSON.stringify({ address: server.session?.address, transport: server.session?.transport })}\nlaptop got:\n${datagrams.join("\n")}\nscreen: ${visible()}\n${log}`);
     }
     await Bun.sleep(500);
     healthy();
