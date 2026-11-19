@@ -74,7 +74,9 @@ public final class StreamService extends Service {
     private static final int IDLE_AFTER_MS = 2000;
     private static final long KEEPALIVE_MS = 250;
     /** Over UDP the laptop pings the TCP socket every second; silence this long means it is gone. */
-    private static final long LAPTOP_SILENT_MS = 5000;
+    private static final long LAPTOP_SILENT_MS = 8000;
+    /** A dropped connection keeps the phone silenced this long, so a quick reconnect is not heard on the speaker. */
+    private static final long RESTORE_GRACE_MS = 10_000;
     /** DSCP EF: Wi-Fi sends these in its video queue, ahead of bulk traffic. */
     private static final int TOS_EF = 0xB8;
 
@@ -474,8 +476,10 @@ public final class StreamService extends Service {
                 if (statsSock != null) statsSock.close();
                 closeQuietly(s);
                 try { rec.stop(); } catch (RuntimeException ignored) {}
-                // While the laptop is away the phone plays on its own speaker again.
-                restoreVolume();
+                // While the laptop is away the phone plays on its own speaker again, but only
+                // once a reconnect has had a moment; a Wi-Fi blip should not blare the speaker.
+                main.removeCallbacks(restoreAfterGrace);
+                main.postDelayed(restoreAfterGrace, RESTORE_GRACE_MS);
             }
             try {
                 Thread.sleep(backoff);
@@ -668,7 +672,10 @@ public final class StreamService extends Service {
         throw new IOException("reply too long");
     }
 
+    private final Runnable restoreAfterGrace = this::restoreVolume;
+
     private synchronized void silencePhone() {
+        main.removeCallbacks(restoreAfterGrace);
         if (!silence || silenceBroken || savedVolume >= 0) return;
         try {
             savedVolume = audio.getStreamVolume(AudioManager.STREAM_MUSIC);
@@ -816,6 +823,7 @@ public final class StreamService extends Service {
             record.release();
             record = null;
         }
+        main.removeCallbacks(restoreAfterGrace);
         restoreVolume();
         if (projection != null) {
             projection.unregisterCallback(projectionCallback);
