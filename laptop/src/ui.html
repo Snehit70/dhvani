@@ -425,7 +425,7 @@ dialog::backdrop { background: rgb(0 0 0 / .4); }
           <div class="card-b" style="padding-top:12px">
             <div class="label" style="margin-bottom:8px">Delay</div>
             <div class="seg wide" role="radiogroup" id="latency" aria-label="Delay">
-              <button role="radio" data-l="low" aria-checked="false">Low<small>50–120 ms, for video</small></button>
+              <button role="radio" data-l="low" aria-checked="false">Low<small>50–200 ms, for video</small></button>
               <button role="radio" data-l="stable" aria-checked="true">Stable<small>100–300 ms, fewest gaps</small></button>
             </div>
             <div style="margin-top:8px">
@@ -514,7 +514,7 @@ function ago(ts) {
 const db = (v) => v > 0 ? 20 * Math.log10(v) : -Infinity;
 const fmtDb = (v) => { const d = db(v); return d === -Infinity || d < -90 ? "−∞" : (d < 0 ? "−" : "") + Math.abs(d).toFixed(1); };
 const isHeadset = (name) => /bluez|headset|headphone|hands.?free/i.test(name);
-const REASONS = { phone_closed: "Stopped on the phone", socket_error: "Connection lost", replaced: "Another phone took over", disconnected: "Disconnected here", code_changed: "Code changed", shutdown: "Service restarted", running: "Live" };
+const REASONS = { phone_closed: "Phone hung up", timeout: "Phone went quiet (Wi-Fi)", socket_error: "Connection lost", replaced: "Another phone took over", disconnected: "Disconnected here", code_changed: "Code changed", shutdown: "Service restarted", running: "Live" };
 
 // Crisp canvas at any DPR; returns a 2D context in CSS pixels.
 function ctx2d(cv) {
@@ -848,7 +848,8 @@ function render(s) {
   svc.lastElementChild.textContent = live ? "Streaming" : s.health.firewall === "blocked" ? "Blocked" : "Ready";
   $("laptop-line").textContent = `${s.name} · v${s.version}`;
   $("fw-banner").hidden = s.health.firewall !== "blocked"; $("fw-cmd").textContent = s.firewallFix || "";
-  $("err-banner").hidden = !s.lastError; $("err-text").textContent = s.lastError;
+  const errMsg = s.outputMissing && s.session ? "The chosen output is gone (headset off or out of range). Dhvani stays silent instead of using the speakers, and resumes when it's back. Pick another output to play now." : s.lastError;
+  $("err-banner").hidden = !errMsg; $("err-text").textContent = errMsg;
 
   // Now playing
   $("np").classList.toggle("live", live);

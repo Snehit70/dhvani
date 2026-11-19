@@ -57,6 +57,8 @@ export type ServerHooks = {
   addresses?(): string[];
   /** Whether a phone at this address may stream over UDP. Default: anything but loopback (USB). */
   allowUdp?(address: string): boolean;
+  /** True while the chosen output device is gone (e.g. headset switched off): play silence, not the speakers. */
+  outputMissing?(): boolean;
 };
 
 const isLoopback = (a: string) => a === "127.0.0.1" || a === "::1" || a.startsWith("127.");
@@ -66,7 +68,9 @@ const RESPAWN_INTERVAL_MS = 1000;
 /** No UDP audio this long after the session starts: the path is blocked, fall back to TCP. */
 export const UDP_FALLBACK_MS = 2500;
 /** UDP audio stopped this long (the phone sends a keepalive at least every 250 ms): phone is gone. */
-export const UDP_TIMEOUT_MS = 5000;
+export const UDP_TIMEOUT_MS = 8000;
+/** A housekeeping tick this late means the laptop itself stalled (suspend, heavy load), not the phone. */
+export const LATE_TICK_MS = 3000;
 export const STATS_INTERVAL_MS = 10_000;
 
 export type SessionSummary = {
@@ -124,6 +128,8 @@ type Active = {
     token: Buffer;
     reorder: Reorder;
     lastAt: number;
+    /** When housekeeping last ran, to tell a stalled laptop from a silent phone. */
+    lastTick: number;
     timers: ReturnType<typeof setInterval>[];
   } | null;
 };
@@ -377,7 +383,7 @@ export class AudioServer {
       const cfg = this.getConfig();
       const pv = active.session.phoneVolume;
       const follow = cfg.followPhone && pv ? phoneGain(pv) : 1;
-      const { out, peak } = active.limiter.process(frames, cfg.muted ? 0 : cfg.volume * follow);
+      const { out, peak } = active.limiter.process(frames, cfg.muted || this.hooks.outputMissing?.() ? 0 : cfg.volume * follow);
       const result = player ? player.write(out, peak < QUIET_PEAK) : "closed";
       if (result === "quiet") active.stats.dropQuiet++;
       else if (result !== "ok") {
@@ -399,6 +405,7 @@ export class AudioServer {
         token,
         reorder: new Reorder((d) => onAudio(d.pcm, d)),
         lastAt: 0,
+        lastTick: performance.now(),
         timers: [],
       };
       active.udp = u;
@@ -438,7 +445,12 @@ export class AudioServer {
     const u = active.udp;
     if (this.active !== active || !u || active.socket.destroyed) return;
     if (active.session.transport !== "udp") return;
-    const age = performance.now() - u.lastAt;
+    const now = performance.now();
+    const late = now - u.lastTick > LATE_TICK_MS;
+    u.lastTick = now;
+    // After a laptop stall the queued packets have not been read yet; give the phone a fresh window.
+    if (late && u.lastAt) u.lastAt = now;
+    const age = now - u.lastAt;
     if (!u.reorder.received && Date.now() - active.session.since >= UDP_FALLBACK_MS) {
       active.session.transport = "tcp";
       log("udp_fallback", { session: active.session.id });

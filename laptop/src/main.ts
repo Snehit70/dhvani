@@ -10,7 +10,7 @@ import { WebUI } from "./web";
 import { SessionNotifier, notifySend } from "./notify";
 import { UsbBridge } from "./usb";
 
-const VERSION = "0.5.0";
+const VERSION = "0.6.0";
 let config: Config = loadConfig();
 
 /** Container, VM and VPN-internal bridges a phone on the LAN can never reach. */
@@ -94,6 +94,28 @@ async function probeOutput() {
   if (next) log("output_delay", { ...next });
   pushState();
 }
+/**
+ * True while the output picked in the panel is gone, e.g. the Bluetooth headset was switched
+ * off or walked out of range. PipeWire would move the stream to the speakers, often at a
+ * volume set for headphones, so Dhvani plays silence until the device is back.
+ */
+let outputMissing = false;
+async function checkPinnedOutput() {
+  let missing = false;
+  if (config.sink && server.session) {
+    const { sinks } = await listSinks();
+    missing = sinks.length > 0 && !sinks.some((s) => s.name === config.sink);
+  }
+  if (missing === outputMissing) return;
+  outputMissing = missing;
+  log(missing ? "output_missing" : "output_back", { sink: config.sink });
+  // Reopen playback so the stream goes back to the chosen device, not wherever PipeWire parked it.
+  if (!missing) {
+    server.restartPlayer();
+    setTimeout(probeOutput, 2000);
+  }
+  pushState();
+}
 let lastLevelSent = 0;
 /** Last five minutes of one-second readings, so a freshly opened panel has a chart. */
 const METRICS_KEEP = 300;
@@ -120,6 +142,7 @@ const server = new AudioServer(() => config, pwCatPlayer, {
   },
   onSessionEnd: (s, reason) => notifier.ended(s.device, reason),
   addresses: () => addresses().map((a) => a.address),
+  outputMissing: () => outputMissing,
 });
 
 // pactl takes ~0.2-0.5 s; volume drags and level-driven state pushes must not wait on it each time.
@@ -155,6 +178,7 @@ async function state() {
     phone: server.phone,
     recent: server.recent,
     output,
+    outputMissing,
     firewallFix: `sudo firewall-cmd --permanent --add-port=${AUDIO_PORT}/tcp --add-port=${DISCOVERY_PORT}/udp && sudo firewall-cmd --reload`,
     health: {
       listening: server.listening,
@@ -250,6 +274,7 @@ async function main() {
   await checkFirewall();
   setInterval(checkFirewall, 60_000).unref();
   setInterval(probeOutput, 10_000).unref();
+  setInterval(checkPinnedOutput, 2000).unref();
   console.log(`Dhvani ${VERSION} listening on TCP ${AUDIO_PORT}, panel http://127.0.0.1:${UI_PORT}`);
   console.log(`Pairing code ${config.code}. Addresses: ${addresses().map((a) => a.address).join(", ") || "none"}`);
 

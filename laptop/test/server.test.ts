@@ -195,6 +195,24 @@ test("followPhone off ignores the phone's volume", async () => {
   c.sock.end();
 });
 
+test("a missing output plays silence instead of falling back to the speakers", async () => {
+  let missing = true;
+  server = new AudioServer(() => config, factory, { onChange: () => {}, onLevel: () => {}, outputMissing: () => missing }, 500);
+  const port = await server.listen(0, "127.0.0.1");
+  const c = connect(port);
+  c.sock.write(hello("424242"));
+  await c.line();
+  await until(() => server.session !== null);
+  c.sock.write(Buffer.from([0x00, 0x40, 0x00, 0x40]));
+  await until(() => players[0]?.data.length === 4);
+  expect(players[0]!.data).toEqual([0, 0, 0, 0]);
+  missing = false;
+  c.sock.write(Buffer.from([0x00, 0x40, 0x00, 0x40]));
+  await until(() => players[0]?.data.length === 8);
+  expect(players[0]!.data.slice(4)).toEqual([0x00, 0x40, 0x00, 0x40]);
+  c.sock.end();
+});
+
 test("laptop pushes its volume to the phone after the reply", async () => {
   const port = await start({ ...config, volume: 0.8, muted: true });
   const c = connect(port);
