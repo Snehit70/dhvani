@@ -83,6 +83,10 @@ public final class StreamService extends Service {
     private final Handler main = new Handler(Looper.getMainLooper());
     /** Audio goes as UDP packets; false means it is written to the TCP socket. */
     private volatile boolean useUdp;
+    /** Where reports and laptop controls go: the UDP port the laptop announced, else the default. */
+    private volatile int reportPort = Protocol.DISCOVERY_PORT;
+    /** The worker's report socket. Controls go on it too: packets from a fresh socket were lost. */
+    private volatile DatagramSocket reportSock;
     /** Uptime when the laptop last wrote anything on the TCP socket. */
     private volatile long lastHeardAt;
     private int udpSeq;
@@ -229,10 +233,14 @@ public final class StreamService extends Service {
     @Override public int onStartCommand(Intent intent, int flags, int startId) {
         if (intent != null && ACTION_CONTROL.equals(intent.getAction())) {
             if (running) control(intent);
-            else if (worker == null) stopSelf(startId);
+            else {
+                Log.d(TAG, "control ignored, not streaming");
+                if (worker == null) stopSelf(startId);
+            }
             return START_NOT_STICKY;
         }
         if (intent == null || ACTION_STOP.equals(intent.getAction())) {
+            Log.i(TAG, intent == null ? "restarted by the system without a session; stopping" : "stop requested");
             stopStreaming(null);
             return START_NOT_STICKY;
         }
@@ -365,6 +373,7 @@ public final class StreamService extends Service {
                 Log.i(TAG, "streaming to " + reply.name);
                 s.setSoTimeout(0);
                 udpTarget = s.getInetAddress();
+                reportPort = reply.udpPort > 0 ? reply.udpPort : Protocol.DISCOVERY_PORT;
                 // adb reverse carries TCP only, so over USB the audio stays on the socket.
                 useUdp = reply.udpToken != null && !s.getInetAddress().isLoopbackAddress();
                 if (useUdp) {
@@ -391,6 +400,7 @@ public final class StreamService extends Service {
                 long readMax = 0, writeMax = 0;
                 int slowWrites = 0, slowReads = 0;
                 try { statsSock = new DatagramSocket(); } catch (IOException ignored) {}
+                reportSock = statsSock;
                 String lastVolume = null;
                 long nextVolumeCheck = 0, volumeResendAt = 0;
                 boolean wasUdp = useUdp;
@@ -480,6 +490,7 @@ public final class StreamService extends Service {
                 lastHeardAt = 0;
                 if (audioSock != null) audioSock.close();
                 StreamState.clearLaptop();
+                reportSock = null;
                 if (statsSock != null) statsSock.close();
                 closeQuietly(s);
                 try { rec.stop(); } catch (RuntimeException ignored) {}
@@ -542,7 +553,7 @@ public final class StreamService extends Service {
         if (sock == null) return;
         try {
             byte[] b = packet.getBytes(StandardCharsets.UTF_8);
-            sock.send(new DatagramPacket(b, b.length, target(s), Protocol.DISCOVERY_PORT));
+            sock.send(new DatagramPacket(b, b.length, target(s), reportPort));
         } catch (Exception ignored) {}
     }
 
@@ -600,11 +611,25 @@ public final class StreamService extends Service {
     }
 
     private void control(Intent intent) {
-        Double volume = intent.hasExtra(EXTRA_VOLUME)
-                ? (double) Math.max(0f, Math.min(1.5f, intent.getFloatExtra(EXTRA_VOLUME, 1f))) : null;
-        Boolean muted = intent.hasExtra(EXTRA_MUTED) ? intent.getBooleanExtra(EXTRA_MUTED, false)
-                : intent.getBooleanExtra(EXTRA_TOGGLE_MUTE, false) ? !StreamState.laptopMuted : null;
-        laptopControl(volume, muted);
+        laptopControl(controlVolume(intent), controlMuted(intent, StreamState.laptopMuted));
+    }
+
+    /** Laptop volume asked for by a CONTROL intent, clamped to 0..1.5, or null to leave it. */
+    static Double controlVolume(Intent intent) {
+        if (!intent.hasExtra(EXTRA_VOLUME)) return null;
+        float v = intent.getFloatExtra(EXTRA_VOLUME, 1f);
+        if (Float.isNaN(v)) return null;
+        return (double) Math.max(0f, Math.min(1.5f, v));
+    }
+
+    /**
+     * Mute asked for by a CONTROL intent, or null to leave it. Plain ifs on purpose: a ternary
+     * mixing boolean and null unboxes the null and crashed the app on every slider move.
+     */
+    static Boolean controlMuted(Intent intent, boolean currentlyMuted) {
+        if (intent.hasExtra(EXTRA_MUTED)) return intent.getBooleanExtra(EXTRA_MUTED, false);
+        if (intent.getBooleanExtra(EXTRA_TOGGLE_MUTE, false)) return !currentlyMuted;
+        return null;
     }
 
     /** Sets the laptop's volume and/or mute. Null leaves a field unchanged. */
@@ -612,6 +637,7 @@ public final class StreamService extends Service {
         if (volume == null && muted == null) return;
         final java.net.InetAddress t = udpTarget;
         final String c = code;
+        Log.d(TAG, "control volume=" + volume + " muted=" + muted + (t == null ? " (no laptop address)" : " to port " + reportPort));
         if (t == null || c == null) return;
         // Shown right away; the laptop confirms with its own update over TCP.
         if (volume != null) StreamState.laptopVolume = volume;
@@ -619,9 +645,13 @@ public final class StreamService extends Service {
         final byte[] b = Protocol.control(c, volume, muted).getBytes(StandardCharsets.UTF_8);
         try {
             sender.execute(() -> {
-                try (DatagramSocket ds = new DatagramSocket()) {
-                    ds.send(new DatagramPacket(b, b.length, t, Protocol.DISCOVERY_PORT));
-                } catch (IOException ignored) {}
+                DatagramSocket ds = reportSock;
+                if (ds == null) return;
+                try {
+                    ds.send(new DatagramPacket(b, b.length, t, reportPort));
+                } catch (IOException e) {
+                    Log.d(TAG, "control send failed: " + e);
+                }
             });
         } catch (java.util.concurrent.RejectedExecutionException ignored) {}
     }
@@ -658,20 +688,29 @@ public final class StreamService extends Service {
                 }
             }
             byte[] b = Protocol.stats(code, o).getBytes(StandardCharsets.UTF_8);
-            sock.send(new DatagramPacket(b, b.length, target(s), Protocol.DISCOVERY_PORT));
+            sock.send(new DatagramPacket(b, b.length, target(s), reportPort));
             Log.d(TAG, "stats " + o);
         } catch (Exception ignored) {}
     }
 
     private boolean weakWifi;
 
-    /** What the user can do about this phone's Wi-Fi, or "" when it is fine. Weak below -70 dBm, fine again above -66. */
     private String wifiTip(int rssi, int freqMHz) {
-        weakWifi = weakWifi ? rssi < -66 : rssi < -70;
+        weakWifi = weakWifi(weakWifi, rssi);
+        return wifiTip(weakWifi, freqMHz);
+    }
+
+    /** Weak below -70 dBm, fine again only above -66, so the tip does not flicker. */
+    static boolean weakWifi(boolean wasWeak, int rssi) {
+        return wasWeak ? rssi < -66 : rssi < -70;
+    }
+
+    /** What the user can do about this phone's Wi-Fi, or "" when it is fine. */
+    static String wifiTip(boolean weak, int freqMHz) {
         boolean slowBand = freqMHz > 0 && freqMHz < 3000;
-        if (weakWifi && slowBand) return "Weak 2.4 GHz Wi-Fi, so audio may drop out. Move closer to the router so the phone can switch to 5 GHz.";
+        if (weak && slowBand) return "Weak 2.4 GHz Wi-Fi, so audio may drop out. Move closer to the router so the phone can switch to 5 GHz.";
         if (slowBand) return "This phone is on 2.4 GHz Wi-Fi, which drops audio more often. Move closer to the router so it can switch to 5 GHz.";
-        if (weakWifi) return "Weak Wi-Fi signal, so audio may drop out. Move closer to the router, or use a USB cable.";
+        if (weak) return "Weak Wi-Fi signal, so audio may drop out. Move closer to the router, or use a USB cable.";
         return "";
     }
 

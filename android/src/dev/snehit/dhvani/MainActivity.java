@@ -739,7 +739,10 @@ public final class MainActivity extends Activity implements StreamState.Listener
     }
 
     private void sendControl(Float volume, Boolean muted) {
-        if (StreamState.status != StreamState.Status.STREAMING) return;
+        if (StreamState.status != StreamState.Status.STREAMING) {
+            android.util.Log.d("Dhvani", "control not sent, status " + StreamState.status);
+            return;
+        }
         Intent i = new Intent(this, StreamService.class).setAction(StreamService.ACTION_CONTROL);
         if (volume != null) i.putExtra(StreamService.EXTRA_VOLUME, volume.floatValue());
         if (muted != null) i.putExtra(StreamService.EXTRA_MUTED, muted.booleanValue());

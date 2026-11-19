@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      apk_release:
+        description: "Run the emulator suite against the APK from this release tag (e.g. v0.7.0) instead of a fresh build"
+        required: false
+
+jobs:
+  laptop:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: laptop
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install
+      - run: bunx tsc --noEmit
+      - run: bun test
+
+  android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - run: cd laptop && bun install
+      - name: Build APK
+        run: android/build.sh
+      - name: Use a released APK
+        if: ${{ inputs.apk_release != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "${{ inputs.apk_release }}" -p dhvani.apk -O "$RUNNER_TEMP/release.apk"
+          echo "APK=$RUNNER_TEMP/release.apk" >> "$GITHUB_ENV"
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Emulator tests
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          disable-animations: true
+          emulator-options: -no-window -no-snapshot -no-boot-anim -gpu swiftshader_indirect -audio none
+          script: android/e2e.sh
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: logcat
+          path: logcat.txt
+          if-no-files-found: ignore
