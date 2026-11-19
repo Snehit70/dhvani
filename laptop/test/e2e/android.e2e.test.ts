@@ -124,8 +124,23 @@ async function scrollTo(label: string | RegExp, pick = find): Promise<Node> {
   }
   return waitFor(label, 3000);
 }
-const slider = () =>
-  scrollTo("Laptop volume", (l, nodes = screen()) => nodes.find((n) => n.cls.endsWith("SeekBar") && n.desc === l));
+const findSlider = (l: string | RegExp, nodes = screen()) => nodes.find((n) => n.cls.endsWith("SeekBar") && n.desc === l);
+/** The volume slider, scrolled into the middle of the screen, clear of the gesture-nav edge. */
+async function slider(): Promise<Node> {
+  let bar = await scrollTo("Laptop volume", findSlider);
+  for (let i = 0; i < 4 && (bar.y > 1700 || bar.y < 400); i++) {
+    sh(bar.y > 1700 ? "input swipe 540 1500 540 1000 300" : "input swipe 540 1000 540 1500 300");
+    bar = await scrollTo("Laptop volume", findSlider);
+  }
+  return bar;
+}
+/** A real finger drag: down, eight moves, up. */
+function drag(y: number, fromX: number, toX: number) {
+  const xs = Array.from({ length: 9 }, (_, i) => Math.round(fromX + ((toX - fromX) * i) / 8));
+  y = Math.round(y);
+  sh([`input motionevent DOWN ${xs[0]} ${y}`, ...xs.slice(1).map((x) => `input motionevent MOVE ${x} ${y}`),
+    `input motionevent UP ${xs[8]} ${y}`].join("; "));
+}
 const tap = (n: Node) => sh(`input tap ${n.x} ${n.y}`);
 
 function launch() {
@@ -193,8 +208,12 @@ describe.skipIf(!E2E)("Android app end to end", () => {
     launch();
     const bar = await slider();
     const w = bar.x2 - bar.x1;
-    sh(`input swipe ${bar.x1 + w * 0.8} ${bar.y} ${bar.x1 + w * 0.3} ${bar.y} 600`);
-    await until("a volume control", () => controls.some((c) => c.volume !== undefined && c.muted === undefined));
+    drag(bar.y, bar.x1 + w * 0.8, bar.x1 + w * 0.3);
+    try {
+      await until("a volume control", () => controls.some((c) => c.volume !== undefined && c.muted === undefined));
+    } catch (e) {
+      throw new Error(`${(e as Error).message}; slider at ${JSON.stringify(bar)}; got ${JSON.stringify(controls)}; screen: ${visible()}`);
+    }
     await Bun.sleep(500);
     healthy();
     const last = controls.at(-1)!.volume!;
