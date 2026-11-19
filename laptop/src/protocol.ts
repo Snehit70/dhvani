@@ -267,3 +267,5 @@ export function encodeAudioPacket(p: { token: Uint8Array; seq: number; sentMs: n
 
 export const PING_LINE = JSON.stringify({ dhvani: "ping" }) + "\n";
 export const TCP_FALLBACK_LINE = JSON.stringify({ dhvani: "transport", udp: false }) + "\n";
+/** UDP reaches the laptop again: go back to it. Phones before 0.7 ignore this and stay on TCP. */
+export const UDP_RESUME_LINE = JSON.stringify({ dhvani: "transport", udp: true }) + "\n";

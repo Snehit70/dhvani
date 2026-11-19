@@ -252,13 +252,13 @@ test("control packet from the streaming phone reaches the hook; wrong code does 
   c.sock.end();
 });
 
-import { encodeAudioPacket, TCP_FALLBACK_LINE } from "../src/protocol";
+import { encodeAudioPacket, TCP_FALLBACK_LINE, UDP_RESUME_LINE } from "../src/protocol";
 
-async function startUdp() {
+async function startUdp(retryMs?: number) {
   controls = [];
   server = new AudioServer(() => config, factory, {
     onChange: () => changes++, onLevel: () => {}, addresses: () => [], allowUdp: () => true,
-  }, 500);
+  }, 500, retryMs);
   const port = await server.listen(0, "127.0.0.1");
   await server.listenDiscovery(0, port);
   return port;
@@ -304,3 +304,47 @@ test("UDP that never arrives falls back to TCP audio", async () => {
   await until(() => players[0]?.data.length === 4);
   c.sock.end();
 }, 6000);
+
+test("after a TCP fallback, UDP comes back once the phone's reports get through", async () => {
+  const port = await startUdp(0);
+  const c = connect(port);
+  c.sock.write(helloUdp);
+  const reply = JSON.parse(await c.line());
+  const token = Buffer.from(reply.udp.token, "hex");
+  while ((await c.line()) !== TCP_FALLBACK_LINE.trim()) {}
+  c.sock.write(Buffer.from([5, 0, 6, 0]));
+  await until(() => players[0]?.data.length === 4);
+  const udp = dgram.createSocket("udp4");
+  // A phone report over UDP: the path works now, so the laptop asks for UDP audio again.
+  udp.send(JSON.stringify({ dhvani: "stats", v: 1, code: "424242", rssi: -60 }), reply.udp.port, "127.0.0.1");
+  while ((await c.line()) !== UDP_RESUME_LINE.trim()) {}
+  // TCP audio still plays until the first UDP packet lands.
+  c.sock.write(Buffer.from([7, 0, 7, 0]));
+  await until(() => players[0]?.data.length === 8);
+  // The phone's sequence moved on while it sent over TCP; that is not a hole to fill.
+  udp.send(encodeAudioPacket({ token, seq: 4000, sentMs: 50_000, late: false, pcm: new Uint8Array(4).fill(9) }), reply.udp.port, "127.0.0.1");
+  await until(() => server.session?.transport === "udp");
+  await until(() => players[0]?.data.length === 12);
+  expect(players[0]!.data.slice(8)).toEqual([9, 9, 9, 9]);
+  c.sock.write(Buffer.from([1, 1, 1, 1]));
+  await Bun.sleep(30);
+  expect(players[0]!.data.length).toBe(12);
+  udp.close();
+  c.sock.end();
+}, 8000);
+
+test("a UDP retry that gets nothing goes back to TCP", async () => {
+  const port = await startUdp(0);
+  const c = connect(port);
+  c.sock.write(helloUdp);
+  const reply = JSON.parse(await c.line());
+  while ((await c.line()) !== TCP_FALLBACK_LINE.trim()) {}
+  const udp = dgram.createSocket("udp4");
+  udp.send(JSON.stringify({ dhvani: "stats", v: 1, code: "424242" }), reply.udp.port, "127.0.0.1");
+  while ((await c.line()) !== UDP_RESUME_LINE.trim()) {}
+  while ((await c.line()) !== TCP_FALLBACK_LINE.trim()) {}
+  expect(server.session?.transport).toBe("tcp");
+  expect(server.session).not.toBeNull();
+  udp.close();
+  c.sock.end();
+}, 10000);

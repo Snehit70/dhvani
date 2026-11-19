@@ -2,12 +2,12 @@ import net from "node:net";
 import { randomBytes } from "node:crypto";
 import dgram from "node:dgram";
 import type { Config } from "./config";
-import { FrameAligner, Limiter, QUIET_PEAK, type LatencyMode } from "./audio";
+import { FrameAligner, JitterBuffer, Limiter, QUIET_PEAK, type LatencyMode } from "./audio";
 import { Analyzer, type LevelFrame } from "./analyzer";
 import { log } from "./log";
 import type { Player, PlayerFactory } from "./player";
 import { StreamStats } from "./stats";
-import { Reorder, type Delivered } from "./udp";
+import { Reorder, StaleGate, type Delivered } from "./udp";
 import {
   FailureLimiter,
   MAX_HELLO_BYTES,
@@ -25,6 +25,7 @@ import {
   parseAudioPacket,
   PING_LINE,
   TCP_FALLBACK_LINE,
+  UDP_RESUME_LINE,
   type PhoneControl,
   type Hello,
 } from "./protocol";
@@ -71,6 +72,9 @@ export const UDP_FALLBACK_MS = 2500;
 export const UDP_TIMEOUT_MS = 8000;
 /** A housekeeping tick this late means the laptop itself stalled (suspend, heavy load), not the phone. */
 export const LATE_TICK_MS = 3000;
+/** After a TCP fallback, try UDP again once the phone's UDP reports get through: first after this, doubling. */
+export const UDP_RETRY_MS = 10_000;
+export const UDP_RETRY_MAX_MS = 300_000;
 export const STATS_INTERVAL_MS = 10_000;
 
 export type SessionSummary = {
@@ -130,6 +134,15 @@ type Active = {
     lastAt: number;
     /** When housekeeping last ran, to tell a stalled laptop from a silent phone. */
     lastTick: number;
+    /** When the current try at UDP began, and how many packets had arrived by then. */
+    since: number;
+    receivedAtStart: number;
+    /** Asked the phone to go back to UDP and waiting for its first packet. */
+    resuming: boolean;
+    /** Earliest next UDP retry after a fallback, and the wait after that one. */
+    retryAt: number;
+    retryMs: number;
+    stale: StaleGate;
     timers: ReturnType<typeof setInterval>[];
   } | null;
 };
@@ -161,6 +174,7 @@ export class AudioServer {
     private makePlayer: PlayerFactory,
     private hooks: ServerHooks,
     private helloTimeoutMs = 5000,
+    private udpRetryMs = UDP_RETRY_MS,
   ) {}
 
   async listen(port: number, host = "0.0.0.0"): Promise<number> {
@@ -378,6 +392,14 @@ export class AudioServer {
       active.sec.bytes += chunk.length;
       const frames = aligner.push(chunk);
       if (!frames.length) return;
+      // Backlog released by a Wi-Fi stall: skip it and play live audio, rather than play old audio and skip later.
+      if (d && d.sentMs !== null && active.player && !active.player.closed && active.udp?.stale.stale(
+        d.sentMs, now, active.player.targetMs + JitterBuffer.HEADROOM_MS,
+      )) {
+        active.stats.dropStale++;
+        active.player.gap?.();
+        return;
+      }
       active.analyzer.push(frames);
       const player = this.ensurePlayer(active);
       const cfg = this.getConfig();
@@ -406,6 +428,12 @@ export class AudioServer {
         reorder: new Reorder((d) => onAudio(d.pcm, d)),
         lastAt: 0,
         lastTick: performance.now(),
+        since: performance.now(),
+        receivedAtStart: 0,
+        resuming: false,
+        retryAt: 0,
+        retryMs: this.udpRetryMs,
+        stale: new StaleGate(),
         timers: [],
       };
       active.udp = u;
@@ -433,10 +461,17 @@ export class AudioServer {
   private udpAudio(msg: Buffer) {
     const a = this.active;
     const u = a?.udp;
-    if (!a || !u || a.session.transport !== "udp") return;
+    if (!a || !u || (a.session.transport !== "udp" && !u.resuming)) return;
     const p = parseAudioPacket(msg);
     if (!p || !u.token.equals(p.token)) return;
     u.lastAt = performance.now();
+    if (u.resuming) {
+      u.resuming = false;
+      u.retryMs = this.udpRetryMs;
+      a.session.transport = "udp";
+      log("udp_resume", { session: a.session.id });
+      this.hooks.onChange();
+    }
     u.reorder.push(p.seq, p.sentMs, p.late, p.pcm);
   }
 
@@ -444,21 +479,26 @@ export class AudioServer {
   private udpHousekeeping(active: Active) {
     const u = active.udp;
     if (this.active !== active || !u || active.socket.destroyed) return;
-    if (active.session.transport !== "udp") return;
     const now = performance.now();
     const late = now - u.lastTick > LATE_TICK_MS;
     u.lastTick = now;
+    if (late) u.since = Math.max(u.since, now - UDP_FALLBACK_MS / 2);
+    if (active.session.transport !== "udp" && !u.resuming) return;
     // After a laptop stall the queued packets have not been read yet; give the phone a fresh window.
     if (late && u.lastAt) u.lastAt = now;
     const age = now - u.lastAt;
-    if (!u.reorder.received && Date.now() - active.session.since >= UDP_FALLBACK_MS) {
+    if (u.reorder.received === u.receivedAtStart && now - u.since >= UDP_FALLBACK_MS) {
+      const retried = u.resuming;
       active.session.transport = "tcp";
-      log("udp_fallback", { session: active.session.id });
+      u.resuming = false;
+      u.retryAt = now + u.retryMs;
+      if (retried) u.retryMs = Math.min(UDP_RETRY_MAX_MS, u.retryMs * 2);
+      log("udp_fallback", { session: active.session.id, retry: retried, nextTryS: Math.round((u.retryAt - now) / 1000) });
       active.socket.write(TCP_FALLBACK_LINE);
       this.hooks.onChange();
       return;
     }
-    if (u.reorder.received && age > UDP_TIMEOUT_MS) {
+    if (active.session.transport === "udp" && u.reorder.received && age > UDP_TIMEOUT_MS) {
       log("udp_timeout", { session: active.session.id, ms: Math.round(age) });
       active.socket.destroy();
       this.endActive("timeout");
@@ -528,10 +568,28 @@ export class AudioServer {
     return a;
   }
 
+  /**
+   * A UDP report from the streaming phone got through, so UDP works now. If audio fell back
+   * to TCP (often just a weak start), ask the phone to switch back, with growing waits between tries.
+   */
+  private udpReachable(a: Active) {
+    const u = a.udp;
+    if (!u || a.session.transport !== "tcp" || u.resuming || a.socket.destroyed) return;
+    const now = performance.now();
+    if (now < u.retryAt) return;
+    u.resuming = true;
+    u.since = now;
+    u.receivedAtStart = u.reorder.received;
+    u.reorder.reset();
+    log("udp_retry", { session: a.session.id });
+    a.socket.write(UDP_RESUME_LINE);
+  }
+
   private phoneStats(s: { code: string; fields: Record<string, unknown> }, address: string) {
     // Only the phone that is currently streaming, with the right code, gets logged.
     const a = this.sessionFor(address, s.code);
     if (!a) return;
+    this.udpReachable(a);
     log("phone_stats", { session: a.session.id, ...s.fields });
     if (typeof s.fields.screenOn === "boolean" && a.screenOff === s.fields.screenOn) {
       a.screenOff = !s.fields.screenOn;
@@ -545,6 +603,7 @@ export class AudioServer {
   private phoneVolume(v: { code: string; index: number; max: number; muted: boolean }, address: string) {
     const a = this.sessionFor(address, v.code);
     if (!a) return;
+    this.udpReachable(a);
     const prev = a.session.phoneVolume;
     if (prev && prev.index === v.index && prev.max === v.max && prev.muted === v.muted) return;
     a.session.phoneVolume = { index: v.index, max: v.max, muted: v.muted };
