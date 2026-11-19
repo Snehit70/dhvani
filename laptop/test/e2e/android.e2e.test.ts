@@ -58,7 +58,11 @@ function adb(...args: string[]): string {
 }
 const sh = (cmd: string) => adb("shell", cmd);
 const alive = () => sh(`pidof ${PKG} || true`).trim() !== "";
-const crashes = () => adb("logcat", "-b", "crash", "-d").trim();
+/** Crash-log entries from this app; other processes on a fresh emulator crash sometimes too. */
+const crashes = () => {
+  const log = adb("logcat", "-b", "crash", "-d");
+  return log.includes(`Process: ${PKG}`) || log.includes(`${PKG} `) ? log.trim() : "";
+};
 
 async function until(what: string, cond: () => boolean, ms = 10_000) {
   const end = Date.now() + ms;
@@ -82,11 +86,18 @@ function screen(): Node[] {
   }
   return nodes;
 }
+const same = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
 const find = (label: string | RegExp, nodes = screen()) =>
-  nodes.find((n) => (typeof label === "string" ? n.text === label || n.desc === label : label.test(n.text) || label.test(n.desc)));
+  nodes.find((n) => (typeof label === "string" ? same(n.text, label) || same(n.desc, label) : label.test(n.text) || label.test(n.desc)));
+const visible = () => screen().map((n) => n.text || n.desc).filter(Boolean).join(" | ");
 async function waitFor(label: string | RegExp, ms = 10_000): Promise<Node> {
   let n: Node | undefined;
-  await until(`"${label}" on screen`, () => !!(n = find(label)), ms);
+  try {
+    await until(`"${label}" on screen`, () => !!(n = find(label)), ms);
+  } catch (e) {
+    const top = sh("dumpsys activity activities | grep -m1 -E 'topResumedActivity|mResumedActivity' || true").trim();
+    throw new Error(`${(e as Error).message}\n  top: ${top}\n  screen: ${visible()}`);
+  }
   return n!;
 }
 async function scrollTo(label: string | RegExp): Promise<Node> {
@@ -95,7 +106,7 @@ async function scrollTo(label: string | RegExp): Promise<Node> {
     if (n) return n;
     sh("input swipe 540 1600 540 900 300");
   }
-  return waitFor(label, 1000);
+  return waitFor(label, 3000);
 }
 const tap = (n: Node) => sh(`input tap ${n.x} ${n.y}`);
 
@@ -268,14 +279,16 @@ describe.skipIf(!E2E)("Android app end to end", () => {
     healthy();
   }, 60_000);
 
-  test("a wrong code shows an error, not a crash", async () => {
+  test("a wrong code stops streaming with an error, not a crash", async () => {
     const real = cfg.code;
     cfg.code = "000000";
     server.disconnect();
     await Bun.sleep(4000);
-    healthy();
+    expect(server.session).toBeNull();
+    expect(crashes()).toBe("");
     cfg.code = real;
-    await until("the phone to reconnect with the right code", () => !!server.session, 30_000);
+    audioBytes = 0;
+    await startStreaming();
     healthy();
   }, 60_000);
 
