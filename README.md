@@ -144,6 +144,12 @@ On the phone: `adb logcat -s Dhvani`.
 cd laptop && bun install && bun test && bunx tsc --noEmit && bun src/main.ts
 ```
 
+Phone tests:
+
+- `android/test.sh` runs the Java unit tests on a connected device or emulator, using the real Android runtime (Intent extras, org.json).
+- `android/e2e.sh` boots a headless emulator, installs a fresh APK, and drives the real app against an in-process laptop server on ports 47900 to 47903. It covers streaming over UDP, the volume slider, mute, laptop-pushed volume, odd control intents, volume keys, rotation, a laptop restart, a wrong code, stop, and a monkey run. Any entry in the device's crash log fails the run. `APK=path android/e2e.sh` tests another build.
+- One-time setup: `sdkmanager "emulator" "system-images;android-34;google_apis;x86_64"`. KVM is also required.
+
 ## License
 
 MIT, see [LICENSE](LICENSE).
