@@ -19,10 +19,11 @@ phone (Android 10+)  --UDP 47802, raw 48 kHz stereo PCM, each packet sent twice-
 ```
 
 Over Wi-Fi the audio goes as 5 ms UDP packets, each one sent again 20 ms later. A lost
-packet is filled from its copy, and one lost twice plays as 5 ms of silence. Over TCP the
-same loss stalled the stream for one to three seconds while the packet was resent. If UDP
-does not get through, the laptop asks the phone to send on the TCP socket instead. Over USB
-(`adb reverse` carries TCP only) audio always uses TCP.
+packet is filled from its copy, and one lost twice is covered by a 5 ms fade, so it is heard
+as a dip rather than a click. Over TCP the same loss stalled the stream for one to three
+seconds while the packet was resent. If UDP does not get through, the laptop asks the phone
+to send on the TCP socket instead, and switches back to UDP once the phone's reports reach it
+again (phone app 0.7+). Over USB (`adb reverse` carries TCP only) audio always uses TCP.
 
 ## Laptop
 
@@ -69,6 +70,7 @@ Options:
 
 - **Silence this phone**: mutes the phone speaker while streaming and restores it when you stop, or 10 s after the connection drops (so a quick reconnect is not heard on the phone). Some phones also mute the shared audio when the speaker is muted. Dhvani detects that after about 3 s of silence, puts the volume back, and tells you to turn the option off.
 - **Volume buttons control the laptop**: while the phone is silenced, its volume buttons change the laptop volume (5% a press, with a short on-screen note) and the phone stays quiet. This uses a small Accessibility service that only looks at the volume keys, and only while streaming. Turn on **Dhvani volume buttons** in Accessibility settings. On Android 13+ a sideloaded app's toggle is greyed out until you allow it: App info, ⋮ menu, **Allow restricted settings**. Without the service, Dhvani still catches the phone volume rising, puts it back to 0 within a moment and moves the laptop instead, but a press can be heard briefly and volume down can't be seen.
+- **Wi-Fi tips**: while streaming, the app tells you when the phone is on 2.4 GHz or has a weak signal, the usual causes of dropouts.
 - **Reconnect automatically**: retries with backoff if Wi-Fi drops or the laptop restarts.
 - **Start when opened**: opening Dhvani connects to the saved laptop right away.
 
@@ -105,7 +107,9 @@ Events: `start`, `stop`, `firewall`, `settings`, `hello_rejected`, `session_star
 `session_stats` (every 10 s: arrival gaps p50/p95/max, rate vs real time, drops
 by cause, queued lead, underruns, peak, silence %; `dropQuiet` counts silent
 chunks shed on purpose, `compressedMs` the audio removed by briefly playing
-faster, `stale` UDP packets held over a second), `phone_stats` (every 10 s
+faster, `stale` UDP packets held over a second, `dropStale` packets skipped because a Wi-Fi
+stall delivered them too late), `udp_fallback` / `udp_retry` / `udp_resume` (audio moved
+to TCP and back), `phone_stats` (every 10 s
 from the phone, and at once when its screen turns on or off: socket write/read
 stalls, watchdog trips, reconnects, Wi-Fi RSSI/link speed/band, screen),
 `phone_screen`, `player_start`, `player_exit`, `output_missing` / `output_back`
@@ -114,7 +118,10 @@ duration, totals).
 
 When audio piles up after a Wi-Fi hiccup, Dhvani drops silent bits first and
 otherwise catches up by playing up to about 20% faster for a moment, with pitch
-kept, instead of skipping audio. While the phone screen is off, Android may let
+kept, instead of skipping audio. When a longer stall releases a backlog all at once,
+the oldest packets are skipped so playback jumps back to live audio instead of
+playing old audio and skipping later. Every skip is smoothed over 2 ms so it does
+not click. While the phone screen is off, Android may let
 Wi-Fi doze, so Low mode holds at least 80 ms. After an underrun the buffer grows by
 as much as it ran dry (up to 60 ms at once, 200 ms in total in Low mode) and
 shrinks back slowly. A laptop stall (suspend, heavy load) does not end the session:

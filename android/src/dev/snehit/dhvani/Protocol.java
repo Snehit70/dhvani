@@ -10,7 +10,7 @@ final class Protocol {
     static final int DISCOVERY_PORT = 47802;
     static final int RATE = 48000;
     static final int CHANNELS = 2;
-    static final String APP_VERSION = "0.6.0";
+    static final String APP_VERSION = "0.7.0";
 
     /** UDP audio packet: 'D' 'H', version, flags (bit 0 = late copy), 8-byte token, seq, phone ms, PCM. */
     static final int UDP_HEADER = 20;
@@ -170,6 +170,16 @@ final class Protocol {
             return new Laptop(o.optDouble("volume", 1), o.optBoolean("muted", false), addrs);
         } catch (JSONException e) {
             return null;
+        }
+    }
+
+    /** UDP reaches the laptop again (after a fallback): send audio over UDP once more. */
+    static boolean isUdpResume(String line) {
+        try {
+            JSONObject o = new JSONObject(line);
+            return "transport".equals(o.optString("dhvani")) && o.optBoolean("udp", false);
+        } catch (JSONException e) {
+            return false;
         }
     }
 
