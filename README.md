@@ -35,7 +35,9 @@ Needs Linux with PipeWire (`pw-cat`, `pactl`) and [Bun](https://bun.sh).
 
 The control panel is at <http://127.0.0.1:47801> (also "Dhvani" in the app menu). There you can:
 
-- pick the output (follow the system output, Bluetooth headset, speakers), set volume up to 150%, and mute
+- pick the output (follow the system output, Bluetooth headset, speakers), set volume up to 150%, and mute.
+  If a chosen headset switches off or leaves range, Dhvani plays silence instead of falling back
+  to the speakers, and resumes when it comes back
 - see the pairing code, make a new one, and see the laptop's addresses
 - check health (server, discovery, firewall) and disconnect the phone
 
@@ -65,7 +67,7 @@ Building needs only an Android SDK (platform + build-tools) and a JDK 17+.
 
 Options:
 
-- **Silence this phone**: mutes the phone speaker while streaming and restores it when you stop or the connection drops. Some phones also mute the shared audio when the speaker is muted. Dhvani detects that after about 3 s of silence, puts the volume back, and tells you to turn the option off.
+- **Silence this phone**: mutes the phone speaker while streaming and restores it when you stop, or 10 s after the connection drops (so a quick reconnect is not heard on the phone). Some phones also mute the shared audio when the speaker is muted. Dhvani detects that after about 3 s of silence, puts the volume back, and tells you to turn the option off.
 - **Volume buttons control the laptop**: while the phone is silenced, its volume buttons change the laptop volume (5% a press, with a short on-screen note) and the phone stays quiet. This uses a small Accessibility service that only looks at the volume keys, and only while streaming. Turn on **Dhvani volume buttons** in Accessibility settings. On Android 13+ a sideloaded app's toggle is greyed out until you allow it: App info, ⋮ menu, **Allow restricted settings**. Without the service, Dhvani still catches the phone volume rising, puts it back to 0 within a moment and moves the laptop instead, but a press can be heard briefly and volume down can't be seen.
 - **Reconnect automatically**: retries with backoff if Wi-Fi drops or the laptop restarts.
 - **Start when opened**: opening Dhvani connects to the saved laptop right away.
@@ -106,13 +108,17 @@ chunks shed on purpose, `compressedMs` the audio removed by briefly playing
 faster, `stale` UDP packets held over a second), `phone_stats` (every 10 s
 from the phone, and at once when its screen turns on or off: socket write/read
 stalls, watchdog trips, reconnects, Wi-Fi RSSI/link speed/band, screen),
-`phone_screen`, `player_start`, `player_exit`, `session_end` (reason,
+`phone_screen`, `player_start`, `player_exit`, `output_missing` / `output_back`
+(the chosen output disappeared or returned), `session_end` (reason,
 duration, totals).
 
 When audio piles up after a Wi-Fi hiccup, Dhvani drops silent bits first and
 otherwise catches up by playing up to about 20% faster for a moment, with pitch
 kept, instead of skipping audio. While the phone screen is off, Android may let
-Wi-Fi doze, so Low mode holds at least 80 ms. The pairing code is never logged.
+Wi-Fi doze, so Low mode holds at least 80 ms. After an underrun the buffer grows by
+as much as it ran dry (up to 60 ms at once, 200 ms in total in Low mode) and
+shrinks back slowly. A laptop stall (suspend, heavy load) does not end the session:
+the phone gets a fresh 8 s window once the laptop is running again. The pairing code is never logged.
 
 On the phone: `adb logcat -s Dhvani`.
 
