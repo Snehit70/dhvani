@@ -85,6 +85,8 @@ public final class StreamService extends Service {
     private volatile boolean useUdp;
     /** Where reports and laptop controls go: the UDP port the laptop announced, else the default. */
     private volatile int reportPort = Protocol.DISCOVERY_PORT;
+    /** The worker's report socket. Controls go on it too: packets from a fresh socket were lost. */
+    private volatile DatagramSocket reportSock;
     /** Uptime when the laptop last wrote anything on the TCP socket. */
     private volatile long lastHeardAt;
     private int udpSeq;
@@ -398,6 +400,7 @@ public final class StreamService extends Service {
                 long readMax = 0, writeMax = 0;
                 int slowWrites = 0, slowReads = 0;
                 try { statsSock = new DatagramSocket(); } catch (IOException ignored) {}
+                reportSock = statsSock;
                 String lastVolume = null;
                 long nextVolumeCheck = 0, volumeResendAt = 0;
                 boolean wasUdp = useUdp;
@@ -487,6 +490,7 @@ public final class StreamService extends Service {
                 lastHeardAt = 0;
                 if (audioSock != null) audioSock.close();
                 StreamState.clearLaptop();
+                reportSock = null;
                 if (statsSock != null) statsSock.close();
                 closeQuietly(s);
                 try { rec.stop(); } catch (RuntimeException ignored) {}
@@ -641,9 +645,13 @@ public final class StreamService extends Service {
         final byte[] b = Protocol.control(c, volume, muted).getBytes(StandardCharsets.UTF_8);
         try {
             sender.execute(() -> {
-                try (DatagramSocket ds = new DatagramSocket()) {
+                DatagramSocket ds = reportSock;
+                if (ds == null) return;
+                try {
                     ds.send(new DatagramPacket(b, b.length, t, reportPort));
-                } catch (IOException ignored) {}
+                } catch (IOException e) {
+                    Log.d(TAG, "control send failed: " + e);
+                }
             });
         } catch (java.util.concurrent.RejectedExecutionException ignored) {}
     }
