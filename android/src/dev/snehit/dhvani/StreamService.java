@@ -235,6 +235,7 @@ public final class StreamService extends Service {
             return START_NOT_STICKY;
         }
         if (intent == null || ACTION_STOP.equals(intent.getAction())) {
+            Log.i(TAG, intent == null ? "restarted by the system without a session; stopping" : "stop requested");
             stopStreaming(null);
             return START_NOT_STICKY;
         }

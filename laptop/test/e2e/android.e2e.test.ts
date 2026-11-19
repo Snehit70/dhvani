@@ -111,6 +111,11 @@ async function waitFor(label: string | RegExp, ms = 10_000): Promise<Node> {
   }
   return n!;
 }
+/** A slow swipe, so the list doesn't fling, then a pause so positions read next are where taps land. */
+async function scroll(path: string) {
+  sh(`input swipe ${path} 900`);
+  await Bun.sleep(600);
+}
 /** Scrolls the page up to the top, then down, until the label is on screen. */
 async function scrollTo(label: string | RegExp, pick = find): Promise<Node> {
   const swipes = ["540 800 540 1700", "540 800 540 1700", "540 800 540 1700",
@@ -120,7 +125,7 @@ async function scrollTo(label: string | RegExp, pick = find): Promise<Node> {
     if (dismissSystemDialog(nodes) && dialogs++ < 5) { i--; await Bun.sleep(500); continue; }
     const n = pick(label, nodes);
     if (n) return n;
-    if (i < swipes.length) sh(`input swipe ${swipes[i]} 300`);
+    if (i < swipes.length) await scroll(swipes[i]!);
   }
   return waitFor(label, 3000);
 }
@@ -129,7 +134,7 @@ const findSlider = (l: string | RegExp, nodes = screen()) => nodes.find((n) => n
 async function slider(): Promise<Node> {
   let bar = await scrollTo("Laptop volume", findSlider);
   for (let i = 0; i < 4 && (bar.y > 1700 || bar.y < 400); i++) {
-    sh(bar.y > 1700 ? "input swipe 540 1500 540 1000 300" : "input swipe 540 1000 540 1500 300");
+    await scroll(bar.y > 1700 ? "540 1500 540 1000" : "540 1000 540 1500");
     bar = await scrollTo("Laptop volume", findSlider);
   }
   return bar;
