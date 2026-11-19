@@ -631,6 +631,7 @@ public final class MainActivity extends Activity implements StreamState.Listener
                 ? View.VISIBLE : View.GONE);
         heroProgress.setIndeterminateTintList(ColorStateList.valueOf(primary));
         String n = StreamState.notice;
+        if (n.isEmpty() && s == StreamState.Status.STREAMING) n = StreamState.wifiTip;
         notice.setText(n);
         notice.setVisibility(n.isEmpty() ? View.GONE : View.VISIBLE);
 

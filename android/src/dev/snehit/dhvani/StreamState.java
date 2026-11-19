@@ -15,6 +15,8 @@ final class StreamState {
     static volatile String detail = "";
     static volatile String laptop = "";
     static volatile String notice = "";
+    /** Advice about the phone's own Wi-Fi while streaming (2.4 GHz, weak signal), or "". */
+    static volatile String wifiTip = "";
     /** Laptop playback volume 0..1.5, or -1 until the laptop reports it. */
     static volatile double laptopVolume = -1;
     static volatile boolean laptopMuted = false;
@@ -36,6 +38,13 @@ final class StreamState {
         notifyListeners();
     }
 
+    static void setWifiTip(String t) {
+        String n = t == null ? "" : t;
+        if (n.equals(wifiTip)) return;
+        wifiTip = n;
+        notifyListeners();
+    }
+
     static void setLaptop(double volume, boolean muted, String[] addresses) {
         laptopVolume = volume;
         laptopMuted = muted;
@@ -47,6 +56,7 @@ final class StreamState {
         laptopVolume = -1;
         laptopMuted = false;
         laptopAddresses = new String[0];
+        wifiTip = "";
     }
 
     static boolean active() {

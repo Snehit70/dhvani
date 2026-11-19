@@ -393,6 +393,7 @@ public final class StreamService extends Service {
                 try { statsSock = new DatagramSocket(); } catch (IOException ignored) {}
                 String lastVolume = null;
                 long nextVolumeCheck = 0, volumeResendAt = 0;
+                boolean wasUdp = useUdp;
                 while (running) {
                     long r0 = SystemClock.uptimeMillis();
                     int n = rec.read(buf, 0, buf.length);
@@ -404,6 +405,12 @@ public final class StreamService extends Service {
                     // Over UDP nothing writes to the socket, so a closed one shows up only here.
                     if (s.isClosed()) throw new IOException("laptop closed the connection");
                     boolean udpNow = useUdp && audioSock != null;
+                    // Back on UDP after a TCP stint: late copies queued before then are stale.
+                    if (udpNow && !wasUdp) {
+                        lateCopies.clear();
+                        lateDue.clear();
+                    }
+                    wasUdp = udpNow;
                     if (udpNow) sendLateCopies(audioSock, SystemClock.uptimeMillis());
                     boolean zero = allZero(buf, n);
                     quietMs = zero ? quietMs + CHUNK_MS : 0;
@@ -561,6 +568,13 @@ public final class StreamService extends Service {
                         useUdp = false;
                         continue;
                     }
+                    if (Protocol.isUdpResume(line)) {
+                        if (!s.getInetAddress().isLoopbackAddress()) {
+                            Log.i(TAG, "laptop hears UDP again, switching back to udp");
+                            useUdp = true;
+                        }
+                        continue;
+                    }
                     Protocol.Laptop l = Protocol.parseLaptop(line);
                     if (l == null) continue;
                     if (s.getInetAddress().isLoopbackAddress()) {
@@ -640,12 +654,25 @@ public final class StreamService extends Service {
                     o.put("rssi", wi.getRssi());
                     o.put("linkMbps", wi.getLinkSpeed());
                     o.put("freqMHz", wi.getFrequency());
+                    StreamState.setWifiTip(wifiTip(wi.getRssi(), wi.getFrequency()));
                 }
             }
             byte[] b = Protocol.stats(code, o).getBytes(StandardCharsets.UTF_8);
             sock.send(new DatagramPacket(b, b.length, target(s), Protocol.DISCOVERY_PORT));
             Log.d(TAG, "stats " + o);
         } catch (Exception ignored) {}
+    }
+
+    private boolean weakWifi;
+
+    /** What the user can do about this phone's Wi-Fi, or "" when it is fine. Weak below -70 dBm, fine again above -66. */
+    private String wifiTip(int rssi, int freqMHz) {
+        weakWifi = weakWifi ? rssi < -66 : rssi < -70;
+        boolean slowBand = freqMHz > 0 && freqMHz < 3000;
+        if (weakWifi && slowBand) return "Weak 2.4 GHz Wi-Fi, so audio may drop out. Move closer to the router so the phone can switch to 5 GHz.";
+        if (slowBand) return "This phone is on 2.4 GHz Wi-Fi, which drops audio more often. Move closer to the router so it can switch to 5 GHz.";
+        if (weakWifi) return "Weak Wi-Fi signal, so audio may drop out. Move closer to the router, or use a USB cable.";
+        return "";
     }
 
     private static boolean allZero(byte[] b, int n) {
