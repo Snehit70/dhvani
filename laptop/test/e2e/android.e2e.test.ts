@@ -72,7 +72,7 @@ async function until(what: string, cond: () => boolean, ms = 10_000) {
   }
 }
 
-type Node = { text: string; desc: string; x: number; y: number; x1: number; x2: number };
+type Node = { text: string; desc: string; cls: string; x: number; y: number; x1: number; x2: number };
 function screen(): Node[] {
   sh("uiautomator dump /sdcard/dhvani-ui.xml >/dev/null");
   const xml = sh("cat /sdcard/dhvani-ui.xml");
@@ -82,7 +82,7 @@ function screen(): Node[] {
     const b = a("bounds").match(/\[(\d+),(\d+)\]\[(\d+),(\d+)\]/);
     if (!b) continue;
     const [x1, y1, x2, y2] = b.slice(1).map(Number) as [number, number, number, number];
-    nodes.push({ text: a("text"), desc: a("content-desc"), x: (x1 + x2) >> 1, y: (y1 + y2) >> 1, x1, x2 });
+    nodes.push({ text: a("text"), desc: a("content-desc"), cls: a("class"), x: (x1 + x2) >> 1, y: (y1 + y2) >> 1, x1, x2 });
   }
   return nodes;
 }
@@ -111,16 +111,21 @@ async function waitFor(label: string | RegExp, ms = 10_000): Promise<Node> {
   }
   return n!;
 }
-async function scrollTo(label: string | RegExp): Promise<Node> {
-  for (let i = 0; i < 6; i++) {
+/** Scrolls the page up to the top, then down, until the label is on screen. */
+async function scrollTo(label: string | RegExp, pick = find): Promise<Node> {
+  const swipes = ["540 800 540 1700", "540 800 540 1700", "540 800 540 1700",
+    "540 1600 540 900", "540 1600 540 900", "540 1600 540 900", "540 1600 540 900", "540 1600 540 900"];
+  for (let i = 0, dialogs = 0; i <= swipes.length; i++) {
     const nodes = screen();
-    if (dismissSystemDialog(nodes)) { i--; await Bun.sleep(500); continue; }
-    const n = find(label, nodes);
+    if (dismissSystemDialog(nodes) && dialogs++ < 5) { i--; await Bun.sleep(500); continue; }
+    const n = pick(label, nodes);
     if (n) return n;
-    sh("input swipe 540 1600 540 900 300");
+    if (i < swipes.length) sh(`input swipe ${swipes[i]} 300`);
   }
   return waitFor(label, 3000);
 }
+const slider = () =>
+  scrollTo("Laptop volume", (l, nodes = screen()) => nodes.find((n) => n.cls.endsWith("SeekBar") && n.desc === l));
 const tap = (n: Node) => sh(`input tap ${n.x} ${n.y}`);
 
 function launch() {
@@ -129,14 +134,14 @@ function launch() {
 
 async function startStreaming() {
   launch();
-  const start = await scrollTo("Start streaming");
+  const start = await scrollTo(/^(Start streaming|Try again)$/i);
   tap(start);
   // The share prompt is skipped by the PROJECT_MEDIA app-op; tap through it if it shows anyway.
   const end = Date.now() + 15_000;
   while (!server.session && Date.now() < end) {
     const ok = find(/^(Start|Start now|START NOW)$/);
     if (ok && !alive()) break;
-    if (ok && ok.text !== "Start streaming") tap(ok);
+    if (ok && !/streaming/i.test(ok.text)) tap(ok);
     await Bun.sleep(300);
   }
   await until("the phone to connect", () => !!server.session, 15_000);
@@ -186,7 +191,7 @@ describe.skipIf(!E2E)("Android app end to end", () => {
   test("dragging the laptop volume slider sends volume and does not crash", async () => {
     controls.length = 0;
     launch();
-    const bar = await scrollTo("Laptop volume");
+    const bar = await slider();
     const w = bar.x2 - bar.x1;
     sh(`input swipe ${bar.x1 + w * 0.8} ${bar.y} ${bar.x1 + w * 0.3} ${bar.y} 600`);
     await until("a volume control", () => controls.some((c) => c.volume !== undefined && c.muted === undefined));
@@ -199,7 +204,7 @@ describe.skipIf(!E2E)("Android app end to end", () => {
 
   test("tapping the slider sends one volume", async () => {
     controls.length = 0;
-    const bar = await scrollTo("Laptop volume");
+    const bar = await slider();
     sh(`input tap ${bar.x1 + Math.round((bar.x2 - bar.x1) * 0.9)} ${bar.y}`);
     await until("a volume control", () => controls.some((c) => c.volume !== undefined));
     await Bun.sleep(500);
@@ -277,7 +282,7 @@ describe.skipIf(!E2E)("Android app end to end", () => {
     sh("input keyevent HOME");
     await Bun.sleep(800);
     launch();
-    await scrollTo("Laptop volume");
+    await slider();
     expect(server.session).toBeTruthy();
     healthy();
   }, 30_000);
