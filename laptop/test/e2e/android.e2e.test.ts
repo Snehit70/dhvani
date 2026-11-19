@@ -150,12 +150,18 @@ async function slider(): Promise<Node> {
   }
   return bar;
 }
-/** A real finger drag: down, eight moves, up. */
-function drag(y: number, fromX: number, toX: number) {
+/**
+ * A real finger drag: down, eight moves, up. Runs without blocking, because the
+ * laptop server shares this event loop: a second of spawnSync let its UDP buffer
+ * fill with audio and drop the phone's controls.
+ */
+async function drag(y: number, fromX: number, toX: number) {
   const xs = Array.from({ length: 9 }, (_, i) => Math.round(fromX + ((toX - fromX) * i) / 8));
   y = Math.round(y);
-  sh([`input motionevent DOWN ${xs[0]} ${y}`, ...xs.slice(1).map((x) => `input motionevent MOVE ${x} ${y}`),
-    `input motionevent UP ${xs[8]} ${y}`].join("; "));
+  const cmd = [`input motionevent DOWN ${xs[0]} ${y}`, ...xs.slice(1).map((x) => `input motionevent MOVE ${x} ${y}`),
+    `input motionevent UP ${xs[8]} ${y}`].join("; ");
+  const p = Bun.spawn(["adb", "shell", cmd], { stdout: "ignore", stderr: "pipe" });
+  if ((await p.exited) !== 0) throw new Error(`drag failed: ${await new Response(p.stderr).text()}`);
 }
 const tap = (n: Node) => sh(`input tap ${n.x} ${n.y}`);
 
@@ -224,7 +230,7 @@ describe.skipIf(!E2E)("Android app end to end", () => {
     launch();
     const bar = await slider();
     const w = bar.x2 - bar.x1;
-    drag(bar.y, bar.x1 + w * 0.8, bar.x1 + w * 0.3);
+    await drag(bar.y, bar.x1 + w * 0.8, bar.x1 + w * 0.3);
     try {
       await until("a volume control", () => controls.some((c) => c.volume !== undefined && c.muted === undefined));
     } catch (e) {
