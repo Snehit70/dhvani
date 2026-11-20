@@ -8,7 +8,7 @@ Plays your Android phone's audio on your Linux laptop over Wi-Fi: music, videos,
 
 1. On the laptop: `git clone https://github.com/Snehit70/dhvani && cd dhvani && ./install.sh`, then open <http://127.0.0.1:47801>.
 2. On the phone: install `dhvani.apk` from the [latest release](https://github.com/Snehit70/dhvani/releases/latest).
-3. Open Dhvani on the phone, tap your laptop, enter the 6-digit code from the panel, tap **Start**.
+3. Open Dhvani on the phone, tap your laptop, enter the 6-digit code from the panel, tap **Start streaming**.
 
 ## How it works
 
@@ -147,7 +147,7 @@ cd laptop && bun install && bun test && bunx tsc --noEmit && bun src/main.ts
 Phone tests:
 
 - `android/test.sh` runs the Java unit tests on a connected device or emulator, using the real Android runtime (Intent extras, org.json).
-- `android/e2e.sh` boots a headless emulator, installs a fresh APK, and drives the real app against an in-process laptop server on ports 47900 to 47903. It covers streaming over UDP, the volume slider, mute, laptop-pushed volume, odd control intents, volume keys, rotation, a laptop restart, a wrong code, stop, and a monkey run. Any entry in the device's crash log fails the run. `APK=path android/e2e.sh` tests another build.
+- `android/e2e.sh` runs in CI on a headless emulator (only when `android/`, `laptop/src/` or the e2e tests change; locally it does nothing unless an emulator is already attached). It installs a fresh APK and drives the real app against an in-process laptop server on ports 47900 to 47903. It covers streaming over UDP, the volume slider, mute, laptop-pushed volume, odd control intents, volume keys, rotation, a laptop restart, a wrong code, stop, and a monkey run. Any entry in the device's crash log fails the run. `APK=path android/e2e.sh` tests another build.
 - One-time setup: `sdkmanager "emulator" "system-images;android-34;google_apis;x86_64"`. KVM is also required.
 
 ## License

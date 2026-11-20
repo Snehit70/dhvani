@@ -1,16 +1,24 @@
 package dev.snehit.dhvani;
 
 import android.Manifest;
+import android.animation.LayoutTransition;
+import android.animation.ValueAnimator;
 import android.app.Activity;
+import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.content.res.ColorStateList;
 import android.content.res.Configuration;
+import android.graphics.Canvas;
 import android.graphics.Color;
+import android.graphics.Paint;
+import android.graphics.RectF;
 import android.graphics.Typeface;
+import android.graphics.drawable.ClipDrawable;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
+import android.graphics.drawable.LayerDrawable;
 import android.graphics.drawable.RippleDrawable;
 import android.media.projection.MediaProjectionConfig;
 import android.media.projection.MediaProjectionManager;
@@ -20,20 +28,21 @@ import android.os.Handler;
 import android.os.Looper;
 import android.text.InputFilter;
 import android.text.InputType;
+import android.text.TextUtils;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowInsets;
+import android.view.animation.PathInterpolator;
 import android.view.inputmethod.EditorInfo;
-import android.widget.Button;
+import android.view.inputmethod.InputMethodManager;
 import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
-import android.widget.RadioButton;
 import android.widget.ScrollView;
 import android.widget.SeekBar;
 import android.widget.Switch;
@@ -55,6 +64,10 @@ import java.util.Map;
 /**
  * Single-screen UI built in code, following Material 3: tonal surfaces instead of borders,
  * the M3 type scale and shape scale, and dynamic color from the wallpaper on Android 12+.
+ *
+ * Two layouts share the screen. Idle: a status card, the laptop picker with the pairing code,
+ * and options. Connecting or streaming: only the status card, which then holds the laptop's
+ * volume and the stop button; the setup is hidden until the stream ends.
  */
 public final class MainActivity extends Activity implements StreamState.Listener {
     private static final int REQ_PERMS = 1;
@@ -63,6 +76,8 @@ public final class MainActivity extends Activity implements StreamState.Listener
     /** Set by the Quick Settings tile: start streaming as soon as the screen opens. */
     static final String EXTRA_AUTOSTART = "autostart";
     private static final String USB_HOST = "127.0.0.1";
+    /** M3 emphasized easing, used for every state change on this screen. */
+    private static final PathInterpolator EASE = new PathInterpolator(0.2f, 0f, 0f, 1f);
 
     private SharedPreferences prefs;
     private final Handler main = new Handler(Looper.getMainLooper());
@@ -76,24 +91,35 @@ public final class MainActivity extends Activity implements StreamState.Listener
     private int surface, surfaceLow, surfaceMid, surfaceHigh, surfaceHighest;
     private int onSurface, onSurfaceVariant, outline, outlineVariant;
 
-    // Views
-    private LinearLayout hero;
+    // Status card
+    private GradientDrawable heroBg;
+    private ValueAnimator heroFade;
     private FrameLayout heroAvatar;
     private ImageView heroIcon;
-    private TextView heroTitle, heroDetail, notice, searching;
-    private ProgressBar heroProgress, searchSpinner;
-    private Button startButton;
-    private LinearLayout laptopList;
-    private View fieldsDivider;
-    private EditText addressField, codeField;
-    private Switch silenceSwitch, reconnectSwitch, autoSwitch;
-    private TextView keysSub, keysAction;
-    private LinearLayout volumeCard;
+    private Bars heroBars;
+    private TextView heroOverline, heroTitle, heroDetail;
+    private ProgressBar heroProgress;
+    private LinearLayout noticeBox;
+    private ImageView noticeIcon;
+    private TextView notice;
+    private Pill actionButton;
+    // Laptop volume, inside the card while streaming
+    private LinearLayout volumeRow;
+    private FrameLayout muteButton;
+    private ImageView muteOn, muteOff;
+    private Boolean shownMuted;
     private SeekBar volumeBar;
     private TextView volumeValue;
-    private Button muteButton;
     private boolean draggingVolume;
     private long lastVolumeSent;
+    // Setup, hidden while active
+    private LinearLayout setup;
+    private LinearLayout searchRow, laptopList, manualRow, addressBox;
+    private boolean manualOpen;
+    private EditText addressField, codeField;
+    private Switch silenceSwitch, reconnectSwitch, autoSwitch;
+    private TextView keysSub;
+    private ImageView keysTrail;
 
     // Discovery
     /** The live discovery thread; a stopped thread sees it changed and exits. */
@@ -104,6 +130,63 @@ public final class MainActivity extends Activity implements StreamState.Listener
         final String ip; final String name; final int port; long seen;
         Laptop(String ip, String name, int port, long seen) {
             this.ip = ip; this.name = name; this.port = port; this.seen = seen;
+        }
+    }
+
+    /** A button with a leading icon and a label, centered: M3 filled or tonal. */
+    private static final class Pill {
+        LinearLayout view; ImageView icon; TextView label;
+    }
+
+    /**
+     * Four rounded bars that move while audio streams, in place of a static icon.
+     * The animator runs only while the bars are shown and the screen is in front.
+     */
+    private static final class Bars extends View {
+        private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final RectF r = new RectF();
+        private final float[] rest = {0.35f, 0.8f, 0.55f, 0.3f};
+        private final float[] speed = {1.9f, 1.3f, 2.3f, 1.6f};
+        private final float[] phase = {0f, 1.1f, 2.3f, 0.6f};
+        private ValueAnimator anim;
+        private float t;
+
+        Bars(Context c) { super(c); }
+
+        void setColor(int color) { paint.setColor(color); invalidate(); }
+
+        void play(boolean on) {
+            if (on == (anim != null)) return;
+            if (on) {
+                anim = ValueAnimator.ofFloat(0f, 1f);
+                anim.setDuration(1000);
+                anim.setRepeatCount(ValueAnimator.INFINITE);
+                anim.addUpdateListener(a -> { t = android.os.SystemClock.uptimeMillis() / 1000f; invalidate(); });
+                anim.start();
+            } else {
+                anim.cancel();
+                anim = null;
+                invalidate();
+            }
+        }
+
+        @Override protected void onDetachedFromWindow() {
+            play(false);
+            super.onDetachedFromWindow();
+        }
+
+        @Override protected void onDraw(Canvas c) {
+            float w = getWidth(), h = getHeight();
+            float bar = w * 0.14f, gap = w * 0.09f;
+            float x = (w - (4 * bar + 3 * gap)) / 2f;
+            for (int i = 0; i < 4; i++) {
+                float k = anim == null ? rest[i]
+                        : 0.28f + 0.72f * Math.abs((float) Math.sin(t * speed[i] * 3f + phase[i]));
+                float bh = Math.max(bar, h * 0.62f * k);
+                r.set(x, (h - bh) / 2f, x + bar, (h + bh) / 2f);
+                c.drawRoundRect(r, bar / 2f, bar / 2f, paint);
+                x += bar + gap;
+            }
         }
     }
 
@@ -148,6 +231,7 @@ public final class MainActivity extends Activity implements StreamState.Listener
         StreamState.remove(this);
         stopDiscovery();
         saveFields();
+        heroBars.play(false);
         super.onPause();
     }
 
@@ -251,13 +335,15 @@ public final class MainActivity extends Activity implements StreamState.Listener
                 shape(Color.WHITE, radiusDp));
     }
 
-    /** Scale to 0.96 while pressed: tactile feedback for primary actions. */
+    /** Scale to 0.96 while pressed: tactile feedback for buttons. */
     private void pressScale(View v) {
         v.setOnTouchListener((view, e) -> {
             int a = e.getActionMasked();
-            if (a == MotionEvent.ACTION_DOWN) view.animate().scaleX(0.96f).scaleY(0.96f).setDuration(100).start();
-            else if (a == MotionEvent.ACTION_UP || a == MotionEvent.ACTION_CANCEL)
-                view.animate().scaleX(1f).scaleY(1f).setDuration(150).start();
+            if (a == MotionEvent.ACTION_DOWN) {
+                view.animate().scaleX(0.96f).scaleY(0.96f).setDuration(100).setInterpolator(EASE).start();
+            } else if (a == MotionEvent.ACTION_UP || a == MotionEvent.ACTION_CANCEL) {
+                view.animate().scaleX(1f).scaleY(1f).setDuration(150).setInterpolator(EASE).start();
+            }
             return false;
         });
     }
@@ -271,8 +357,18 @@ public final class MainActivity extends Activity implements StreamState.Listener
         return t;
     }
 
+    private LinearLayout vertical() {
+        LinearLayout l = new LinearLayout(this);
+        l.setOrientation(LinearLayout.VERTICAL);
+        return l;
+    }
+
     private static LinearLayout.LayoutParams fullWidth() {
         return new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+    }
+
+    private static LinearLayout.LayoutParams weighted() {
+        return new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1);
     }
 
     private ImageView icon(int res, int tint, int sizeDp) {
@@ -283,31 +379,56 @@ public final class MainActivity extends Activity implements StreamState.Listener
         return i;
     }
 
+    /** Sections slide open and shut, and their contents fade, instead of jumping. */
+    private LayoutTransition smooth() {
+        LayoutTransition lt = new LayoutTransition();
+        lt.enableTransitionType(LayoutTransition.CHANGING);
+        for (int type : new int[] {LayoutTransition.CHANGING, LayoutTransition.CHANGE_APPEARING,
+                LayoutTransition.CHANGE_DISAPPEARING, LayoutTransition.APPEARING, LayoutTransition.DISAPPEARING}) {
+            lt.setInterpolator(type, EASE);
+        }
+        lt.setDuration(LayoutTransition.CHANGING, 240);
+        lt.setDuration(LayoutTransition.CHANGE_APPEARING, 240);
+        lt.setDuration(LayoutTransition.CHANGE_DISAPPEARING, 240);
+        lt.setDuration(LayoutTransition.APPEARING, 200);
+        lt.setDuration(LayoutTransition.DISAPPEARING, 120);
+        lt.setStartDelay(LayoutTransition.APPEARING, 80);
+        lt.setStartDelay(LayoutTransition.CHANGE_DISAPPEARING, 0);
+        return lt;
+    }
+
+    private void showKeyboard(View v) {
+        InputMethodManager imm = getSystemService(InputMethodManager.class);
+        if (imm != null) imm.showSoftInput(v, InputMethodManager.SHOW_IMPLICIT);
+    }
+
+    private void hideKeyboard() {
+        View f = getCurrentFocus();
+        if (f != null) f.clearFocus();
+        InputMethodManager imm = getSystemService(InputMethodManager.class);
+        if (imm != null) imm.hideSoftInputFromWindow(getWindow().getDecorView().getWindowToken(), 0);
+    }
+
     /** M3 list subheader followed by a grouped container; returns the container. */
     private LinearLayout section(LinearLayout parent, String heading) {
         TextView h = text(heading, 14, primary, true);
-        h.setPadding(dp(16), dp(24), dp(16), dp(8));
+        h.setPadding(dp(16), dp(28), dp(16), dp(8));
         parent.addView(h);
-        LinearLayout c = new LinearLayout(this);
-        c.setOrientation(LinearLayout.VERTICAL);
+        LinearLayout c = vertical();
         c.setBackground(shape(surfaceLow, 24));
         c.setClipToOutline(true);
-        c.setPadding(0, dp(8), 0, dp(8));
+        c.setPadding(0, dp(4), 0, dp(4));
         parent.addView(c, fullWidth());
         return c;
     }
 
-    /** M3 filled text field: tonal box, floating label, active indicator line. */
-    private EditText filledField(LinearLayout parent, String label, String hint, int inputType, String support) {
-        LinearLayout box = new LinearLayout(this);
-        box.setOrientation(LinearLayout.VERTICAL);
-        GradientDrawable bg = new GradientDrawable();
-        bg.setColor(surfaceHighest);
-        float r = dp(4);
-        bg.setCornerRadii(new float[] {r, r, r, r, 0, 0, 0, 0});
+    /** Filled text field: tonal box with a label; a primary outline while focused. */
+    private EditText field(LinearLayout parent, String label, String hint, int inputType) {
+        LinearLayout box = vertical();
+        GradientDrawable bg = shape(surfaceHighest, 12);
         box.setBackground(bg);
-        TextView l = text(label, 12, onSurfaceVariant, false);
-        l.setPadding(dp(16), dp(8), dp(16), 0);
+        box.setPadding(dp(16), dp(10), dp(16), dp(4));
+        TextView l = text(label, 12, onSurfaceVariant, true);
         box.addView(l);
         EditText e = new EditText(this);
         e.setHint(hint);
@@ -315,92 +436,115 @@ public final class MainActivity extends Activity implements StreamState.Listener
         e.setSingleLine(true);
         e.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
         e.setTextColor(onSurface);
-        e.setHintTextColor(alpha(onSurfaceVariant, 0.6f));
+        e.setHintTextColor(alpha(onSurfaceVariant, 0.7f));
         e.setBackground(null);
-        e.setPadding(dp(16), dp(2), dp(16), dp(8));
+        e.setPadding(0, dp(2), 0, dp(8));
         box.addView(e, fullWidth());
-        View line = new View(this);
-        line.setBackgroundColor(onSurfaceVariant);
-        box.addView(line, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(1)));
         e.setOnFocusChangeListener((v, focused) -> {
-            line.setBackgroundColor(focused ? primary : onSurfaceVariant);
-            line.getLayoutParams().height = dp(focused ? 2 : 1);
-            line.requestLayout();
+            bg.setStroke(focused ? dp(2) : 0, primary);
             l.setTextColor(focused ? primary : onSurfaceVariant);
         });
-        box.setOnClickListener(v -> e.requestFocus());
+        box.setOnClickListener(v -> { e.requestFocus(); showKeyboard(e); });
         LinearLayout.LayoutParams lp = fullWidth();
-        lp.leftMargin = lp.rightMargin = dp(16);
-        lp.topMargin = dp(8);
+        lp.setMargins(dp(12), dp(8), dp(12), dp(4));
         parent.addView(box, lp);
-        if (support != null) {
-            TextView s = text(support, 12, onSurfaceVariant, false);
-            s.setPadding(dp(32), dp(4), dp(32), dp(4));
-            parent.addView(s);
-        }
         return e;
     }
 
-    private Switch switchRow(LinearLayout parent, String title, String sub, boolean value) {
+    /** List row: leading icon, title, optional supporting text (kept in the row's tag), trailing view. */
+    private LinearLayout listRow(LinearLayout parent, int iconRes, String title, String sub, View trailing) {
         LinearLayout row = new LinearLayout(this);
-        row.setOrientation(LinearLayout.HORIZONTAL);
         row.setGravity(Gravity.CENTER_VERTICAL);
-        row.setMinimumHeight(dp(72));
-        row.setPadding(dp(16), dp(12), dp(16), dp(12));
+        row.setMinimumHeight(dp(64));
+        row.setPadding(dp(16), dp(10), dp(16), dp(10));
         row.setBackground(pressable(null, onSurface, 0));
-        LinearLayout texts = new LinearLayout(this);
-        texts.setOrientation(LinearLayout.VERTICAL);
+        ImageView i = new ImageView(this);
+        i.setImageResource(iconRes);
+        i.setImageTintList(ColorStateList.valueOf(onSurfaceVariant));
+        LinearLayout.LayoutParams ilp = new LinearLayout.LayoutParams(dp(24), dp(24));
+        ilp.setMarginEnd(dp(16));
+        row.addView(i, ilp);
+        LinearLayout texts = vertical();
         texts.addView(text(title, 16, onSurface, false));
-        TextView s = text(sub, 14, onSurfaceVariant, false);
-        s.setPadding(0, dp(2), dp(16), 0);
+        TextView s = text(sub, 13, onSurfaceVariant, false);
+        s.setPadding(0, dp(1), dp(8), 0);
+        s.setVisibility(sub.isEmpty() ? View.GONE : View.VISIBLE);
         texts.addView(s);
-        row.addView(texts, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+        row.setTag(s);
+        row.addView(texts, weighted());
+        if (trailing != null) row.addView(trailing);
+        parent.addView(row, fullWidth());
+        return row;
+    }
+
+    private Switch switchRow(LinearLayout parent, int iconRes, String title, String sub, boolean value) {
         Switch sw = new Switch(this);
         sw.setChecked(value);
         sw.setContentDescription(title);
         int[][] states = {{android.R.attr.state_checked}, {}};
         sw.setThumbTintList(new ColorStateList(states, new int[] {primary, outline}));
         sw.setTrackTintList(new ColorStateList(states, new int[] {alpha(primary, 0.5f), outlineVariant}));
-        row.addView(sw);
-        row.setOnClickListener(v -> { if (sw.isEnabled()) sw.toggle(); });
-        parent.addView(row, fullWidth());
+        LinearLayout row = listRow(parent, iconRes, title, sub, sw);
+        row.setOnClickListener(v -> sw.toggle());
         return sw;
     }
 
-    /** Row that opens Accessibility settings so the volume buttons can drive the laptop. */
-    private void volumeKeysRow(LinearLayout parent) {
-        LinearLayout row = new LinearLayout(this);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-        row.setGravity(Gravity.CENTER_VERTICAL);
-        row.setMinimumHeight(dp(72));
-        row.setPadding(dp(16), dp(12), dp(16), dp(12));
-        row.setBackground(pressable(null, onSurface, 0));
-        LinearLayout texts = new LinearLayout(this);
-        texts.setOrientation(LinearLayout.VERTICAL);
-        texts.addView(text("Volume buttons control the laptop", 16, onSurface, false));
-        keysSub = text("", 14, onSurfaceVariant, false);
-        keysSub.setPadding(0, dp(2), dp(16), 0);
-        texts.addView(keysSub);
-        row.addView(texts, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
-        keysAction = text("", 14, primary, true);
-        row.addView(keysAction);
-        row.setOnClickListener(v -> {
-            try {
-                startActivity(new Intent(android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS));
-            } catch (RuntimeException ignored) {}
-        });
-        parent.addView(row, fullWidth());
+    /** Full-width 56dp button with a leading icon; colors are set per state by stylePill. */
+    private Pill pill() {
+        Pill p = new Pill();
+        p.view = new LinearLayout(this);
+        p.view.setGravity(Gravity.CENTER);
+        p.view.setClickable(true);
+        p.view.setFocusable(true);
+        p.icon = new ImageView(this);
+        LinearLayout.LayoutParams ilp = new LinearLayout.LayoutParams(dp(20), dp(20));
+        ilp.setMarginEnd(dp(8));
+        p.view.addView(p.icon, ilp);
+        p.label = text("", 16, onPrimary, true);
+        p.view.addView(p.label);
+        pressScale(p.view);
+        return p;
+    }
+
+    private void stylePill(Pill p, int iconRes, String label, int bg, int fg) {
+        p.icon.setImageResource(iconRes);
+        p.icon.setImageTintList(ColorStateList.valueOf(fg));
+        p.label.setText(label);
+        p.label.setTextColor(fg);
+        p.view.setBackground(pressable(shape(bg, 16), fg, 16));
+    }
+
+    /** Thick rounded track and a ringed thumb, in the streaming card's colors. */
+    private void styleSlider(SeekBar b) {
+        GradientDrawable track = shape(alpha(onPrimaryContainer, 0.16f), 4);
+        ClipDrawable fill = new ClipDrawable(shape(primary, 4), Gravity.START, ClipDrawable.HORIZONTAL);
+        LayerDrawable ld = new LayerDrawable(new Drawable[] {track, fill});
+        ld.setId(0, android.R.id.background);
+        ld.setId(1, android.R.id.progress);
+        b.setProgressDrawable(ld);
+        b.setMinHeight(dp(8));
+        b.setMaxHeight(dp(8));
+        GradientDrawable thumb = new GradientDrawable();
+        thumb.setShape(GradientDrawable.OVAL);
+        thumb.setColor(primary);
+        thumb.setStroke(dp(3), primaryContainer);
+        thumb.setSize(dp(24), dp(24));
+        b.setThumb(thumb);
+        b.setSplitTrack(false);
+        b.setBackground(null);
+        b.setPadding(dp(14), 0, dp(14), 0);
     }
 
     private void renderVolumeKeys() {
         if (keysSub == null) return;
         boolean on = VolumeKeyService.enabled(this);
-        keysSub.setText(on
-                ? "On. While the phone is silenced, its volume buttons change the laptop and the phone stays quiet."
-                : "In Accessibility, open Dhvani volume buttons and turn it on. If it is greyed out: App info, "
-                        + "⋮ menu, Allow restricted settings. Until then a press may be heard on the phone for a moment.");
-        keysAction.setText(on ? "On" : "Set up");
-        keysAction.setTextColor(on ? onSurfaceVariant : primary);
+        keysSub.setText(on ? "On while this phone is silenced"
+                : Build.VERSION.SDK_INT >= 33
+                        ? "Tap to turn on in Accessibility. Greyed out? App info › ⋮ › Allow restricted settings"
+                        : "Tap to turn on in Accessibility");
+        keysSub.setVisibility(View.VISIBLE);
+        keysTrail.setImageResource(on ? R.drawable.ic_check : R.drawable.ic_chevron);
+        keysTrail.setImageTintList(ColorStateList.valueOf(on ? primary : onSurfaceVariant));
     }
 
     // ---------- Screen ----------
@@ -409,9 +553,9 @@ public final class MainActivity extends Activity implements StreamState.Listener
         ScrollView scroll = new ScrollView(this);
         scroll.setBackgroundColor(surface);
         scroll.setFillViewport(true);
-        LinearLayout root = new LinearLayout(this);
-        root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(dp(16), dp(8), dp(16), dp(32));
+        LinearLayout root = vertical();
+        root.setPadding(dp(16), dp(8), dp(16), dp(24));
+        root.setLayoutTransition(smooth());
         scroll.addView(root);
         scroll.setOnApplyWindowInsetsListener((v, insets) -> {
             if (Build.VERSION.SDK_INT >= 30) {
@@ -424,88 +568,67 @@ public final class MainActivity extends Activity implements StreamState.Listener
             return insets.consumeSystemWindowInsets();
         });
 
-        // Top app bar (medium): title + supporting line
-        TextView title = text("Dhvani", 28, onSurface, false);
-        title.setPadding(dp(8), dp(24), dp(8), 0);
+        TextView title = text("Dhvani", 22, onSurface, true);
+        title.setPadding(dp(8), dp(20), dp(8), dp(16));
         root.addView(title);
-        TextView sub = text("Phone audio on your laptop", 14, onSurfaceVariant, false);
-        sub.setPadding(dp(8), dp(2), dp(8), dp(16));
-        root.addView(sub);
 
-        // Status hero
-        hero = new LinearLayout(this);
-        hero.setOrientation(LinearLayout.VERTICAL);
-        hero.setPadding(dp(20), dp(20), dp(20), dp(20));
+        // ---- Status card: everything about the current stream ----
+        LinearLayout hero = vertical();
+        hero.setPadding(dp(16), dp(16), dp(16), dp(16));
+        heroBg = shape(surfaceMid, 32);
+        hero.setBackground(heroBg);
+        hero.setLayoutTransition(smooth());
         root.addView(hero, fullWidth());
+
         LinearLayout top = new LinearLayout(this);
         top.setGravity(Gravity.CENTER_VERTICAL);
+        top.setPadding(dp(4), dp(4), dp(4), dp(4));
         heroAvatar = new FrameLayout(this);
-        heroIcon = icon(R.drawable.ic_phone, onSurfaceVariant, 26);
+        heroIcon = icon(R.drawable.ic_phone, onSurfaceVariant, 24);
         heroAvatar.addView(heroIcon);
+        heroBars = new Bars(this);
+        heroBars.setVisibility(View.GONE);
+        heroAvatar.addView(heroBars, new FrameLayout.LayoutParams(dp(32), dp(32), Gravity.CENTER));
         LinearLayout.LayoutParams alp = new LinearLayout.LayoutParams(dp(52), dp(52));
-        alp.rightMargin = dp(16);
+        alp.setMarginEnd(dp(16));
         top.addView(heroAvatar, alp);
-        LinearLayout texts = new LinearLayout(this);
-        texts.setOrientation(LinearLayout.VERTICAL);
+        LinearLayout texts = vertical();
+        heroOverline = text("", 12, onSurfaceVariant, true);
+        heroOverline.setLetterSpacing(0.04f);
         heroTitle = text("", 22, onSurface, false);
+        heroTitle.setMaxLines(2);
+        heroTitle.setEllipsize(TextUtils.TruncateAt.END);
         heroDetail = text("", 14, onSurfaceVariant, false);
         heroDetail.setPadding(0, dp(2), 0, 0);
+        texts.addView(heroOverline);
         texts.addView(heroTitle);
         texts.addView(heroDetail);
-        top.addView(texts, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
-        hero.addView(top);
+        top.addView(texts, weighted());
+        hero.addView(top, fullWidth());
+
         heroProgress = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
         heroProgress.setIndeterminate(true);
         LinearLayout.LayoutParams plp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(4));
-        plp.topMargin = dp(18);
+        plp.setMargins(dp(4), dp(16), dp(4), 0);
         hero.addView(heroProgress, plp);
-        notice = text("", 14, onWarningContainer, false);
-        notice.setBackground(shape(warningContainer, 12));
-        notice.setPadding(dp(14), dp(10), dp(14), dp(10));
-        LinearLayout.LayoutParams nlp = fullWidth();
-        nlp.topMargin = dp(16);
-        hero.addView(notice, nlp);
-        startButton = new Button(this);
-        startButton.setAllCaps(false);
-        startButton.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
-        startButton.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
-        startButton.setStateListAnimator(null);
-        startButton.setOnClickListener(v -> onStartStop());
-        pressScale(startButton);
-        LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(56));
-        blp.topMargin = dp(20);
-        hero.addView(startButton, blp);
 
-        // Laptop volume, while streaming
-        volumeCard = new LinearLayout(this);
-        volumeCard.setOrientation(LinearLayout.VERTICAL);
-        volumeCard.setBackground(shape(surfaceLow, 24));
-        volumeCard.setPadding(dp(20), dp(16), dp(12), dp(12));
-        LinearLayout.LayoutParams vclp = fullWidth();
-        vclp.topMargin = dp(12);
-        root.addView(volumeCard, vclp);
-        LinearLayout vhead = new LinearLayout(this);
-        vhead.setGravity(Gravity.CENTER_VERTICAL);
-        vhead.addView(text("Laptop volume", 16, onSurface, false),
-                new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
-        volumeValue = text("", 14, onSurfaceVariant, false);
-        volumeValue.setFontFeatureSettings("tnum");
-        vhead.addView(volumeValue);
-        muteButton = new Button(this);
-        muteButton.setAllCaps(false);
-        muteButton.setStateListAnimator(null);
-        muteButton.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        // Laptop volume: mute toggle, slider, value
+        volumeRow = new LinearLayout(this);
+        volumeRow.setGravity(Gravity.CENTER_VERTICAL);
+        muteButton = new FrameLayout(this);
+        muteButton.setClickable(true);
+        muteButton.setFocusable(true);
+        muteOn = icon(R.drawable.ic_volume, onPrimaryContainer, 22);
+        muteOff = icon(R.drawable.ic_volume_off, onPrimaryContainer, 22);
+        muteButton.addView(muteOn);
+        muteButton.addView(muteOff);
         muteButton.setOnClickListener(v -> sendControl(null, !StreamState.laptopMuted));
-        LinearLayout.LayoutParams mlp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(40));
-        mlp.leftMargin = dp(12);
-        vhead.addView(muteButton, mlp);
-        volumeCard.addView(vhead);
+        pressScale(muteButton);
+        volumeRow.addView(muteButton, new LinearLayout.LayoutParams(dp(48), dp(48)));
         volumeBar = new SeekBar(this);
         volumeBar.setMax(150);
         volumeBar.setContentDescription("Laptop volume");
-        volumeBar.setProgressTintList(ColorStateList.valueOf(primary));
-        volumeBar.setThumbTintList(ColorStateList.valueOf(primary));
-        volumeBar.setProgressBackgroundTintList(ColorStateList.valueOf(outlineVariant));
+        styleSlider(volumeBar);
         volumeBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
             @Override public void onProgressChanged(SeekBar b, int p, boolean user) {
                 if (!user) return;
@@ -522,151 +645,288 @@ public final class MainActivity extends Activity implements StreamState.Listener
                 sendControl(b.getProgress() / 100f, null);
             }
         });
-        LinearLayout.LayoutParams vblp = fullWidth();
-        vblp.topMargin = dp(8);
-        volumeCard.addView(volumeBar, vblp);
-        TextView vnote = text("Changes the laptop's own output. While the phone is silenced, its volume buttons do too.",
-                12, onSurfaceVariant, false);
-        vnote.setPadding(0, dp(4), dp(8), 0);
-        volumeCard.addView(vnote);
+        volumeRow.addView(volumeBar, new LinearLayout.LayoutParams(0, dp(48), 1));
+        volumeValue = text("", 14, onPrimaryContainer, true);
+        volumeValue.setFontFeatureSettings("tnum");
+        volumeValue.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
+        volumeRow.addView(volumeValue, new LinearLayout.LayoutParams(dp(52), ViewGroup.LayoutParams.WRAP_CONTENT));
+        LinearLayout.LayoutParams vrlp = fullWidth();
+        vrlp.topMargin = dp(16);
+        hero.addView(volumeRow, vrlp);
 
-        // Laptop
-        LinearLayout lap = section(root, "Laptop");
-        LinearLayout searchRow = new LinearLayout(this);
+        // Notice: a problem with the stream, or a Wi-Fi tip
+        noticeBox = new LinearLayout(this);
+        noticeBox.setGravity(Gravity.CENTER_VERTICAL);
+        noticeBox.setPadding(dp(12), dp(12), dp(16), dp(12));
+        noticeBox.setBackground(shape(warningContainer, 16));
+        noticeIcon = new ImageView(this);
+        noticeIcon.setImageTintList(ColorStateList.valueOf(onWarningContainer));
+        LinearLayout.LayoutParams nilp = new LinearLayout.LayoutParams(dp(20), dp(20));
+        nilp.setMarginEnd(dp(12));
+        noticeBox.addView(noticeIcon, nilp);
+        notice = text("", 14, onWarningContainer, false);
+        noticeBox.addView(notice, weighted());
+        LinearLayout.LayoutParams nlp = fullWidth();
+        nlp.topMargin = dp(16);
+        hero.addView(noticeBox, nlp);
+
+        actionButton = pill();
+        actionButton.view.setOnClickListener(v -> onStartStop());
+        LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(56));
+        blp.topMargin = dp(16);
+        hero.addView(actionButton.view, blp);
+
+        // ---- Setup: hidden while connecting or streaming ----
+        setup = vertical();
+        setup.setLayoutTransition(smooth());
+        root.addView(setup, fullWidth());
+
+        LinearLayout lap = section(setup, "Laptop");
+        lap.setLayoutTransition(smooth());
+        searchRow = new LinearLayout(this);
         searchRow.setGravity(Gravity.CENTER_VERTICAL);
-        searchRow.setPadding(dp(16), dp(8), dp(16), dp(8));
-        searchSpinner = new ProgressBar(this, null, android.R.attr.progressBarStyleSmall);
-        searchSpinner.setIndeterminateTintList(ColorStateList.valueOf(primary));
-        LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(dp(18), dp(18));
-        slp.rightMargin = dp(12);
-        searchRow.addView(searchSpinner, slp);
-        searching = text("", 14, onSurfaceVariant, false);
-        searchRow.addView(searching, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
-        lap.addView(searchRow);
-        laptopList = new LinearLayout(this);
-        laptopList.setOrientation(LinearLayout.VERTICAL);
+        searchRow.setPadding(dp(16), dp(14), dp(16), dp(14));
+        ProgressBar spinner = new ProgressBar(this, null, android.R.attr.progressBarStyleSmall);
+        spinner.setIndeterminateTintList(ColorStateList.valueOf(primary));
+        LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(dp(20), dp(20));
+        slp.setMarginEnd(dp(16));
+        searchRow.addView(spinner, slp);
+        searchRow.addView(text("Looking for laptops on this Wi-Fi…", 14, onSurfaceVariant, false), weighted());
+        lap.addView(searchRow, fullWidth());
+        laptopList = vertical();
         laptopList.setPadding(dp(8), 0, dp(8), 0);
         lap.addView(laptopList, fullWidth());
-        fieldsDivider = new View(this);
-        fieldsDivider.setBackgroundColor(outlineVariant);
-        LinearLayout.LayoutParams dlp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(1));
-        dlp.setMargins(dp(16), dp(8), dp(16), dp(8));
-        lap.addView(fieldsDivider, dlp);
-        addressField = filledField(lap, "Address", "192.168.1.20",
-                InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI, null);
+        manualRow = listRow(lap, R.drawable.ic_edit, "Enter address", "", null);
+        manualRow.setOnClickListener(v -> {
+            manualOpen = true;
+            renderLaptops();
+            addressField.requestFocus();
+            showKeyboard(addressField);
+        });
+        addressField = field(lap, "Address", "192.168.1.20",
+                InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
         addressField.setText(prefs.getString("host", ""));
-        codeField = filledField(lap, "Pairing code", "000000", InputType.TYPE_CLASS_NUMBER,
-                "Shown in Dhvani on the laptop");
+        addressBox = (LinearLayout) addressField.getParent();
+        codeField = field(lap, "Pairing code", "6 digits from the laptop panel", InputType.TYPE_CLASS_NUMBER);
         codeField.setFilters(new InputFilter[] {new InputFilter.LengthFilter(6)});
-        codeField.setTypeface(Typeface.MONOSPACE);
-        codeField.setTextSize(TypedValue.COMPLEX_UNIT_SP, 24);
-        codeField.setLetterSpacing(0.3f);
         codeField.setImeOptions(EditorInfo.IME_ACTION_DONE);
+        codeField.setFontFeatureSettings("tnum");
         codeField.setText(prefs.getString("code", ""));
+        ((LinearLayout.LayoutParams) ((View) codeField.getParent()).getLayoutParams()).bottomMargin = dp(12);
+        styleCode();
 
-        // Options
-        LinearLayout opts = section(root, "Options");
-        silenceSwitch = switchRow(opts, "Silence this phone",
-                "Mutes the phone speaker while the laptop plays. Restored when you stop.",
-                prefs.getBoolean("silence", true));
-        volumeKeysRow(opts);
-        reconnectSwitch = switchRow(opts, "Reconnect automatically",
-                "Keeps trying if Wi-Fi drops or the laptop restarts.",
-                prefs.getBoolean("reconnect", true));
-        autoSwitch = switchRow(opts, "Start when opened",
-                "Opening Dhvani connects to the saved laptop. Android still asks to allow sharing.",
-                prefs.getBoolean("autoConnect", false));
+        LinearLayout opts = section(setup, "Options");
+        silenceSwitch = switchRow(opts, R.drawable.ic_phone_quiet, "Silence this phone",
+                "Mute its speaker while the laptop plays", prefs.getBoolean("silence", true));
+        keysTrail = new ImageView(this);
+        keysTrail.setLayoutParams(new LinearLayout.LayoutParams(dp(20), dp(20)));
+        LinearLayout keysRow = listRow(opts, R.drawable.ic_keys, "Volume buttons control the laptop", "", keysTrail);
+        keysSub = (TextView) keysRow.getTag();
+        keysRow.setOnClickListener(v -> {
+            try {
+                startActivity(new Intent(android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS));
+            } catch (RuntimeException ignored) {}
+        });
+        reconnectSwitch = switchRow(opts, R.drawable.ic_retry_auto, "Reconnect automatically",
+                "If Wi-Fi drops or the laptop restarts", prefs.getBoolean("reconnect", true));
+        autoSwitch = switchRow(opts, R.drawable.ic_bolt, "Start when opened",
+                "Connect to the saved laptop on launch", prefs.getBoolean("autoConnect", false));
 
-        TextView foot = text("Only playback audio is shared, never the microphone or the screen. "
-                + "Apps that block capture (some banking and DRM video apps) stay silent.", 12, onSurfaceVariant, false);
-        foot.setPadding(dp(16), dp(16), dp(16), 0);
-        root.addView(foot);
+        LinearLayout foot = new LinearLayout(this);
+        foot.setGravity(Gravity.CENTER_VERTICAL);
+        foot.setPadding(dp(16), dp(20), dp(16), 0);
+        ImageView lock = new ImageView(this);
+        lock.setImageResource(R.drawable.ic_lock);
+        lock.setImageTintList(ColorStateList.valueOf(onSurfaceVariant));
+        LinearLayout.LayoutParams lklp = new LinearLayout.LayoutParams(dp(16), dp(16));
+        lklp.setMarginEnd(dp(8));
+        foot.addView(lock, lklp);
+        foot.addView(text("Only playback audio is shared, never the mic or screen.", 12, onSurfaceVariant, false), weighted());
+        setup.addView(foot, fullWidth());
+
+        android.text.TextWatcher refresh = new android.text.TextWatcher() {
+            @Override public void beforeTextChanged(CharSequence s, int a, int b, int c) {}
+            @Override public void onTextChanged(CharSequence s, int a, int b, int c) {}
+            @Override public void afterTextChanged(android.text.Editable s) {
+                styleCode();
+                if (!StreamState.active()) onState();
+            }
+        };
+        addressField.addTextChangedListener(refresh);
+        codeField.addTextChangedListener(refresh);
         renderLaptops();
         return scroll;
     }
 
+    /** Digits spaced like a code once typed; the hint stays plain text. */
+    private void styleCode() {
+        boolean empty = codeField.getText().length() == 0;
+        codeField.setTextSize(TypedValue.COMPLEX_UNIT_SP, empty ? 16 : 22);
+        codeField.setLetterSpacing(empty ? 0f : 0.3f);
+    }
+
+    /** The name of the laptop at this address, if discovery has seen it. */
+    private String laptopName(String addr) {
+        synchronized (laptops) {
+            for (Laptop l : laptops.values()) if (address(l).equals(addr)) return l.name;
+        }
+        return addr;
+    }
+
+    private static String address(Laptop l) {
+        return l.port == Protocol.AUDIO_PORT ? l.ip : l.ip + ":" + l.port;
+    }
+
+    private String idleHint() {
+        String addr = addressField.getText().toString().trim();
+        if (addr.isEmpty()) return "Pick your laptop below.";
+        if (!codeField.getText().toString().trim().matches("\\d{6}")) return "Enter the pairing code below.";
+        return "Ready for " + laptopName(addr) + ".";
+    }
+
+    private boolean heroColorSet;
+    private int heroShown;
+
+    /** Cross-fades the card's color between states. */
+    private void fadeHero(int to) {
+        if (heroColorSet && heroFade == null && heroShown == to) return;
+        if (heroFade != null) heroFade.cancel();
+        heroFade = null;
+        if (!heroColorSet) {
+            heroColorSet = true;
+            heroShown = to;
+            heroBg.setColor(to);
+            return;
+        }
+        if (heroShown == to) return;
+        ValueAnimator a = ValueAnimator.ofArgb(heroShown, to);
+        a.setDuration(250);
+        a.setInterpolator(EASE);
+        a.addUpdateListener(v -> {
+            heroShown = (int) v.getAnimatedValue();
+            heroBg.setColor(heroShown);
+        });
+        a.addListener(new android.animation.AnimatorListenerAdapter() {
+            @Override public void onAnimationEnd(android.animation.Animator x) {
+                if (heroFade == a) heroFade = null;
+            }
+        });
+        heroFade = a;
+        a.start();
+    }
+
     @Override public void onState() {
         StreamState.Status s = StreamState.status;
-        String title, detail = StreamState.detail;
-        int bg, fg, fgVariant, avatarBg, avatarFg, iconRes;
-        String action;
+        boolean active = StreamState.active();
+        boolean streaming = s == StreamState.Status.STREAMING;
+        String overline = "", title, detail = StreamState.detail, action;
+        int bg, fg, fgVariant, avatarBg, avatarFg, iconRes, actionIcon, actionBg, actionFg;
         switch (s) {
             case STREAMING:
-                bg = primaryContainer; fg = onPrimaryContainer; fgVariant = onPrimaryContainer;
+                bg = primaryContainer; fg = onPrimaryContainer; fgVariant = alpha(onPrimaryContainer, 0.75f);
                 avatarBg = primary; avatarFg = onPrimary; iconRes = R.drawable.ic_notify;
-                title = "Playing on " + detail; detail = "Sound from this phone now plays on the laptop.";
-                action = "Stop";
+                overline = "Playing on";
+                title = detail.isEmpty() ? "your laptop" : detail;
+                detail = "";
+                action = "Stop"; actionIcon = R.drawable.ic_stop;
+                actionBg = alpha(onPrimaryContainer, 0.1f); actionFg = onPrimaryContainer;
                 break;
             case CONNECTING:
             case RECONNECTING:
-                bg = secondaryContainer; fg = onSecondaryContainer; fgVariant = onSecondaryContainer;
-                avatarBg = surfaceLow; avatarFg = primary; iconRes = R.drawable.ic_laptop;
+                bg = secondaryContainer; fg = onSecondaryContainer; fgVariant = alpha(onSecondaryContainer, 0.75f);
+                avatarBg = alpha(onSecondaryContainer, 0.1f); avatarFg = onSecondaryContainer;
+                iconRes = R.drawable.ic_laptop;
                 title = s == StreamState.Status.CONNECTING ? "Connecting…" : "Reconnecting…";
-                action = "Cancel";
+                action = "Cancel"; actionIcon = R.drawable.ic_close;
+                actionBg = alpha(onSecondaryContainer, 0.1f); actionFg = onSecondaryContainer;
                 break;
             case ERROR:
-                bg = errorContainer; fg = onErrorContainer; fgVariant = onErrorContainer;
+                bg = errorContainer; fg = onErrorContainer; fgVariant = alpha(onErrorContainer, 0.85f);
                 avatarBg = error; avatarFg = onError; iconRes = R.drawable.ic_error;
                 title = "Stopped";
-                action = "Try again";
+                action = "Try again"; actionIcon = R.drawable.ic_retry;
+                actionBg = primary; actionFg = onPrimary;
                 break;
             default:
                 bg = surfaceMid; fg = onSurface; fgVariant = onSurfaceVariant;
                 avatarBg = surfaceHighest; avatarFg = onSurfaceVariant; iconRes = R.drawable.ic_phone;
                 title = "Not streaming";
-                if (detail.isEmpty()) detail = "Pick your laptop, enter the code and tap Start.";
-                action = "Start streaming";
+                if (detail.isEmpty()) detail = idleHint();
+                action = "Start streaming"; actionIcon = R.drawable.ic_play;
+                actionBg = primary; actionFg = onPrimary;
                 break;
         }
-        hero.setBackground(shape(bg, 28));
+        fadeHero(bg);
         heroAvatar.setBackground(shape(avatarBg, 16));
         heroIcon.setImageResource(iconRes);
         heroIcon.setImageTintList(ColorStateList.valueOf(avatarFg));
+        heroIcon.setVisibility(streaming ? View.GONE : View.VISIBLE);
+        heroBars.setVisibility(streaming ? View.VISIBLE : View.GONE);
+        heroBars.setColor(avatarFg);
+        heroBars.play(streaming);
+        heroOverline.setText(overline);
+        heroOverline.setTextColor(fgVariant);
+        heroOverline.setVisibility(overline.isEmpty() ? View.GONE : View.VISIBLE);
         heroTitle.setText(title);
         heroTitle.setTextColor(fg);
         heroDetail.setText(detail);
         heroDetail.setTextColor(fgVariant);
         heroDetail.setVisibility(detail.isEmpty() ? View.GONE : View.VISIBLE);
-        heroProgress.setVisibility(s == StreamState.Status.CONNECTING || s == StreamState.Status.RECONNECTING
-                ? View.VISIBLE : View.GONE);
-        heroProgress.setIndeterminateTintList(ColorStateList.valueOf(primary));
-        String n = StreamState.notice;
-        if (n.isEmpty() && s == StreamState.Status.STREAMING) n = StreamState.wifiTip;
-        notice.setText(n);
-        notice.setVisibility(n.isEmpty() ? View.GONE : View.VISIBLE);
+        heroProgress.setVisibility(active && !streaming ? View.VISIBLE : View.GONE);
+        heroProgress.setIndeterminateTintList(ColorStateList.valueOf(fg));
 
-        boolean active = StreamState.active();
-        startButton.setText(action);
-        if (active) {
-            // Outlined button in the hero's content color.
-            GradientDrawable o = shape(Color.TRANSPARENT, 28);
-            o.setStroke(dp(1), alpha(fg, 0.6f));
-            startButton.setBackground(pressable(o, fg, 28));
-            startButton.setTextColor(fg);
-        } else {
-            startButton.setBackground(pressable(shape(primary, 28), onPrimary, 28));
-            startButton.setTextColor(onPrimary);
+        String n = StreamState.notice;
+        boolean wifi = false;
+        if (n.isEmpty() && streaming) { n = StreamState.wifiTip; wifi = true; }
+        notice.setText(n);
+        noticeIcon.setImageResource(wifi ? R.drawable.ic_wifi : R.drawable.ic_alert);
+        noticeBox.setVisibility(n.isEmpty() ? View.GONE : View.VISIBLE);
+
+        stylePill(actionButton, actionIcon, action, actionBg, actionFg);
+
+        boolean showVolume = streaming && StreamState.laptopVolume >= 0;
+        volumeRow.setVisibility(showVolume ? View.VISIBLE : View.GONE);
+        if (showVolume) renderVolume();
+
+        if (active && setup.getVisibility() == View.VISIBLE) hideKeyboard();
+        setup.setVisibility(active ? View.GONE : View.VISIBLE);
+    }
+
+    private void renderVolume() {
+        int pct = (int) Math.round(StreamState.laptopVolume * 100);
+        boolean muted = StreamState.laptopMuted;
+        if (!draggingVolume) {
+            volumeBar.setProgress(pct);
+            volumeValue.setText(muted ? "Muted" : pct + "%");
         }
-        boolean showVolume = s == StreamState.Status.STREAMING && StreamState.laptopVolume >= 0;
-        volumeCard.setVisibility(showVolume ? View.VISIBLE : View.GONE);
-        if (showVolume) {
-            int pct = (int) Math.round(StreamState.laptopVolume * 100);
-            boolean muted = StreamState.laptopMuted;
-            if (!draggingVolume) {
-                volumeBar.setProgress(pct);
-                volumeValue.setText(muted ? "Muted" : pct + "%");
-            }
-            volumeBar.setAlpha(muted ? 0.5f : 1f);
-            muteButton.setText(muted ? "Unmute" : "Mute");
-            muteButton.setTextColor(muted ? onPrimary : onSecondaryContainer);
-            muteButton.setBackground(pressable(shape(muted ? primary : secondaryContainer, 20),
-                    muted ? onPrimary : onSecondaryContainer, 20));
-        }
-        for (View v : new View[] {addressField, codeField, silenceSwitch, reconnectSwitch, autoSwitch}) {
-            v.setEnabled(!active);
-            ((View) v.getParent()).setAlpha(active ? 0.38f : 1f);
+        volumeBar.setAlpha(muted ? 0.45f : 1f);
+        // Muted reads as "on": a filled circle, like a pressed toggle.
+        int fill = muted ? onPrimaryContainer : alpha(onPrimaryContainer, 0.1f);
+        int ink = muted ? primaryContainer : onPrimaryContainer;
+        muteButton.setBackground(pressable(shape(fill, 24), ink, 24));
+        muteOn.setImageTintList(ColorStateList.valueOf(ink));
+        muteOff.setImageTintList(ColorStateList.valueOf(ink));
+        muteButton.setContentDescription(muted ? "Unmute" : "Mute");
+        if (shownMuted == null || shownMuted != muted) {
+            swapIcon(muted ? muteOff : muteOn, muted ? muteOn : muteOff, shownMuted != null);
+            shownMuted = muted;
         }
     }
+
+    /** Icon swap: the new one scales up from 0.25 and fades in while the old one shrinks out. */
+    private static void swapIcon(View in, View out, boolean animate) {
+        in.animate().cancel();
+        out.animate().cancel();
+        if (!animate) {
+            in.setAlpha(1f); in.setScaleX(1f); in.setScaleY(1f);
+            out.setAlpha(0f); out.setScaleX(0.25f); out.setScaleY(0.25f);
+            return;
+        }
+        in.animate().alpha(1f).scaleX(1f).scaleY(1f).setDuration(200).setInterpolator(EASE).start();
+        out.animate().alpha(0f).scaleX(0.25f).scaleY(0.25f).setDuration(200).setInterpolator(EASE).start();
+    }
+
+    private String laptopsShown;
 
     private void renderLaptops() {
         long now = System.currentTimeMillis();
@@ -675,55 +935,74 @@ public final class MainActivity extends Activity implements StreamState.Listener
             laptops.values().removeIf(l -> now - l.seen > LAPTOP_TTL_MS);
             list.addAll(laptops.values());
         }
-        laptopList.removeAllViews();
-        boolean empty = list.isEmpty();
-        searchSpinner.setVisibility(empty ? View.VISIBLE : View.GONE);
-        searching.setText(empty
-                ? "Looking for laptops on this Wi-Fi… If none appear, type the address below."
-                : "Tap your laptop, or type an address below.");
         String current = addressField.getText().toString().trim();
+        boolean inList = false;
+        StringBuilder key = new StringBuilder(current).append('|');
         for (Laptop l : list) {
-            String addr = l.port == Protocol.AUDIO_PORT ? l.ip : l.ip + ":" + l.port;
+            String a = address(l);
+            if (a.equals(current)) inList = true;
+            key.append(a).append('=').append(l.name).append(';');
+        }
+        searchRow.setVisibility(list.isEmpty() ? View.VISIBLE : View.GONE);
+        // The typed address shows only when asked for, or when it is not one of the laptops listed.
+        boolean typed = manualOpen || addressField.hasFocus() || (!current.isEmpty() && !inList);
+        addressBox.setVisibility(typed ? View.VISIBLE : View.GONE);
+        manualRow.setVisibility(typed ? View.GONE : View.VISIBLE);
+        // Rebuild only on a real change, so rows don't flash every discovery round.
+        if (key.toString().equals(laptopsShown)) return;
+        laptopsShown = key.toString();
+        laptopList.removeAllViews();
+        for (Laptop l : list) {
+            String addr = address(l);
             boolean selected = addr.equals(current);
+            boolean usb = USB_HOST.equals(l.ip);
             LinearLayout row = new LinearLayout(this);
             row.setGravity(Gravity.CENTER_VERTICAL);
-            row.setMinimumHeight(dp(72));
-            row.setPadding(dp(12), dp(10), dp(8), dp(10));
+            row.setMinimumHeight(dp(64));
+            row.setPadding(dp(8), dp(8), dp(12), dp(8));
             row.setBackground(pressable(shape(selected ? secondaryContainer : Color.TRANSPARENT, 16),
                     onSurface, 16));
             FrameLayout lead = new FrameLayout(this);
             lead.setBackground(shape(selected ? primary : surfaceHighest, 12));
-            lead.addView(icon(R.drawable.ic_laptop, selected ? onPrimary : onSurfaceVariant, 22));
+            lead.addView(icon(usb ? R.drawable.ic_usb : R.drawable.ic_laptop,
+                    selected ? onPrimary : onSurfaceVariant, 22));
             LinearLayout.LayoutParams llp = new LinearLayout.LayoutParams(dp(44), dp(44));
-            llp.rightMargin = dp(16);
+            llp.setMarginEnd(dp(16));
             row.addView(lead, llp);
-            LinearLayout t = new LinearLayout(this);
-            t.setOrientation(LinearLayout.VERTICAL);
+            LinearLayout t = vertical();
             int fg = selected ? onSecondaryContainer : onSurface;
-            TextView name = text(l.name, 16, fg, false);
+            TextView name = text(l.name, 16, fg, selected);
             name.setSingleLine(true);
-            name.setEllipsize(android.text.TextUtils.TruncateAt.END);
+            name.setEllipsize(TextUtils.TruncateAt.END);
             t.addView(name);
-            String shown = USB_HOST.equals(l.ip) ? "USB cable" : addr;
-            t.addView(text(shown, 14, selected ? onSecondaryContainer : onSurfaceVariant, false));
-            row.addView(t, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
-            RadioButton rb = new RadioButton(this);
-            rb.setChecked(selected);
-            rb.setClickable(false);
-            rb.setFocusable(false);
-            rb.setButtonTintList(ColorStateList.valueOf(selected ? primary : onSurfaceVariant));
-            row.addView(rb);
+            String shown = usb ? "USB cable" : addr;
+            t.addView(text(shown, 13, selected ? alpha(onSecondaryContainer, 0.8f) : onSurfaceVariant, false));
+            row.addView(t, weighted());
+            if (selected) {
+                ImageView check = new ImageView(this);
+                check.setImageResource(R.drawable.ic_check);
+                check.setImageTintList(ColorStateList.valueOf(primary));
+                row.addView(check, new LinearLayout.LayoutParams(dp(22), dp(22)));
+            }
             row.setContentDescription(l.name + ", " + shown + (selected ? ", selected" : ""));
             row.setOnClickListener(v -> {
                 if (StreamState.active()) return;
+                manualOpen = false;
+                addressField.clearFocus();
                 addressField.setText(addr);
                 renderLaptops();
-                if (codeField.getText().length() < 6) codeField.requestFocus();
+                if (codeField.getText().length() < 6) {
+                    codeField.requestFocus();
+                    showKeyboard(codeField);
+                } else {
+                    hideKeyboard();
+                }
             });
             LinearLayout.LayoutParams lp = fullWidth();
-            lp.bottomMargin = dp(2);
+            lp.setMargins(0, dp(2), 0, dp(2));
             laptopList.addView(row, lp);
         }
+        if (!StreamState.active()) onState();
     }
 
     // ---------- Start / stop ----------
