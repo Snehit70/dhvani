@@ -37,6 +37,8 @@ Needs Linux with PipeWire (`pw-cat`, `pactl`) and [Bun](https://bun.sh).
 The control panel is at <http://127.0.0.1:47801> (also "Dhvani" in the app menu). There you can:
 
 - pick the output (follow the system output, Bluetooth headset, speakers), set volume up to 150%, and mute.
+  The volume follows the same curve as the system volume (50% is about -18 dB, 150% about +10 dB),
+  so each step sounds about the same size anywhere on the slider
   If a chosen headset switches off or leaves range, Dhvani plays silence instead of falling back
   to the speakers, and resumes when it comes back
 - see the pairing code, make a new one, and see the laptop's addresses

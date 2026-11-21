@@ -2,7 +2,7 @@ import net from "node:net";
 import { randomBytes } from "node:crypto";
 import dgram from "node:dgram";
 import type { Config } from "./config";
-import { FrameAligner, JitterBuffer, Limiter, QUIET_PEAK, type LatencyMode } from "./audio";
+import { FrameAligner, JitterBuffer, Limiter, QUIET_PEAK, volumeGain, type LatencyMode } from "./audio";
 import { Analyzer, type LevelFrame } from "./analyzer";
 import { log } from "./log";
 import type { Player, PlayerFactory } from "./player";
@@ -405,7 +405,7 @@ export class AudioServer {
       const cfg = this.getConfig();
       const pv = active.session.phoneVolume;
       const follow = cfg.followPhone && pv ? phoneGain(pv) : 1;
-      const { out, peak } = active.limiter.process(frames, cfg.muted || this.hooks.outputMissing?.() ? 0 : cfg.volume * follow);
+      const { out, peak } = active.limiter.process(frames, cfg.muted || this.hooks.outputMissing?.() ? 0 : volumeGain(cfg.volume) * follow);
       const result = player ? player.write(out, peak < QUIET_PEAK) : "closed";
       if (result === "quiet") active.stats.dropQuiet++;
       else if (result !== "ok") {

@@ -6,7 +6,7 @@ import type { Player, PlayerFactory } from "../src/player";
 import { AudioServer } from "../src/server";
 
 const config: Config = {
-  code: "424242", sink: "", volume: 1, muted: false, followPhone: true, name: "testbox",
+  code: "424242", sink: "", volume: 1, volumeScale: "cubic", muted: false, followPhone: true, name: "testbox",
   latency: "stable", notify: false, usb: false,
 };
 
