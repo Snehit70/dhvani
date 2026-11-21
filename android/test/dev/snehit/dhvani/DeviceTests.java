@@ -73,6 +73,11 @@ public final class DeviceTests {
             eq(1.0, StreamService.controlVolume(i));
             eq(Boolean.FALSE, StreamService.controlMuted(i, true));
         });
+        test("volume fallback moves the laptop at most once per 100 ms", () -> {
+            yes(StreamService.fallbackStepDue(10_000, 0), "first rise counts");
+            yes(!StreamService.fallbackStepDue(10_050, 10_000), "a rise 50 ms later is the same press");
+            yes(StreamService.fallbackStepDue(10_100, 10_000), "a rise 100 ms later is a new press");
+        });
         test("volume is clamped, NaN ignored", () -> {
             eq(1.5, StreamService.controlVolume(control().putExtra(StreamService.EXTRA_VOLUME, 9f)));
             eq(0.0, StreamService.controlVolume(control().putExtra(StreamService.EXTRA_VOLUME, -1f)));

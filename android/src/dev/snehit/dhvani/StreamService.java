@@ -155,7 +155,7 @@ public final class StreamService extends Service {
     /**
      * Fallback without the Accessibility service: the phone's volume rose while Dhvani holds it
      * silent (a button press, the shade slider, a headset). Put it back to 0 at once and move the
-     * laptop instead. The phone may be heard for a moment; volume down can't be seen at 0.
+     * laptop up one step instead. The phone may be heard for a moment; volume down can't be seen at 0.
      */
     private final android.content.BroadcastReceiver volumeChanged = new android.content.BroadcastReceiver() {
         @Override public void onReceive(Context c, Intent i) {
@@ -164,10 +164,24 @@ public final class StreamService extends Service {
             int prev = i.getIntExtra("android.media.EXTRA_PREV_VOLUME_STREAM_VALUE", 0);
             if (value <= 0 || !holdsPhoneSilent()) return;
             try { audio.setStreamVolume(AudioManager.STREAM_MUSIC, 0, 0); } catch (RuntimeException ignored) {}
-            Log.i(TAG, "phone volume rose to " + value + " while silenced; moved to laptop");
-            for (int n = Math.max(1, value - prev); n > 0; n--) volumeKey(1);
+            long now = SystemClock.uptimeMillis();
+            if (!fallbackStepDue(now, lastFallbackStep)) return;
+            lastFallbackStep = now;
+            Log.i(TAG, "phone volume rose " + prev + "->" + value + " while silenced; laptop up one step");
+            volumeKey(1);
         }
     };
+    /**
+     * One press is 10 phone steps on some phones (MIUI has 150), and a held key or the shade
+     * slider sends a run of changes. Counting steps sent the laptop from 25% to 125% in two presses.
+     */
+    private static final long FALLBACK_STEP_MS = 100;
+    private long lastFallbackStep;
+
+    /** True when a phone volume rise should move the laptop: at most one step per FALLBACK_STEP_MS. */
+    static boolean fallbackStepDue(long now, long lastStep) {
+        return now - lastStep >= FALLBACK_STEP_MS;
+    }
 
     /** Set when the screen turns on or off, so the stream loop reports it right away. */
     private volatile boolean statsNow;

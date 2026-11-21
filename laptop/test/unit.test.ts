@@ -1,9 +1,12 @@
 import { describe, expect, test } from "bun:test";
-import { FrameAligner, JitterBuffer, Limiter, latencyBounds, processPcm } from "../src/audio";
+import { FrameAligner, JitterBuffer, Limiter, fromLinearVolume, latencyBounds, processPcm, volumeGain } from "../src/audio";
 import { Accelerator } from "../src/stretch";
 import { SessionNotifier } from "../src/notify";
 import { usbSerials } from "../src/usb";
-import { sanitize, defaults } from "../src/config";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { sanitize, defaults, loadConfig } from "../src/config";
 import { FailureLimiter, codesMatch, isDiscoverRequest, parseHello, parseControl, parsePhoneStats, parsePhoneVolume, phoneGain } from "../src/protocol";
 import { StreamStats } from "../src/stats";
 
@@ -89,6 +92,31 @@ describe("audio", () => {
     expect(out.map((o) => o.length)).toEqual([0, 8, 4]);
     expect(read(new Uint8Array([...out[1]!, ...out[2]!]))).toEqual([1, 2, 3, 4, 5, 6]);
   });
+});
+
+test("volume curve is cubic: 0 silent, 100% unity, 50% about -18 dB, 150% about +10.6 dB", () => {
+  expect(volumeGain(0)).toBe(0);
+  expect(volumeGain(1)).toBe(1);
+  expect(20 * Math.log10(volumeGain(0.5))).toBeCloseTo(-18.06, 1);
+  expect(20 * Math.log10(volumeGain(1.5))).toBeCloseTo(10.57, 1);
+  // Each 5% step near the bottom no longer jumps several dB more than one near the top.
+  const db = (v: number) => 20 * Math.log10(volumeGain(v));
+  expect(db(0.3) - db(0.25)).toBeLessThan(5);
+  expect(db(1.5) - db(1.45)).toBeGreaterThan(0.8);
+});
+
+test("a config saved on the old linear scale keeps its loudness", () => {
+  const dir = mkdtempSync(join(tmpdir(), "dhvani-cfg-"));
+  const path = join(dir, "config.json");
+  writeFileSync(path, JSON.stringify({ ...defaults(), volumeScale: undefined, volume: 0.13 }));
+  const c = loadConfig(path);
+  expect(c.volume).toBe(0.51);
+  expect(volumeGain(c.volume)).toBeCloseTo(0.13, 2);
+  expect(JSON.parse(readFileSync(path, "utf8")).volumeScale).toBe("cubic");
+  // Loading again must not convert twice.
+  expect(loadConfig(path).volume).toBe(0.51);
+  expect(fromLinearVolume(1.5)).toBe(1.14);
+  expect(fromLinearVolume(1)).toBe(1);
 });
 
 test("sanitize keeps values in range", () => {

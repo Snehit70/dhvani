@@ -59,6 +59,20 @@ export class Limiter {
   }
 }
 
+/**
+ * Gain for a volume setting (0..1.5, the number the panel and the phone show). Cubic, like
+ * PipeWire's own volume, so equal slider moves sound like equal steps: 50% is about -18 dB,
+ * 100% unity, 150% about +10.6 dB. A linear scale made 5-15% loud and 100-150% barely louder.
+ */
+export function volumeGain(volume: number): number {
+  return volume > 0 ? volume ** 3 : 0;
+}
+
+/** Converts a setting saved on the old linear scale to the cubic one, keeping the same loudness. */
+export function fromLinearVolume(volume: number): number {
+  return Math.round(Math.cbrt(Math.min(1.5, Math.max(0, volume))) * 100) / 100;
+}
+
 /** One-off gain with a fresh limiter, for callers without a stream. */
 export function processPcm(chunk: Uint8Array, gain: number, channels = 2): { out: Uint8Array; peak: number } {
   return new Limiter(channels, 48_000).process(chunk, gain);

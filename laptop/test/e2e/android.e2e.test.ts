@@ -22,7 +22,7 @@ const HOST = process.env.DHVANI_E2E_HOST ?? "10.0.2.2";
 const CODE = "135790";
 
 const cfg: Config = {
-  code: CODE, sink: "", volume: 1, muted: false, followPhone: false, name: "e2e-laptop",
+  code: CODE, sink: "", volume: 1, volumeScale: "cubic", muted: false, followPhone: false, name: "e2e-laptop",
   latency: "stable", notify: false, usb: false,
 };
 

@@ -2,15 +2,17 @@ import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "n
 import { hostname } from "node:os";
 import { dirname, join } from "node:path";
 import { randomInt } from "node:crypto";
-import type { LatencyMode } from "./audio";
+import { fromLinearVolume, type LatencyMode } from "./audio";
 
 export type Config = {
   /** Six-digit code the phone must present. */
   code: string;
   /** PipeWire sink name; empty string follows the system default output. */
   sink: string;
-  /** 0..1.5 software gain. */
+  /** 0..1.5, shown as 0..150%. The gain is cubic in this (see volumeGain). */
   volume: number;
+  /** "cubic" once `volume` is on the cubic scale; files without it hold a linear gain. */
+  volumeScale: "cubic";
   muted: boolean;
   /** Scale output by the phone's own media volume (phone muted = laptop silent). */
   followPhone: boolean;
@@ -35,7 +37,7 @@ export function newCode(): string {
 
 export function defaults(): Config {
   return {
-    code: newCode(), sink: "", volume: 1, muted: false, followPhone: true, name: hostname(),
+    code: newCode(), sink: "", volume: 1, volumeScale: "cubic", muted: false, followPhone: true, name: hostname(),
     latency: "stable", notify: true, usb: true,
   };
 }
@@ -60,7 +62,10 @@ export function loadConfig(path = configPath()): Config {
   try {
     const raw = JSON.parse(readFileSync(path, "utf8")) as Partial<Config>;
     const merged = sanitize(raw, defaults());
-    if (raw.code !== merged.code) saveConfig(merged, path);
+    // Up to 0.8 the volume was a linear gain; move it to the cubic scale at the same loudness.
+    const linear = raw.volumeScale !== "cubic";
+    if (linear) merged.volume = fromLinearVolume(merged.volume);
+    if (raw.code !== merged.code || linear) saveConfig(merged, path);
     return merged;
   } catch {
     const fresh = defaults();
