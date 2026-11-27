@@ -2,14 +2,27 @@
 # Installs a fresh APK on a running emulator, then runs the on-device unit tests and the
 # end-to-end suite in laptop/test/e2e. Meant for CI, which boots the emulator
 # (.github/workflows/ci.yml). It never boots one itself and never touches a real phone: with no
-# emulator attached it exits without running anything. Pass APK=path to test another build.
+# emulator attached it exits without running anything, except in CI, where that is a failure.
+# Uses ANDROID_SERIAL when set (the emulator runner sets it). Pass APK=path to test another build.
 set -euo pipefail
 cd "$(dirname "$0")"
 
 SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-$HOME/Android/Sdk}}"
 export PATH="$SDK/platform-tools:$PATH"
-running="$(adb devices | awk '/^emulator-[0-9]+\tdevice$/ {print $1; exit}')"
+if [[ -n "${ANDROID_SERIAL:-}" ]]; then
+  if [[ "$ANDROID_SERIAL" != emulator-* ]]; then
+    echo "ANDROID_SERIAL=$ANDROID_SERIAL is not an emulator; refusing to touch it"
+    exit 1
+  fi
+  running="$(adb devices | awk -v s="$ANDROID_SERIAL" '$1 == s && $2 == "device" {print $1}')"
+else
+  running="$(adb devices | awk '/^emulator-[0-9]+\tdevice$/ {print $1; exit}')"
+fi
 if [[ -z "$running" ]]; then
+  if [[ -n "${CI:-}" ]]; then
+    echo "no ready emulator${ANDROID_SERIAL:+ at $ANDROID_SERIAL}; CI must run the suite"
+    exit 1
+  fi
   echo "no emulator attached; the emulator suite runs in CI"
   exit 0
 fi

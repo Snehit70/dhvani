@@ -10,6 +10,11 @@ on:
         description: "Run the emulator suite against the APK from this release tag (e.g. v0.7.0) instead of a fresh build"
         required: false
 
+# paths-filter reads the PR's file list through the API, and the release step downloads an APK.
+permissions:
+  contents: read
+  pull-requests: read
+
 jobs:
   laptop:
     runs-on: ubuntu-latest
@@ -36,6 +41,8 @@ jobs:
               - 'android/**'
               - 'laptop/src/**'
               - 'laptop/test/e2e/**'
+              - 'laptop/package.json'
+              - 'laptop/bun.lock'
               - '.github/workflows/ci.yml'
       - uses: oven-sh/setup-bun@v2
       - uses: actions/setup-java@v4
