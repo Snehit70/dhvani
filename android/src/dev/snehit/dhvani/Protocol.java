@@ -150,11 +150,14 @@ final class Protocol {
         final double volume;
         final boolean muted;
         final String[] addresses;
+        /** The laptop's chosen output is gone (headset off), so it plays silence. */
+        final boolean outputMissing;
 
-        Laptop(double volume, boolean muted, String[] addresses) {
+        Laptop(double volume, boolean muted, String[] addresses, boolean outputMissing) {
             this.volume = volume;
             this.muted = muted;
             this.addresses = addresses;
+            this.outputMissing = outputMissing;
         }
     }
 
@@ -167,7 +170,8 @@ final class Protocol {
             int n = a == null ? 0 : Math.min(8, a.length());
             String[] addrs = new String[n];
             for (int i = 0; i < n; i++) addrs[i] = a.optString(i, "");
-            return new Laptop(o.optDouble("volume", 1), o.optBoolean("muted", false), addrs);
+            return new Laptop(o.optDouble("volume", 1), o.optBoolean("muted", false), addrs,
+                    o.optBoolean("outputMissing", false));
         } catch (JSONException e) {
             return null;
         }

@@ -21,6 +21,8 @@ final class StreamState {
     static volatile double laptopVolume = -1;
     static volatile boolean laptopMuted = false;
     static volatile String[] laptopAddresses = new String[0];
+    /** The laptop plays silence because its chosen output (a headset) is gone. */
+    static volatile boolean laptopOutputMissing = false;
 
     private static final CopyOnWriteArrayList<Listener> listeners = new CopyOnWriteArrayList<>();
     private static final Handler main = new Handler(Looper.getMainLooper());
@@ -45,9 +47,10 @@ final class StreamState {
         notifyListeners();
     }
 
-    static void setLaptop(double volume, boolean muted, String[] addresses) {
+    static void setLaptop(double volume, boolean muted, String[] addresses, boolean outputMissing) {
         laptopVolume = volume;
         laptopMuted = muted;
+        laptopOutputMissing = outputMissing;
         if (addresses != null) laptopAddresses = addresses;
         notifyListeners();
     }
@@ -55,6 +58,7 @@ final class StreamState {
     static void clearLaptop() {
         laptopVolume = -1;
         laptopMuted = false;
+        laptopOutputMissing = false;
         laptopAddresses = new String[0];
         wifiTip = "";
     }

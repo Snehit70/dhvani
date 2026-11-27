@@ -8,6 +8,7 @@ import { AUDIO_PORT, DISCOVERY_PORT, UI_PORT } from "./protocol";
 import { AudioServer, type LiveMetrics } from "./server";
 import { WebUI } from "./web";
 import { SessionNotifier, notifySend } from "./notify";
+import { PinnedOutput } from "./output";
 import { UsbBridge } from "./usb";
 
 const VERSION = "0.9.0";
@@ -95,25 +96,37 @@ async function probeOutput() {
   pushState();
 }
 /**
- * True while the output picked in the panel is gone, e.g. the Bluetooth headset was switched
- * off or walked out of range. PipeWire would move the stream to the speakers, often at a
- * volume set for headphones, so Dhvani plays silence until the device is back.
+ * Watches the output picked in the panel. When it is gone (headset off or out of range)
+ * PipeWire would move the stream to the speakers, often at a volume set for headphones.
+ * If the system output is another Bluetooth device, Dhvani plays there; otherwise it plays
+ * silence until the chosen device is back.
  */
-let outputMissing = false;
+const pinned = new PinnedOutput();
+const outputMissing = () => pinned.state.kind === "silent";
 async function checkPinnedOutput() {
-  let missing = false;
-  if (config.sink && server.session) {
-    const { sinks } = await listSinks();
-    missing = sinks.length > 0 && !sinks.some((s) => s.name === config.sink);
+  if (!config.sink) return void pinned.reset();
+  if (!server.session) return;
+  const before = pinned.state;
+  const { sinks, defaultSink } = await listSinks();
+  if (!server.session || !pinned.update(config.sink, sinks, defaultSink, Date.now())) return;
+  const now = pinned.state;
+  const name = sinks.find((s) => s.name === config.sink)?.description ?? "The chosen output";
+  if (now.kind === "ok") {
+    log("output_back", { sink: config.sink });
+  } else {
+    log("output_missing", { sink: config.sink, ...(now.kind === "fallback" ? { fallback: now.sink } : {}) });
   }
-  if (missing === outputMissing) return;
-  outputMissing = missing;
-  log(missing ? "output_missing" : "output_back", { sink: config.sink });
-  // Reopen playback so the stream goes back to the chosen device, not wherever PipeWire parked it.
-  if (!missing) {
+  if (config.notify) {
+    if (now.kind === "silent") notifySend("Output is gone", `${name} is off or out of range. Dhvani stays silent until it's back, or pick another output in the panel.`);
+    if (now.kind === "fallback") notifySend(`Playing on ${now.device}`, "The chosen output is off or out of range.");
+    if (now.kind === "ok" && before.kind === "silent") notifySend("Output is back", `Playing on ${name} again.`);
+  }
+  // Reopen playback on the device that should play now, not wherever PipeWire parked the stream.
+  if (now.kind !== "silent" || before.kind === "fallback") {
     server.restartPlayer();
     setTimeout(probeOutput, 2000);
   }
+  server.pushLaptopState();
   pushState();
 }
 let lastLevelSent = 0;
@@ -138,11 +151,14 @@ const server = new AudioServer(() => config, pwCatPlayer, {
   onSessionStart: (s) => {
     metrics.length = 0;
     setTimeout(probeOutput, 2000);
+    pinned.sessionStarted();
+    void checkPinnedOutput();
     notifier.started(s.device);
   },
   onSessionEnd: (s, reason) => notifier.ended(s.device, reason),
   addresses: () => addresses().map((a) => a.address),
-  outputMissing: () => outputMissing,
+  outputMissing,
+  sink: () => (pinned.state.kind === "fallback" ? pinned.state.sink : config.sink),
 });
 
 // pactl takes ~0.2-0.5 s; volume drags and level-driven state pushes must not wait on it each time.
@@ -178,7 +194,8 @@ async function state() {
     phone: server.phone,
     recent: server.recent,
     output,
-    outputMissing,
+    outputMissing: outputMissing(),
+    outputFallback: pinned.state.kind === "fallback" ? pinned.state.device : null,
     firewallFix: `sudo firewall-cmd --permanent --add-port=${AUDIO_PORT}/tcp --add-port=${DISCOVERY_PORT}/udp && sudo firewall-cmd --reload`,
     health: {
       listening: server.listening,
@@ -204,7 +221,11 @@ function apply(next: Config) {
   config = next;
   saveConfig(config);
   if (Object.keys(changed).length) log("settings", changed);
-  if (sinkChanged) server.restartPlayer();
+  if (sinkChanged) {
+    pinned.reset();
+    server.restartPlayer();
+    server.pushLaptopState();
+  }
   if (sinkChanged || latencyChanged) setTimeout(probeOutput, 2000);
   if (laptopChanged) server.pushLaptopState();
   if (latencyChanged) server.setLatency(config.latency);

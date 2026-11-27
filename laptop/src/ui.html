@@ -813,7 +813,7 @@ function renderHistory() {
     const dot = el("i", "q " + q); dot.title = { clean: "Clean", fair: "Some gaps", rough: "Rough", live: "Live" }[q];
     row.append(dot, el("div", "n", r.device), el("div", "w", ago(r.start)));
     const d2 = el("div", "d2"); d2.append(`${dur(r.durationS)} · ${REASONS[r.reason] || r.reason}`);
-    const issues = [r.underruns ? `${r.underruns} gaps` : "", r.drops ? `${r.drops} skipped` : "", r.rssiMin != null && r.rssiMin < -70 ? `weak Wi-Fi (${r.rssiMin} dBm)` : "", r.reconnects ? `${r.reconnects} reconnects` : ""].filter(Boolean);
+    const issues = [r.underruns ? `${r.underruns} gaps` : "", r.drops ? `${r.drops} skipped` : "", r.rssiMin != null && r.rssiMin < -70 ? `weak Wi-Fi (${r.rssiMin} dBm)` : "", r.reconnects ? `${r.reconnects} ${r.reconnects === 1 ? "retry" : "retries"} to connect` : ""].filter(Boolean);
     if (issues.length) d2.append(" · ", el("span", "issue", issues.join(", ")));
     if (r.targetMaxMs) d2.append(` · buffer ≤ ${Math.round(r.targetMaxMs)} ms`);
     row.append(d2); box.append(row);
@@ -849,7 +849,10 @@ function render(s) {
   svc.lastElementChild.textContent = live ? "Streaming" : s.health.firewall === "blocked" ? "Blocked" : "Ready";
   $("laptop-line").textContent = `${s.name} · v${s.version}`;
   $("fw-banner").hidden = s.health.firewall !== "blocked"; $("fw-cmd").textContent = s.firewallFix || "";
-  const errMsg = s.outputMissing && s.session ? "The chosen output is gone (headset off or out of range). Dhvani stays silent instead of using the speakers, and resumes when it's back. Pick another output to play now." : s.lastError;
+  const errMsg = !s.session ? s.lastError
+    : s.outputMissing ? "The chosen output is gone (headset off or out of range). Dhvani stays silent instead of using the speakers, and resumes when it's back. Pick another output to play now."
+    : s.outputFallback ? `The chosen output is gone, so Dhvani plays on ${s.outputFallback} until it's back.`
+    : s.lastError;
   $("err-banner").hidden = !errMsg; $("err-text").textContent = errMsg;
 
   // Now playing

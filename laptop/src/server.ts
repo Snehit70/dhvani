@@ -60,6 +60,8 @@ export type ServerHooks = {
   allowUdp?(address: string): boolean;
   /** True while the chosen output device is gone (e.g. headset switched off): play silence, not the speakers. */
   outputMissing?(): boolean;
+  /** The PipeWire sink to play on; default: the one in the config ("" follows the system output). */
+  sink?(): string;
 };
 
 const isLoopback = (a: string) => a === "127.0.0.1" || a === "::1" || a.startsWith("127.");
@@ -72,6 +74,8 @@ export const UDP_FALLBACK_MS = 2500;
 export const UDP_TIMEOUT_MS = 8000;
 /** A housekeeping tick this late means the laptop itself stalled (suspend, heavy load), not the phone. */
 export const LATE_TICK_MS = 3000;
+/** The once-a-second timer this late means the laptop was asleep: the phone gave up on this connection long ago. */
+export const SUSPEND_GAP_MS = 30_000;
 /** After a TCP fallback, try UDP again once the phone's UDP reports get through: first after this, doubling. */
 export const UDP_RETRY_MS = 10_000;
 export const UDP_RETRY_MAX_MS = 300_000;
@@ -103,7 +107,8 @@ export type LiveMetrics = {
   lost: number;
 };
 
-export type EndReason = "phone_closed" | "socket_error" | "timeout" | "replaced" | "disconnected" | "code_changed" | "shutdown";
+export type EndReason =
+  | "phone_closed" | "socket_error" | "timeout" | "replaced" | "disconnected" | "code_changed" | "shutdown" | "suspended";
 
 type Active = {
   session: Session;
@@ -128,6 +133,8 @@ type Active = {
   limiter: Limiter;
   sec: { bytes: number; gapMax: number; lastAt: number; lastSilent: boolean; idle: boolean; tMin: number; tMax: number };
   secTimer: ReturnType<typeof setInterval>;
+  /** Wall clock at the last one-second tick; a big jump means the laptop slept. */
+  lastTickAt: number;
   udp: {
     token: Buffer;
     reorder: Reorder;
@@ -234,7 +241,7 @@ export class AudioServer {
     const a = this.active;
     if (!a || a.socket.destroyed) return;
     const cfg = this.getConfig();
-    a.socket.write(laptopState(cfg.volume, cfg.muted, this.hooks.addresses?.() ?? []));
+    a.socket.write(laptopState(cfg.volume, cfg.muted, this.hooks.addresses?.() ?? [], this.hooks.outputMissing?.() ?? false));
   }
 
   /** New bounds take effect at once; the player restarts so PipeWire's period follows the mode. */
@@ -350,6 +357,7 @@ export class AudioServer {
       limiter: new Limiter(hello.channels, hello.rate),
       sec: { bytes: 0, gapMax: 0, lastAt: 0, lastSilent: false, idle: true, tMin: Infinity, tMax: -Infinity },
       secTimer: setInterval(() => this.tickSecond(active), 1000),
+      lastTickAt: Date.now(),
       udp: null,
     };
     active.statsTimer.unref?.();
@@ -513,7 +521,7 @@ export class AudioServer {
     if (now - active.lastSpawn < RESPAWN_INTERVAL_MS) return null;
     active.lastSpawn = now;
     if (active.player) this.retirePlayer(active);
-    const sink = this.getConfig().sink;
+    const sink = this.hooks.sink ? this.hooks.sink() : this.getConfig().sink;
     log("player_start", { session: active.session.id, sink: sink || "default" });
     const player = this.makePlayer(
       { rate: active.hello.rate, channels: active.hello.channels, sink, latency: this.getConfig().latency, screenOff: active.screenOff },
@@ -632,7 +640,16 @@ export class AudioServer {
   }
 
   private tickSecond(active: Active) {
-    if (this.active !== active || !this.hooks.onMetrics) return;
+    if (this.active !== active) return;
+    const now = Date.now();
+    if (now - active.lastTickAt > SUSPEND_GAP_MS) {
+      log("laptop_suspended", { session: active.session.id, gapS: Math.round((now - active.lastTickAt) / 1000) });
+      active.socket.destroy();
+      this.endActive("suspended");
+      return;
+    }
+    active.lastTickAt = now;
+    if (!this.hooks.onMetrics) return;
     const s = active.sec;
     const rssi = this.phone?.rssi;
     this.hooks.onMetrics({
@@ -669,7 +686,13 @@ export class AudioServer {
     this.flushStats(a, a.hello.rate * a.hello.channels * 2);
     this.quality = null;
     this.phone = null;
-    const durationS = Math.round((Date.now() - a.session.since) / 100) / 10;
+    // Woken from suspend before the timer noticed: the session ended when the laptop fell asleep.
+    const now = Date.now();
+    if (now - a.lastTickAt > SUSPEND_GAP_MS && (reason === "phone_closed" || reason === "socket_error" || reason === "timeout")) {
+      reason = "suspended";
+    }
+    const end = reason === "suspended" ? a.lastTickAt : now;
+    const durationS = Math.round((end - a.session.since) / 100) / 10;
     this.recent = [
       { device: a.session.device, start: a.session.since, durationS, reason, drops: a.totalDrops, underruns: this.underruns(a) },
       ...this.recent,

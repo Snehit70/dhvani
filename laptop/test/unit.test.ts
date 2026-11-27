@@ -2,6 +2,8 @@ import { describe, expect, test } from "bun:test";
 import { FrameAligner, JitterBuffer, Limiter, fromLinearVolume, latencyBounds, processPcm, volumeGain } from "../src/audio";
 import { Accelerator } from "../src/stretch";
 import { SessionNotifier } from "../src/notify";
+import { BACK_STABLE_MS, PinnedOutput } from "../src/output";
+import { sessionHistory } from "../src/report";
 import { usbSerials } from "../src/usb";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -529,4 +531,73 @@ test("StreamStats counts packets held for seconds as stale, not jitter", () => {
   const w = s.flush(192000);
   expect(w.stale).toBe(1);
   expect(w.netJitterMaxMs).toBe(0);
+});
+
+describe("PinnedOutput", () => {
+  const wireless = { name: "bluez_output.W", description: "Wireless" };
+  const rockerz = { name: "bluez_output.R", description: "ROCKERZ 430" };
+  const speakers = { name: "alsa_output.pci.analog-stereo", description: "Speakers" };
+
+  test("gone with the speakers as system output: silent", () => {
+    const p = new PinnedOutput();
+    expect(p.update(wireless.name, [speakers], speakers.name, 0)).toBe(true);
+    expect(p.state).toEqual({ kind: "silent" });
+  });
+
+  test("gone while another Bluetooth device is the system output: play there", () => {
+    const p = new PinnedOutput();
+    expect(p.update(wireless.name, [speakers, rockerz], rockerz.name, 0)).toBe(true);
+    expect(p.state).toEqual({ kind: "fallback", sink: rockerz.name, device: "ROCKERZ 430" });
+  });
+
+  test("back only after it stays back, so Bluetooth reconnect flapping does not flip it", () => {
+    const p = new PinnedOutput();
+    p.update(wireless.name, [speakers], speakers.name, 0);
+    expect(p.update(wireless.name, [speakers, wireless], wireless.name, 2000)).toBe(false);
+    expect(p.update(wireless.name, [speakers], speakers.name, 4000)).toBe(false); // flapped away again
+    expect(p.update(wireless.name, [speakers, wireless], wireless.name, 6000)).toBe(false);
+    expect(p.update(wireless.name, [speakers, wireless], wireless.name, 6000 + BACK_STABLE_MS)).toBe(true);
+    expect(p.state).toEqual({ kind: "ok" });
+  });
+
+  test("a new session uses a returned output at once; pactl failing changes nothing", () => {
+    const p = new PinnedOutput();
+    p.update(wireless.name, [speakers], speakers.name, 0);
+    expect(p.update(wireless.name, [], "", 1000)).toBe(false);
+    expect(p.state.kind).toBe("silent");
+    p.sessionStarted();
+    expect(p.update(wireless.name, [wireless], wireless.name, 2000)).toBe(true);
+    expect(p.state.kind).toBe("ok");
+  });
+
+  test("present or none pinned: ok, no change", () => {
+    const p = new PinnedOutput();
+    expect(p.update(wireless.name, [wireless], wireless.name, 0)).toBe(false);
+    expect(p.update("", [], "", 0)).toBe(false);
+  });
+});
+
+test("report: phone retries count per session, not the phone's running total", () => {
+  const dir = mkdtempSync(join(tmpdir(), "dhvani-report-"));
+  const file = join(dir, "events.jsonl");
+  const t = (s: number) => new Date(Date.now() - 3600_000 + s * 1000).toISOString();
+  const ev = [
+    { t: t(0), ev: "start" },
+    { t: t(1), ev: "session_start", session: 1, device: "Pixel" },
+    { t: t(11), ev: "phone_stats", session: 1, reconnects: 0, stalls: 0 },
+    { t: t(20), ev: "session_end", session: 1, reason: "timeout", durationS: 19 },
+    // Laptop asleep: the phone kept retrying.
+    { t: t(30), ev: "session_start", session: 2, device: "Pixel" },
+    { t: t(40), ev: "phone_stats", session: 2, reconnects: 4143, stalls: 1 },
+    { t: t(50), ev: "session_end", session: 2, reason: "phone_closed", durationS: 20 },
+    { t: t(60), ev: "session_start", session: 3, device: "Pixel" },
+    { t: t(70), ev: "phone_stats", session: 3, reconnects: 4144, stalls: 1 },
+    { t: t(80), ev: "session_end", session: 3, reason: "phone_closed", durationS: 20 },
+    // Start tapped again: totals restart.
+    { t: t(90), ev: "session_start", session: 4, device: "Pixel" },
+    { t: t(100), ev: "phone_stats", session: 4, reconnects: 2, stalls: 0 },
+    { t: t(110), ev: "session_end", session: 4, reason: "phone_closed", durationS: 20 },
+  ];
+  writeFileSync(file, ev.map((e) => JSON.stringify(e)).join("\n") + "\n");
+  expect(sessionHistory(file, 1).map((r) => r.reconnects)).toEqual([2, 1, 4143, 0]);
 });

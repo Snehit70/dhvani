@@ -140,6 +140,8 @@ public final class DeviceTests {
             eq(1.2, l.volume);
             eq(true, l.muted);
             eq("10.0.0.5", l.addresses[0]);
+            eq(false, l.outputMissing);
+            eq(true, Protocol.parseLaptop("{\"dhvani\":\"laptop\",\"outputMissing\":true}").outputMissing);
             yes(Protocol.parseLaptop("{\"dhvani\":\"ping\"}") == null, "ping is not state");
             yes(Protocol.parseLaptop("garbage") == null, "garbage");
             yes(Protocol.parseLaptop("{\"dhvani\":\"laptop\"}") != null, "missing fields default");

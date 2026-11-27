@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, setSystemTime, test } from "bun:test";
 import net from "node:net";
 import dgram from "node:dgram";
 import type { Config } from "../src/config";
@@ -210,6 +210,38 @@ test("a missing output plays silence instead of falling back to the speakers", a
   c.sock.write(Buffer.from([0x00, 0x40, 0x00, 0x40]));
   await until(() => players[0]?.data.length === 8);
   expect(players[0]!.data.slice(4)).toEqual([0x00, 0x40, 0x00, 0x40]);
+  c.sock.end();
+});
+
+test("a missing output tells the phone; a fallback sink is what the player opens", async () => {
+  server = new AudioServer(() => ({ ...config, sink: "bluez_output.A" }), factory, {
+    onChange: () => {}, onLevel: () => {}, outputMissing: () => true, sink: () => "bluez_output.B",
+  }, 500);
+  const port = await server.listen(0, "127.0.0.1");
+  const c = connect(port);
+  c.sock.write(hello("424242"));
+  await c.line();
+  expect(JSON.parse(await c.line()).outputMissing).toBe(true);
+  c.sock.write(Buffer.from([0x00, 0x40, 0x00, 0x40]));
+  await until(() => players.length === 1);
+  expect(players[0]!.opts.sink).toBe("bluez_output.B");
+  c.sock.end();
+});
+
+test("a laptop suspend ends the session as suspended, without the sleep in its duration", async () => {
+  const port = await start();
+  const c = connect(port);
+  c.sock.write(hello("424242"));
+  await c.line();
+  await until(() => server.session !== null);
+  try {
+    setSystemTime(new Date(Date.now() + 10 * 60_000));
+    await until(() => server.session === null, 2500);
+  } finally {
+    setSystemTime();
+  }
+  expect(server.recent[0]!.reason).toBe("suspended");
+  expect(server.recent[0]!.durationS).toBeLessThan(5);
   c.sock.end();
 });
 

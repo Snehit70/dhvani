@@ -39,8 +39,10 @@ The control panel is at <http://127.0.0.1:47801> (also "Dhvani" in the app menu)
 - pick the output (follow the system output, Bluetooth headset, speakers), set volume up to 150%, and mute.
   The volume follows the same curve as the system volume (50% is about -18 dB, 150% about +10 dB),
   so each step sounds about the same size anywhere on the slider
-  If a chosen headset switches off or leaves range, Dhvani plays silence instead of falling back
-  to the speakers, and resumes when it comes back
+  If a chosen headset switches off or leaves range, Dhvani plays on the system output when that is
+  another Bluetooth device, and otherwise plays silence instead of falling back to the speakers. It
+  sends a desktop notification, shows a note on the phone, and goes back to the chosen headset a few
+  seconds after it reconnects
 - see the pairing code, make a new one, and see the laptop's addresses
 - check health (server, discovery, firewall) and disconnect the phone
 
@@ -73,7 +75,7 @@ Options:
 - **Silence this phone**: mutes the phone speaker while streaming and restores it when you stop, or 10 s after the connection drops (so a quick reconnect is not heard on the phone). Some phones also mute the shared audio when the speaker is muted. Dhvani detects that after about 3 s of silence, puts the volume back, and tells you to turn the option off.
 - **Volume buttons control the laptop**: while the phone is silenced, its volume buttons change the laptop volume (5% a press, with a short on-screen note) and the phone stays quiet. This uses a small Accessibility service that only looks at the volume keys, and only while streaming. Turn on **Dhvani volume buttons** in Accessibility settings. On Android 13+ a sideloaded app's toggle is greyed out until you allow it: App info, ⋮ menu, **Allow restricted settings**. Without the service, Dhvani still catches the phone volume rising, puts it back to 0 within a moment and moves the laptop up one step instead, but a press can be heard briefly and volume down can't be seen.
 - **Wi-Fi tips**: while streaming, the app tells you when the phone is on 2.4 GHz or has a weak signal, the usual causes of dropouts.
-- **Reconnect automatically**: retries with backoff if Wi-Fi drops or the laptop restarts.
+- **Reconnect automatically**: retries with backoff if Wi-Fi drops or the laptop restarts. After 10 minutes without the laptop (it went to sleep, say) the phone stops and asks you to tap Start again.
 - **Start when opened**: opening Dhvani connects to the saved laptop right away.
 
 The laptop and code are remembered, so you pair once. Android still shows the

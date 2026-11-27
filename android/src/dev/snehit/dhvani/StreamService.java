@@ -77,6 +77,12 @@ public final class StreamService extends Service {
     private static final long LAPTOP_SILENT_MS = 8000;
     /** A dropped connection keeps the phone silenced this long, so a quick reconnect is not heard on the speaker. */
     private static final long RESTORE_GRACE_MS = 10_000;
+    /**
+     * Without the laptop this long (asleep, shut, gone), stop instead of retrying all night with
+     * the capture, the foreground service and both Wi-Fi locks held.
+     */
+    private static final long GIVE_UP_MS = 10 * 60_000;
+    private static final int GAVE_UP_NOTIFICATION_ID = 2;
     /** DSCP EF: Wi-Fi sends these in its video queue, ahead of bulk traffic. */
     private static final int TOS_EF = 0xB8;
 
@@ -266,6 +272,7 @@ public final class StreamService extends Service {
         silence = intent.getBooleanExtra(EXTRA_SILENCE, true);
         reconnect = intent.getBooleanExtra(EXTRA_RECONNECT, true);
         silenceBroken = false;
+        getSystemService(NotificationManager.class).cancel(GAVE_UP_NOTIFICATION_ID);
         audio = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
         restoreLeftoverVolume();
 
@@ -356,6 +363,8 @@ public final class StreamService extends Service {
     private void runLoop() {
         Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO);
         int backoff = 1000;
+        // Since when (elapsedRealtime, which counts deep sleep) no attempt has reached the laptop.
+        long lostSince = 0;
         byte[] buf = new byte[CHUNK_BYTES];
         final AudioRecord rec = record;
         while (running) {
@@ -495,6 +504,14 @@ public final class StreamService extends Service {
                     return;
                 }
                 reconnects++;
+                long now = SystemClock.elapsedRealtime();
+                if (streamed || lostSince == 0) lostSince = now;
+                if (now - lostSince >= GIVE_UP_MS) {
+                    Log.w(TAG, "no laptop for " + (now - lostSince) / 1000 + " s after " + reconnects + " tries; giving up");
+                    notifyGaveUp();
+                    stopFromWorker("The laptop stopped answering, so streaming stopped. Tap Start when it's back.");
+                    return;
+                }
                 update(StreamState.Status.RECONNECTING, streamed
                         ? "Connection lost. Retrying…" : friendly(e) + " Retrying…");
             } finally {
@@ -510,8 +527,12 @@ public final class StreamService extends Service {
                 try { rec.stop(); } catch (RuntimeException ignored) {}
                 // While the laptop is away the phone plays on its own speaker again, but only
                 // once a reconnect has had a moment; a Wi-Fi blip should not blare the speaker.
-                main.removeCallbacks(restoreAfterGrace);
-                main.postDelayed(restoreAfterGrace, RESTORE_GRACE_MS);
+                // Only a dropped stream starts the wait: re-arming it on every failed retry
+                // kept the phone muted for the whole outage.
+                if (streamed) {
+                    main.removeCallbacks(restoreAfterGrace);
+                    main.postDelayed(restoreAfterGrace, RESTORE_GRACE_MS);
+                }
             }
             try {
                 Thread.sleep(backoff);
@@ -584,7 +605,7 @@ public final class StreamService extends Service {
         Thread t = new Thread(() -> {
             try {
                 InputStream in = s.getInputStream();
-                boolean first = true, wasMuted = false;
+                boolean first = true, wasMuted = false, wasMissing = false;
                 while (running && socket == s) {
                     String line = readLine(in);
                     lastHeardAt = SystemClock.uptimeMillis();
@@ -610,10 +631,14 @@ public final class StreamService extends Service {
                             }
                         }
                     }
-                    StreamState.setLaptop(l.volume, l.muted, l.addresses);
-                    if (first || l.muted != wasMuted) refreshNotification();
+                    StreamState.setLaptop(l.volume, l.muted, l.addresses, l.outputMissing);
+                    if (l.outputMissing != wasMissing && StreamState.status == StreamState.Status.STREAMING) {
+                        notificationText = streamingText(StreamState.detail);
+                    }
+                    if (first || l.muted != wasMuted || l.outputMissing != wasMissing) refreshNotification();
                     first = false;
                     wasMuted = l.muted;
+                    wasMissing = l.outputMissing;
                 }
             } catch (IOException | RuntimeException ignored) {
                 // Laptop closed the socket; make sure the stream loop sees it and reconnects.
@@ -655,7 +680,7 @@ public final class StreamService extends Service {
         if (t == null || c == null) return;
         // Shown right away; the laptop confirms with its own update over TCP.
         if (volume != null) StreamState.laptopVolume = volume;
-        if (muted != null) StreamState.setLaptop(StreamState.laptopVolume, muted, null);
+        if (muted != null) StreamState.setLaptop(StreamState.laptopVolume, muted, null, StreamState.laptopOutputMissing);
         final byte[] b = Protocol.control(c, volume, muted).getBytes(StandardCharsets.UTF_8);
         try {
             sender.execute(() -> {
@@ -839,12 +864,16 @@ public final class StreamService extends Service {
         refreshTile();
         String text;
         switch (s) {
-            case STREAMING: text = "Playing on " + detail; break;
+            case STREAMING: text = streamingText(detail); break;
             case RECONNECTING: text = detail; break;
             default: text = "Connecting to " + host; break;
         }
         notificationText = text;
         refreshNotification();
+    }
+
+    private static String streamingText(String laptop) {
+        return StreamState.laptopOutputMissing ? "Laptop output is off, nothing is playing" : "Playing on " + laptop;
     }
 
     private void refreshNotification() {
@@ -868,6 +897,23 @@ public final class StreamService extends Service {
         refreshTile();
         stopForeground(STOP_FOREGROUND_REMOVE);
         stopSelf();
+    }
+
+    /** Left after giving up on the laptop, so the stop is noticed and one tap opens the app. */
+    private void notifyGaveUp() {
+        try {
+            PendingIntent open = PendingIntent.getActivity(this, 3,
+                    new Intent(this, MainActivity.class).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
+                    PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+            NotificationManager nm = getSystemService(NotificationManager.class);
+            nm.notify(GAVE_UP_NOTIFICATION_ID, new Notification.Builder(this, CHANNEL)
+                    .setSmallIcon(R.drawable.ic_notify)
+                    .setContentTitle("Dhvani stopped")
+                    .setContentText("The laptop went away. Tap to open Dhvani and start again.")
+                    .setContentIntent(open)
+                    .setAutoCancel(true)
+                    .build());
+        } catch (RuntimeException ignored) {}
     }
 
     private void stopFromWorker(String error) {

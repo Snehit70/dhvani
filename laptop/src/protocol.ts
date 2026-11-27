@@ -223,8 +223,9 @@ export function parseControl(msg: string): PhoneControl | null {
 }
 
 /** Laptop state pushed down the audio socket so the phone can show and change it. */
-export function laptopState(volume: number, muted: boolean, addresses: string[]): string {
-  return JSON.stringify({ dhvani: "laptop", volume, muted, addresses }) + "\n";
+/** outputMissing: the laptop plays silence because its chosen output is gone (the phone says so). */
+export function laptopState(volume: number, muted: boolean, addresses: string[], outputMissing = false): string {
+  return JSON.stringify({ dhvani: "laptop", volume, muted, addresses, ...(outputMissing ? { outputMissing } : {}) }) + "\n";
 }
 
 export const UDP_HEADER = 20;

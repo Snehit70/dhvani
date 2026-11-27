@@ -6,7 +6,10 @@ type Row = {
   drops: number; underruns: number; targetMaxMs: number; gapMaxMs: number; gaps100: number;
   minRatePct: number; maxLeadMs: number; playerExits: number;
   rssiMin: number | null; linkMin: number | null; writeMaxMs: number; stalls: number; reconnects: number;
+  /** The phone's run totals when this session began; its stats count from there. */
+  base: PhoneCounts;
 };
+type PhoneCounts = { stalls: number; reconnects: number };
 
 function readEvents(file: string): Ev[] {
   const out: Ev[] = [];
@@ -51,6 +54,9 @@ function buildRows(events: Ev[]): { rows: Row[]; rejected: number } {
   let current = new Map<number, Row>();
   let seq = 0;
   let rejected = 0;
+  // The phone counts stalls and reconnects since Start was tapped, across sessions. Keep its
+  // last totals per device so each session gets only what happened since the one before.
+  const phoneTotals = new Map<string, PhoneCounts>();
   for (const e of events) {
     if (e.ev === "start") current = new Map();
     if (e.ev === "hello_rejected") rejected++;
@@ -60,6 +66,7 @@ function buildRows(events: Ev[]): { rows: Row[]; rejected: number } {
         id: ++seq, start: e.t, device: String(e.device ?? "?"), durationS: 0, reason: "running",
         drops: 0, underruns: 0, targetMaxMs: 0, gapMaxMs: 0, gaps100: 0, minRatePct: Infinity, maxLeadMs: 0, playerExits: 0,
         rssiMin: null, linkMin: null, writeMaxMs: 0, stalls: 0, reconnects: 0,
+        base: phoneTotals.get(String(e.device ?? "?")) ?? { stalls: 0, reconnects: 0 },
       };
       current.set(sid, r);
       rows.set(r.id, r);
@@ -83,8 +90,14 @@ function buildRows(events: Ev[]): { rows: Row[]; rejected: number } {
         if (typeof e.linkMbps === "number" && e.linkMbps > 0)
           r.linkMin = r.linkMin === null ? e.linkMbps : Math.min(r.linkMin, e.linkMbps);
         r.writeMaxMs = Math.max(r.writeMaxMs, num(e.writeMaxMs));
-        r.stalls = Math.max(r.stalls, num(e.stalls));
-        r.reconnects = Math.max(r.reconnects, num(e.reconnects));
+        {
+          const cur = { stalls: num(e.stalls), reconnects: num(e.reconnects) };
+          // Lower than before: Start was tapped again and the phone's totals restarted from 0.
+          if (cur.stalls < r.base.stalls || cur.reconnects < r.base.reconnects) r.base = { stalls: 0, reconnects: 0 };
+          r.stalls = Math.max(r.stalls, cur.stalls - r.base.stalls);
+          r.reconnects = Math.max(r.reconnects, cur.reconnects - r.base.reconnects);
+          phoneTotals.set(r.device, cur);
+        }
         break;
       case "session_end":
         r.durationS = num(e.durationS);
@@ -137,7 +150,7 @@ export function report(file: string, args: string[]) {
     if (r.targetMaxMs) notes.push(`buffer up to ${Math.round(r.targetMaxMs)} ms`);
     if (r.playerExits) notes.push(`pw-cat died ${r.playerExits}x`);
     if (r.stalls) notes.push(`${r.stalls} phone stalls`);
-    if (r.reconnects) notes.push(`${r.reconnects} reconnects`);
+    if (r.reconnects) notes.push(`${r.reconnects} ${r.reconnects === 1 ? "retry" : "retries"} to connect`);
     if (r.linkMin !== null && r.linkMin < 50) notes.push(`link ${r.linkMin} Mbps`);
     console.log(
       pad(r.start.replace("T", " ").slice(0, 16), 17) + pad(r.device, 18) + pad((r.durationS / 60).toFixed(1), 7) +
@@ -148,7 +161,8 @@ export function report(file: string, args: string[]) {
   }
   console.log(
     `\ngaps = data gaps over 100 ms (Wi-Fi hiccups); worst = longest gap; rate% = slowest 10 s window ` +
-      `(100 = real time); phone = longest single socket write on the phone.` +
+      `(100 = real time); phone = longest single socket write on the phone. Times are UTC.` +
+      `\nretries to connect = connection drops and failed attempts on the phone since its session before.` +
       (rejected ? `\n${rejected} connection attempts rejected (wrong code, timeout or bad hello).` : "") +
       `\nRaw events: ${file}`,
   );

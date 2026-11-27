@@ -8,8 +8,8 @@ export const notifySend: Send = (title, body) => {
   execFile("notify-send", ["-a", "Dhvani", "-i", "audio-headphones", "-u", "low", title, body], { timeout: 3000 }, () => {});
 };
 
-/** Ends the user caused or that a new session immediately follows: no notification. */
-const QUIET_ENDS: ReadonlySet<EndReason> = new Set(["shutdown", "replaced", "code_changed", "disconnected"]);
+/** Ends the user caused, that a new session immediately follows, or the laptop sleeping: no notification. */
+const QUIET_ENDS: ReadonlySet<EndReason> = new Set(["shutdown", "replaced", "code_changed", "disconnected", "suspended"]);
 
 /**
  * Turns session starts and ends into at most one notification per real change.

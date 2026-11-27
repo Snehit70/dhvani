@@ -877,6 +877,10 @@ public final class MainActivity extends Activity implements StreamState.Listener
 
         String n = StreamState.notice;
         boolean wifi = false;
+        if (n.isEmpty() && streaming && StreamState.laptopOutputMissing) {
+            n = "The laptop's chosen output (a headset?) is off, so nothing is playing. Turn it on or pick "
+                    + "another output in the laptop panel.";
+        }
         if (n.isEmpty() && streaming) { n = StreamState.wifiTip; wifi = true; }
         notice.setText(n);
         noticeIcon.setImageResource(wifi ? R.drawable.ic_wifi : R.drawable.ic_alert);
