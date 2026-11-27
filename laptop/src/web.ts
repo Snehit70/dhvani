@@ -12,7 +12,12 @@ export type WebDeps = {
   history?(): unknown;
 };
 
-type Client = { send(event: string, data: unknown): void; close(): void };
+type Client = { sendRaw(bytes: Uint8Array): void; send(event: string, data: unknown): void; close(): void };
+
+const enc = new TextEncoder();
+const frame = (event: string, data: unknown) => enc.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+/** A panel this many events behind (a frozen or backgrounded tab) is dropped; it reconnects on its own. */
+export const MAX_CLIENT_QUEUE = 256;
 
 /** Local-only control panel. Rejects foreign Host/Origin to block DNS-rebinding and CSRF. */
 export class WebUI {
@@ -53,8 +58,15 @@ export class WebUI {
     this.server?.stop(true);
   }
 
+  /** Open live-update connections (panels). */
+  get listeners(): number {
+    return this.clients.size;
+  }
+
   broadcast(event: string, data: unknown) {
-    for (const c of this.clients) c.send(event, data);
+    if (!this.clients.size) return;
+    const bytes = frame(event, data);
+    for (const c of this.clients) c.sendRaw(bytes);
   }
 
   private async route(req: Request, url: URL): Promise<Response> {
@@ -103,20 +115,23 @@ export class WebUI {
   }
 
   private events(req: Request): Response {
-    const enc = new TextEncoder();
     let client: Client;
     const stream = new ReadableStream<Uint8Array>({
       start: (ctrl) => {
         let open = true;
         const ping = setInterval(() => client.send("ping", 0), 15000);
         client = {
-          send(event, data) {
+          sendRaw(bytes) {
             if (!open) return;
+            if ((ctrl.desiredSize ?? 0) < -MAX_CLIENT_QUEUE) return this.close();
             try {
-              ctrl.enqueue(enc.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
+              ctrl.enqueue(bytes);
             } catch {
               this.close();
             }
+          },
+          send(event, data) {
+            this.sendRaw(frame(event, data));
           },
           close: () => {
             if (!open) return;
@@ -130,7 +145,9 @@ export class WebUI {
         };
         this.clients.add(client);
         req.signal.addEventListener("abort", () => client.close());
-        Promise.resolve(this.deps.state()).then((s) => client.send("state", s));
+        Promise.resolve()
+          .then(() => this.deps.state())
+          .then((s) => client.send("state", s), () => {});
       },
       cancel: () => client?.close(),
     });

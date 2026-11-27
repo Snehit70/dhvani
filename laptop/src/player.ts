@@ -87,6 +87,11 @@ export function pipePlayer(child: Child, opts: PlayerOptions, onExit: (reason: s
   // Last samples handed to pw-cat, and whether the next write follows a skip or inserted silence.
   let last: number[] = new Array(opts.channels).fill(0);
   let splice = false;
+  /** The next write does not follow the last: smooth the join and drop audio held for compression. */
+  const discontinuity = () => {
+    splice = true;
+    accel.drop();
+  };
   const put = (b: Uint8Array) => {
     if (!b.length) return;
     child.stdin.write(b);
@@ -127,12 +132,12 @@ export function pipePlayer(child: Child, opts: PlayerOptions, onExit: (reason: s
       lead.setBounds(latencyBounds(mode, screenOff));
     },
     gap() {
-      splice = true;
+      discontinuity();
     },
     write(pcm, quiet = false) {
       if (closed) return "closed";
       if (child.stdin.writableLength > maxBacklog) {
-        splice = true;
+        discontinuity();
         const t = now();
         if (stalledSince === null) stalledSince = t;
         else if (t - stalledSince > STUCK_MS) {
@@ -145,12 +150,18 @@ export function pipePlayer(child: Child, opts: PlayerOptions, onExit: (reason: s
       stalledSince = null;
       const a = lead.admit(pcm.length, quiet);
       if (a.prefillMs > 0) {
+        // Audio held for compression came before the dry spell: it plays first, ahead of the prefill.
+        const held = accel.flush();
+        if (held.length) {
+          put(held);
+          lead.wrote(held.length);
+        }
         const n = Math.round((a.prefillMs * bytesPerMs) / frameBytes) * frameBytes;
         put(new Uint8Array(n));
         splice = true;
       }
       if (a.mode === "late" || a.mode === "quiet") {
-        splice = true;
+        discontinuity();
         return a.mode;
       }
       const smooth = () => {

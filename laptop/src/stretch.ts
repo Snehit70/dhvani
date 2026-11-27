@@ -62,6 +62,17 @@ export class Accelerator {
     return this.take();
   }
 
+  /**
+   * Forgets held audio, for a discontinuity (skip, drop, stall): playing it later would put
+   * old audio after newer audio. It was excess delay being shed anyway. Returns ms dropped.
+   */
+  drop(): number {
+    const ms = this.pendingMs;
+    this.pending = [];
+    this.pendingBytes = 0;
+    return ms;
+  }
+
   private take(): Uint8Array {
     const out = concat(this.pending);
     this.pending = [];
@@ -75,12 +86,16 @@ export class Accelerator {
     const frames = Math.floor(block.length / this.frameBytes);
     const v = new DataView(block.buffer, block.byteOffset, frames * this.frameBytes);
     const mono = new Float32Array(frames);
+    // Energy per channel, not of the mix: channels in opposite phase cancel in `mono` but are loud.
     let energy = 0;
     for (let f = 0; f < frames; f++) {
       let s = 0;
-      for (let c = 0; c < ch; c++) s += v.getInt16((f * ch + c) * 2, true);
+      for (let c = 0; c < ch; c++) {
+        const x = v.getInt16((f * ch + c) * 2, true);
+        s += x;
+        energy += (x * x) / ch;
+      }
       mono[f] = s / ch;
-      energy += mono[f]! * mono[f]!;
     }
     const W = this.overlap;
     const maxCut = Math.min(this.maxCut, frames - W);

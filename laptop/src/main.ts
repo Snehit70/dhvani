@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { networkInterfaces } from "node:os";
 import { loadConfig, newCode, sanitize, saveConfig, type Config } from "./config";
-import { LOG_FILE, log } from "./log";
+import { LOG_FILE, flushLog, log } from "./log";
 import { recentSessions, report, sessionHistory } from "./report";
 import { listSinks, outputDelay, pwCatPlayer, type OutputDelay } from "./player";
 import { AUDIO_PORT, DISCOVERY_PORT, UI_PORT } from "./protocol";
@@ -41,19 +41,33 @@ function run(cmd: string, args: string[]): Promise<{ code: number; out: string }
 /** "open" | "blocked" | "unknown" (firewalld missing, not running, or a query failed). */
 let firewall: "open" | "blocked" | "unknown" = "unknown";
 
-/** True if the zone allows the port, either directly or through a port range. */
-async function zoneAllows(zone: string, port: number, proto: string): Promise<boolean | null> {
-  const q = await run("firewall-cmd", [`--zone=${zone}`, `--query-port=${port}/${proto}`]);
-  if (q.code === 0) return true;
-  if (q.code !== 1) return null;
-  const list = await run("firewall-cmd", [`--zone=${zone}`, "--list-ports"]);
-  if (list.code !== 0) return null;
-  return list.out.split(/\s+/).some((p) => {
+/** True if a firewalld port list ("47800/tcp 6000-6010/udp") covers the port. */
+function portListAllows(list: string, port: number, proto: string): boolean {
+  return list.split(/\s+/).some((p) => {
     const [range, pr] = p.split("/");
     if (pr !== proto || !range) return false;
     const [lo, hi = lo] = range.split("-").map(Number);
     return port >= lo! && port <= hi!;
   });
+}
+
+/** The "key: value" lines of `firewall-cmd --info-zone` / `--info-service`. */
+function infoField(info: string, key: string): string {
+  const m = info.match(new RegExp(`^\\s*${key}:\\s*(.*)$`, "m"));
+  return m ? m[1]!.trim() : "";
+}
+
+/** True if the zone lets the port in: an ACCEPT target (trusted), a port or range, or a service that has it. */
+async function zoneAllows(zone: string, port: number, proto: string): Promise<boolean | null> {
+  const info = await run("firewall-cmd", [`--info-zone=${zone}`]);
+  if (info.code !== 0) return null;
+  if (infoField(info.out, "target") === "ACCEPT") return true;
+  if (portListAllows(infoField(info.out, "ports"), port, proto)) return true;
+  for (const svc of infoField(info.out, "services").split(/\s+/).filter(Boolean)) {
+    const s = await run("firewall-cmd", [`--info-service=${svc}`]);
+    if (s.code === 0 && portListAllows(infoField(s.out, "ports"), port, proto)) return true;
+  }
+  return false;
 }
 
 async function checkFirewall() {
@@ -80,9 +94,34 @@ async function checkFirewall() {
   setFirewall(open ? "open" : "blocked");
 }
 
+/** Failed checks in a row. Right after resume firewalld answers slowly; keep the last answer for a few tries. */
+let firewallMisses = 0;
+let firewallRetry: ReturnType<typeof setTimeout> | null = null;
 function setFirewall(next: typeof firewall) {
-  if (next !== firewall) log("firewall", { state: next });
+  if (next === "unknown" && firewall !== "unknown" && ++firewallMisses <= 3) {
+    if (!firewallRetry) {
+      firewallRetry = setTimeout(() => {
+        firewallRetry = null;
+        void checkFirewall();
+      }, 5000);
+      firewallRetry.unref();
+    }
+    return;
+  }
+  if (next !== "unknown") firewallMisses = 0;
+  if (next === firewall) return;
+  log("firewall", { state: next });
   firewall = next;
+  pushState();
+}
+/** Checks every minute, and again soon after the laptop wakes (the timer fires late). */
+let firewallTickAt = Date.now();
+function firewallTick() {
+  const now = Date.now();
+  const resumed = now - firewallTickAt > 90_000;
+  firewallTickAt = now;
+  if (resumed) setTimeout(checkFirewall, 5000).unref();
+  else void checkFirewall();
 }
 
 let ui: WebUI;
@@ -138,6 +177,7 @@ const notifier = new SessionNotifier(notifySend, () => config.notify);
 const usb = new UsbBridge(AUDIO_PORT, () => config.usb, pushState);
 const server = new AudioServer(() => config, pwCatPlayer, {
   onChange: pushState,
+  wantsLevel: () => (ui?.listeners ?? 0) > 0,
   onLevel: (frame) => {
     lastLevelSent = frame.peak;
     ui?.broadcast("level", { ...frame, drops: server.drops });
@@ -219,7 +259,12 @@ function apply(next: Config) {
   const usbChanged = next.usb !== config.usb;
   if (codeChanged) changed.code = "changed"; // never log the code itself
   config = next;
-  saveConfig(config);
+  try {
+    saveConfig(config);
+  } catch (e) {
+    // Disk full or read-only: the change still takes effect for this run.
+    log("config_save_failed", { error: (e as Error).message });
+  }
   if (Object.keys(changed).length) log("settings", changed);
   if (sinkChanged) {
     pinned.reset();
@@ -293,19 +338,24 @@ async function main() {
   }
   usb.start();
   await checkFirewall();
-  setInterval(checkFirewall, 60_000).unref();
+  setInterval(firewallTick, 60_000).unref();
   setInterval(probeOutput, 10_000).unref();
   setInterval(checkPinnedOutput, 2000).unref();
   console.log(`Dhvani ${VERSION} listening on TCP ${AUDIO_PORT}, panel http://127.0.0.1:${UI_PORT}`);
-  console.log(`Pairing code ${config.code}. Addresses: ${addresses().map((a) => a.address).join(", ") || "none"}`);
+  // The pairing code stays out of the journal; the panel shows it.
+  console.log(`Addresses: ${addresses().map((a) => a.address).join(", ") || "none"}. Pairing code in the panel.`);
 
-
-  const stop = () => {
+  let stopping = false;
+  const stop = async () => {
+    if (stopping) return;
+    stopping = true;
     server.close();
-    usb.stop();
     notifier.close();
+    // adb can hang; never let it hold up the exit for long.
+    await Promise.race([usb.stop(), new Promise((r) => setTimeout(r, 2000))]);
     log("stop");
     ui.close();
+    flushLog();
     process.exit(0);
   };
   process.on("SIGTERM", stop);

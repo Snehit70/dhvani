@@ -62,6 +62,8 @@ export type ServerHooks = {
   outputMissing?(): boolean;
   /** The PipeWire sink to play on; default: the one in the config ("" follows the system output). */
   sink?(): string;
+  /** Someone is watching the meters (a panel is open). Default: always; false skips the FFT and levels. */
+  wantsLevel?(): boolean;
 };
 
 const isLoopback = (a: string) => a === "127.0.0.1" || a === "::1" || a.startsWith("127.");
@@ -88,6 +90,10 @@ export const SUSPEND_GAP_MS = 30_000;
 export const UDP_RETRY_MS = 10_000;
 export const UDP_RETRY_MAX_MS = 300_000;
 export const STATS_INTERVAL_MS = 10_000;
+/** Pings and state pushes wait while this much is still queued for the phone (a stalled TCP link). */
+export const MAX_CONTROL_BACKLOG = 64 * 1024;
+/** Most PCM one UDP packet may carry: 50 ms. The phone sends 5 ms per packet. */
+const MAX_PACKET_MS = 50;
 
 export type SessionSummary = {
   device: string; start: number; durationS: number; reason: string; drops: number; underruns: number;
@@ -255,7 +261,7 @@ export class AudioServer {
     const a = this.active;
     if (!a || a.socket.destroyed) return;
     const cfg = this.getConfig();
-    a.socket.write(laptopState(cfg.volume, cfg.muted, this.hooks.addresses?.() ?? [], this.hooks.outputMissing?.() ?? false));
+    this.writeControl(a, laptopState(cfg.volume, cfg.muted, this.hooks.addresses?.() ?? [], this.hooks.outputMissing?.() ?? false));
   }
 
   /** New bounds take effect at once; the player restarts so PipeWire's period follows the mode. */
@@ -269,6 +275,12 @@ export class AudioServer {
     if (!this.active) return;
     this.retirePlayer(this.active);
     this.active.lastSpawn = 0;
+  }
+
+  /** A control line that the next one supersedes (ping, state): skipped while the socket is backed up. */
+  private writeControl(a: Active, line: string) {
+    if (a.socket.destroyed || a.socket.writableLength > MAX_CONTROL_BACKLOG) return;
+    a.socket.write(line);
   }
 
   private fail(msg: string) {
@@ -442,7 +454,8 @@ export class AudioServer {
         active.player.gap?.();
         return;
       }
-      active.analyzer.push(frames);
+      const metering = this.hooks.wantsLevel?.() ?? true;
+      if (metering) active.analyzer.push(frames);
       const player = this.ensurePlayer(active);
       const cfg = this.getConfig();
       const pv = active.session.phoneVolume;
@@ -467,12 +480,12 @@ export class AudioServer {
       active.sec.lastSilent = silent;
       if (!silent) active.sec.idle = false;
       active.stats.chunk(peak, player?.leadMs ?? 0, silent);
-      this.reportLevel(active, peak);
+      if (metering) this.reportLevel(active, peak);
     };
     if (token) {
       const u: NonNullable<Active["udp"]> = {
         token,
-        reorder: new Reorder((d) => onAudio(d.pcm, d)),
+        reorder: new Reorder((d) => onAudio(d.pcm, d), undefined, hello.channels),
         lastAt: 0,
         lastTick: performance.now(),
         since: performance.now(),
@@ -517,6 +530,9 @@ export class AudioServer {
     if (!a || !u || (a.session.transport !== "udp" && !u.resuming)) return;
     const p = parseAudioPacket(msg);
     if (!p || !u.token.equals(p.token)) return;
+    if (p.pcm.length > (a.hello.rate * a.hello.channels * 2 * MAX_PACKET_MS) / 1000) return;
+    // Only new packets prove UDP still works: a burst of stale copies must not hold off the fallback.
+    if (!u.reorder.push(p.seq, p.sentMs, p.late, p.pcm)) return;
     u.lastAt = performance.now();
     if (u.resuming) {
       u.resuming = false;
@@ -525,7 +541,6 @@ export class AudioServer {
       log("udp_resume", { session: a.session.id });
       this.hooks.onChange();
     }
-    u.reorder.push(p.seq, p.sentMs, p.late, p.pcm);
   }
 
   /** Once a second over UDP: keep the phone's watchdog fed, switch between UDP and TCP, notice a vanished phone. */
@@ -564,7 +579,7 @@ export class AudioServer {
       }
     }
     // Over TCP too: the phone ignores it there, and it is ready the moment UDP resumes.
-    active.socket.write(PING_LINE);
+    this.writeControl(active, PING_LINE);
   }
 
   /** Tells the phone to send its audio over the TCP socket, and when to try UDP again. */
@@ -667,7 +682,7 @@ export class AudioServer {
     const a = this.sessionFor(address, s.code);
     if (!a) return;
     this.udpReachable(a);
-    log("phone_stats", { session: a.session.id, ...s.fields });
+    log("phone_stats", { ...s.fields, session: a.session.id });
     if (typeof s.fields.screenOn === "boolean" && a.screenOff === s.fields.screenOn) {
       a.screenOff = !s.fields.screenOn;
       log("phone_screen", { session: a.session.id, on: s.fields.screenOn });

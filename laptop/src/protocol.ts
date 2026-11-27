@@ -152,6 +152,9 @@ export class FailureLimiter {
  * claims plus only plain numeric/boolean/short-string fields, so a stray packet
  * cannot inject arbitrary structures into the log.
  */
+/** Envelope and log keys a phone report may not set. */
+const RESERVED_STATS_KEYS = new Set(["dhvani", "code", "v", "t", "ev", "session"]);
+
 export function parsePhoneStats(msg: string): { code: string; fields: Record<string, number | boolean | string> } | null {
   let o: unknown;
   try {
@@ -165,7 +168,7 @@ export function parsePhoneStats(msg: string): { code: string; fields: Record<str
   const fields: Record<string, number | boolean | string> = {};
   let n = 0;
   for (const [k, v] of Object.entries(r)) {
-    if (k === "dhvani" || k === "code" || k === "v" || !/^[a-zA-Z][a-zA-Z0-9]{0,23}$/.test(k)) continue;
+    if (RESERVED_STATS_KEYS.has(k) || !/^[a-zA-Z][a-zA-Z0-9]{0,23}$/.test(k)) continue;
     if (++n > 32) break;
     if (typeof v === "number" && Number.isFinite(v)) fields[k] = v;
     else if (typeof v === "boolean") fields[k] = v;

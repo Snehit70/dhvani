@@ -178,6 +178,46 @@ test("JitterBuffer prefills its target so a Wi-Fi hiccup does not run dry", () =
   expect(b.underruns).toBe(0);
 });
 
+test("JitterBuffer counts a short 10-20 ms dry spell after audible audio", () => {
+  let t = 0;
+  const b = new JitterBuffer(1, { minMs: 100, maxMs: 300 }, () => t);
+  b.admit(10);
+  t += 125; // lead 110 - 125 = -15 ms
+  expect(b.admit(10).prefillMs).toBeGreaterThan(0);
+  expect(b.underruns).toBe(1);
+});
+
+test("log lines keep their own t and ev whatever the fields say", () => {
+  const o = JSON.parse(logLine("phone_stats", { t: "x", ev: "evil", session: 3, rssi: -40 }, "2026-01-01T00:00:00.000Z"));
+  expect(o).toEqual({ t: "2026-01-01T00:00:00.000Z", ev: "phone_stats", session: 3, rssi: -40 });
+  expect(Object.keys(o).slice(0, 2)).toEqual(["t", "ev"]);
+});
+
+test("UsbBridge removes its reverse mapping when USB is turned off, and on stop", async () => {
+  let on = true;
+  const calls: string[] = [];
+  const run = async (args: string[]) => {
+    calls.push(args.join(" "));
+    if (args[0] === "devices") return { ok: true, out: "List of devices attached\nABC\tdevice\n", missing: false };
+    return { ok: true, out: "", missing: false };
+  };
+  const usb = new UsbBridge(47800, () => on, () => {}, run);
+  await usb.tick();
+  expect(usb.phones).toEqual(["ABC"]);
+  on = false;
+  await usb.tick();
+  expect(usb.phones).toEqual([]);
+  expect(calls).toContain("-s ABC reverse --remove tcp:47800");
+  on = true;
+  calls.length = 0;
+  await usb.tick();
+  await usb.stop();
+  expect(calls).toContain("-s ABC reverse --remove tcp:47800");
+  calls.length = 0;
+  await usb.stop(); // nothing left to remove
+  expect(calls).toEqual([]);
+});
+
 test("JitterBuffer grows after an audible underrun, ignores ones after silence, and relaxes", () => {
   let t = 0;
   const b = new JitterBuffer(1, { minMs: 100, maxMs: 300 }, () => t);
@@ -252,6 +292,8 @@ test("parsePhoneStats keeps only flat, bounded fields", () => {
     model: "x".repeat(100), nested: { a: 1 }, "bad key": 1, inf: "y" }));
   expect(r?.code).toBe("123456");
   expect(r?.fields).toEqual({ rssi: -60, ok: true, model: "x".repeat(64), inf: "y" });
+  // A phone report cannot rewrite the log envelope or the session it is filed under.
+  expect(parsePhoneStats(JSON.stringify({ dhvani: "stats", code: "1", t: "x", ev: "y", session: 9, rssi: 1 }))?.fields).toEqual({ rssi: 1 });
   expect(parsePhoneStats('{"dhvani":"discover"}')).toBeNull();
   expect(parsePhoneStats("nope")).toBeNull();
 });
@@ -310,6 +352,22 @@ test("SessionNotifier: one notice per real change, blips within grace are silent
   expect(sent).toEqual(["Phone connected", "Phone disconnected", "Phone connected"]);
 });
 
+test("SessionNotifier: another phone taking over is announced, the same phone reconnecting is not", () => {
+  const sent: string[] = [];
+  const n = new SessionNotifier((title, body) => sent.push(`${title}: ${body}`), () => true, 30);
+  n.started("Pixel");
+  n.ended("Pixel", "replaced");
+  n.started("Pixel"); // the same phone's new connection
+  expect(sent.length).toBe(1);
+  n.ended("Pixel", "replaced");
+  n.started("Galaxy");
+  expect(sent.length).toBe(2);
+  n.ended("Galaxy", "replaced");
+  n.started("Pixel"); // Pixel was dropped from the connected set when Galaxy took over
+  expect(sent.length).toBe(3);
+  expect(sent[2]).toContain("Pixel");
+});
+
 test("Analyzer: a 1 kHz tone lights the 1 kHz band, meters read the channel peaks", () => {
   const { Analyzer, bandEdges, BANDS } = require("../src/analyzer") as typeof import("../src/analyzer");
   const rate = 48000, n = 4096, pcm = new Uint8Array(n * 4), v = new DataView(pcm.buffer);
@@ -334,7 +392,9 @@ test("Analyzer: a 1 kHz tone lights the 1 kHz band, meters read the channel peak
   expect(a.frame(0).l).toBe(0); // meters reset between frames
 });
 
-import { Reorder, HOLE_WAIT_MS, MAX_CONCEAL, StaleGate, type Delivered } from "../src/udp";
+import { Reorder, HOLE_WAIT_MS, MAX_CONCEAL, StaleGate, seqDiff, type Delivered } from "../src/udp";
+import { logLine } from "../src/log";
+import { UsbBridge } from "../src/usb";
 import { declick } from "../src/audio";
 import { encodeAudioPacket, parseAudioPacket, isAudioPacket } from "../src/protocol";
 import { spread } from "../src/stats";
@@ -421,8 +481,47 @@ describe("UDP audio", () => {
     r.push(500, 0, false, pcm(2));
     t += HOLE_WAIT_MS + 1;
     r.tick();
-    expect(out.length).toBe(1 + MAX_CONCEAL + 1);
+    // Past MAX_CONCEAL only the short fade-out plays: the outage is over, so no silence queues behind it.
+    expect(out.length).toBe(1 + 1 + 1);
+    expect(out[1]!.concealed).toBe(true);
     expect(r.lost).toBe(499);
+  });
+
+  test("a hole up to MAX_CONCEAL is filled in full", () => {
+    let t = 0;
+    const out: Delivered[] = [];
+    const r = new Reorder((d) => out.push(d), () => t);
+    r.push(0, 0, false, pcm(1));
+    r.push(MAX_CONCEAL + 1, 0, false, pcm(2));
+    t += HOLE_WAIT_MS + 1;
+    r.tick();
+    expect(out.length).toBe(1 + MAX_CONCEAL + 1);
+  });
+
+  test("sequence numbers wrap past 2^32 without a hole or a stall", () => {
+    const { r, out, vals } = setup();
+    const top = 2 ** 32 - 2;
+    r.push(top, 0, false, pcm(1));
+    r.push(0, 0, false, pcm(3)); // arrives before 2^32 - 1
+    expect(vals()).toEqual([1]);
+    r.push(top + 1, 0, false, pcm(2));
+    expect(vals()).toEqual([1, 2, 3]);
+    expect(r.push(top + 1, 0, true, pcm(2))).toBe(false); // late copy after the wrap: a duplicate
+    r.push(1, 0, false, pcm(4));
+    expect(vals()).toEqual([1, 2, 3, 4]);
+    expect(out.some((d) => d.concealed)).toBe(false);
+    expect(seqDiff(0, 2 ** 32 - 1)).toBe(1);
+    expect(seqDiff(2 ** 32 - 1, 0)).toBe(-1);
+  });
+
+  test("push reports duplicates, and a restarted count starts over", () => {
+    const { r, out } = setup();
+    expect(r.push(100, 0, false, pcm(1))).toBe(true);
+    expect(r.push(100, 0, true, pcm(1))).toBe(false);
+    expect(r.push(50, 0, false, pcm(1))).toBe(false);
+    expect(r.push(100 + 5000, 0, false, pcm(2))).toBe(true); // a jump of seconds: the phone restarted its count
+    expect(out.length).toBe(2);
+    expect(r.lost).toBe(0);
   });
 
   test("reset forgets the sequence so a new run does not count as a giant hole", () => {
@@ -529,6 +628,20 @@ describe("Accelerator", () => {
     let x = 1;
     for (let i = 0; i < 960; i++) { x = (x * 1103515245 + 12345) & 0x7fffffff; v.setInt16(i * 2, (x % 20000) - 10000, true); }
     expect(a.shorten(b).length).toBe(b.length);
+  });
+  test("channels in opposite phase are loud, not quiet: no blind full-length cut", () => {
+    const a = new Accelerator(2, RATE);
+    const b = tone(40, 440);
+    const v = new DataView(b.buffer);
+    for (let f = 0; f < b.length / 4; f++) v.setInt16(f * 4 + 2, -v.getInt16(f * 4, true), true);
+    // The mono mix is silent, so the match search has nothing to go on and the block plays as is.
+    expect(a.shorten(b).length).toBe(b.length);
+  });
+  test("drop forgets held audio", () => {
+    const a = new Accelerator(2, RATE);
+    a.push(tone(5, 440));
+    expect(a.drop()).toBeCloseTo(5, 5);
+    expect(a.flush().length).toBe(0);
   });
   test("flush returns held audio untouched", () => {
     const a = new Accelerator(2, RATE);

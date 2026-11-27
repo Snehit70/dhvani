@@ -220,7 +220,8 @@ export class JitterBuffer {
   static readonly MAX_STEP_MS = 60;
   static readonly RELAX_AFTER_MS = 30_000;
   static readonly RELAX_STEP_MS = 10;
-  static readonly DRY_MS = 20;
+  /** Lead this far below zero: the output ran dry. 10 ms catches the short audible spells too. */
+  static readonly DRY_MS = 10;
   static readonly DRAIN_MS = 30;
   static readonly HEADROOM_MS = 200;
 

@@ -5,12 +5,20 @@ export const HOLE_WAIT_MS = REDUNDANT_DELAY_MS + 15;
 /** Never hold more than this many packets behind a hole, whatever the clock says. */
 const MAX_HELD = 32;
 /**
- * Most silence put in for one hole, in packets (100 ms). A longer hole means the output
- * already ran dry, and the jitter buffer restarts cleanly without it.
+ * Holes up to this many packets (100 ms) are filled in full so playback timing holds. A longer
+ * hole means the output already ran dry: it gets only the short fade-out, and the jitter buffer
+ * restarts cleanly instead of queuing 100 ms of silence after the outage is already over.
  */
 export const MAX_CONCEAL = 20;
+/** A sequence jump this large either way (10 s of packets) is a new run from the phone, not a hole. */
+export const MAX_JUMP = 2000;
 /** Fade-in on the first real packet after concealed ones, in frames (2.5 ms at 48 kHz). */
 const FADE_IN_FRAMES = 120;
+
+/** a - b on the u32 sequence circle: negative when a is before b, also across the wrap. */
+export function seqDiff(a: number, b: number): number {
+  return (a - b) | 0;
+}
 
 export type Delivered = {
   pcm: Uint8Array;
@@ -25,7 +33,7 @@ export type Delivered = {
 /**
  * Puts UDP audio packets back in order, drops duplicates, uses a packet's late copy
  * when the first was lost, and fills packets lost twice with silence so playback timing
- * holds. A hole is waited on for at most HOLE_WAIT_MS.
+ * holds. A hole is waited on for at most HOLE_WAIT_MS. Sequence numbers are u32 and wrap.
  */
 export class Reorder {
   private next = -1;
@@ -52,20 +60,28 @@ export class Reorder {
     this.lastPcm = null;
   }
 
-  push(seq: number, sentMs: number, late: boolean, pcm: Uint8Array) {
+  /** True if the packet was new: not a copy of one already played or waiting. */
+  push(seq: number, sentMs: number, late: boolean, pcm: Uint8Array): boolean {
+    seq >>>= 0;
+    if (this.next >= 0 && Math.abs(seqDiff(seq, this.next)) > MAX_JUMP) {
+      // The phone restarted its count: start over rather than conceal or ignore a giant gap.
+      this.reset();
+      this.afterHole = true;
+    }
     if (this.next < 0) this.next = seq;
     // Already played (the copy of a packet that arrived fine) or already waiting.
-    if (seq < this.next || this.held.has(seq)) return;
+    if (seqDiff(seq, this.next) < 0 || this.held.has(seq)) return false;
     this.received++;
     this.lastSize = pcm.length;
     if (seq === this.next) {
       this.emit(pcm, sentMs, late);
-      this.next++;
+      this.next = (this.next + 1) >>> 0;
       this.drain();
-      return;
+      return true;
     }
     this.held.set(seq, { pcm, sentMs, late, at: this.now() });
     if (this.held.size > MAX_HELD) this.skipHole();
+    return true;
   }
 
   /** Call every few ms: gives up on a hole once its late copy is overdue. */
@@ -78,12 +94,19 @@ export class Reorder {
   }
 
   private skipHole() {
-    let first = Infinity;
-    for (const k of this.held.keys()) if (k < first) first = k;
-    if (first === Infinity) return;
-    const missing = first - this.next;
+    let first = -1;
+    let missing = Infinity;
+    for (const k of this.held.keys()) {
+      const d = seqDiff(k, this.next);
+      if (d < missing) {
+        missing = d;
+        first = k;
+      }
+    }
+    if (first < 0) return;
     this.lost += missing;
-    for (let i = 0; i < Math.min(missing, MAX_CONCEAL); i++) {
+    const fill = missing <= MAX_CONCEAL ? missing : 1;
+    for (let i = 0; i < fill; i++) {
       // The first stand-in plays the last packet backwards, fading out: it starts on the sample
       // the audio stopped at, so the hole is heard as a short dip instead of a click.
       const pcm = i === 0 && this.lastPcm ? fadeOutReversed(this.lastPcm, this.channels) : new Uint8Array(this.lastSize);
@@ -98,7 +121,7 @@ export class Reorder {
     for (let h = this.held.get(this.next); h; h = this.held.get(this.next)) {
       this.held.delete(this.next);
       this.emit(h.pcm, h.sentMs, h.late);
-      this.next++;
+      this.next = (this.next + 1) >>> 0;
     }
   }
 

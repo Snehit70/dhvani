@@ -28,7 +28,8 @@ export function usbSerials(devicesOutput: string): string[] {
 
 /**
  * Keeps `adb reverse tcp:PORT tcp:PORT` in place for every USB-attached phone,
- * so the phone app can stream to 127.0.0.1 through the cable.
+ * so the phone app can stream to 127.0.0.1 through the cable. Turning USB off,
+ * or stopping, removes the mappings again.
  */
 export class UsbBridge {
   /** Serials with a working reverse. */
@@ -36,6 +37,10 @@ export class UsbBridge {
   available = true;
   private timer: ReturnType<typeof setTimeout> | null = null;
   private busy = false;
+  /** Serials that have Dhvani's reverse mapping, to remove when USB is turned off. */
+  private mapped = new Set<string>();
+  /** Bumped by stop(): a sync already running must not put mappings back afterwards. */
+  private generation = 0;
 
   constructor(
     private port: number,
@@ -45,8 +50,10 @@ export class UsbBridge {
   ) {}
 
   start(intervalMs = 5000) {
+    const gen = this.generation;
     const loop = async () => {
       await this.tick();
+      if (gen !== this.generation) return;
       // Without adb installed, look again only occasionally.
       this.timer = setTimeout(loop, this.available ? intervalMs : 60_000);
       this.timer.unref?.();
@@ -54,8 +61,12 @@ export class UsbBridge {
     void loop();
   }
 
-  stop() {
+  /** Stops polling and removes the mappings Dhvani made (best effort, bounded by adb's timeout). */
+  async stop() {
+    this.generation++;
     if (this.timer) clearTimeout(this.timer);
+    this.timer = null;
+    await this.unmapAll();
   }
 
   async tick() {
@@ -69,23 +80,46 @@ export class UsbBridge {
   }
 
   private async sync() {
-    if (!this.enabled()) return this.set([]);
+    const gen = this.generation;
+    if (!this.enabled()) {
+      await this.unmapAll();
+      return this.set([]);
+    }
     const devices = await this.run(["devices"]);
     this.available = !devices.missing;
     if (!devices.ok) return this.set([]);
     const ready: string[] = [];
     const want = `tcp:${this.port} tcp:${this.port}`;
     for (const serial of usbSerials(devices.out)) {
+      // Turned off or stopped while adb ran: leave the rest alone.
+      if (gen !== this.generation || !this.enabled()) break;
       const list = await this.run(["-s", serial, "reverse", "--list"]);
       if (list.ok && list.out.includes(want)) {
+        this.mapped.add(serial);
         ready.push(serial);
         continue;
       }
       const r = await this.run(["-s", serial, "reverse", `tcp:${this.port}`, `tcp:${this.port}`]);
       log("usb_reverse", { ok: r.ok });
-      if (r.ok) ready.push(serial);
+      if (r.ok) {
+        this.mapped.add(serial);
+        ready.push(serial);
+      }
+    }
+    if (gen !== this.generation || !this.enabled()) {
+      await this.unmapAll();
+      return this.set([]);
     }
     this.set(ready);
+  }
+
+  private async unmapAll() {
+    const serials = [...this.mapped];
+    this.mapped.clear();
+    for (const serial of serials) {
+      const r = await this.run(["-s", serial, "reverse", "--remove", `tcp:${this.port}`]);
+      log("usb_reverse_removed", { ok: r.ok });
+    }
   }
 
   private set(next: string[]) {

@@ -19,6 +19,8 @@ const QUIET_ENDS: ReadonlySet<EndReason> = new Set(["shutdown", "replaced", "cod
 export class SessionNotifier {
   private pending: { device: string; timer: ReturnType<typeof setTimeout> } | null = null;
   private connected = new Set<string>();
+  /** The device whose session a new hello just replaced; it stays connected only if it was the same phone. */
+  private replaced: string | null = null;
 
   constructor(
     private send: Send,
@@ -27,6 +29,8 @@ export class SessionNotifier {
   ) {}
 
   started(device: string) {
+    if (this.replaced !== null && this.replaced !== device) this.connected.delete(this.replaced);
+    this.replaced = null;
     if (this.pending?.device === device) {
       clearTimeout(this.pending.timer);
       this.pending = null;
@@ -39,7 +43,11 @@ export class SessionNotifier {
   }
 
   ended(device: string, reason: EndReason) {
-    if (reason === "replaced") return;
+    if (reason === "replaced") {
+      // A start follows at once: a reconnect of the same phone stays quiet, another phone does not inherit it.
+      this.replaced = device;
+      return;
+    }
     if (QUIET_ENDS.has(reason)) {
       this.connected.delete(device);
       return;
