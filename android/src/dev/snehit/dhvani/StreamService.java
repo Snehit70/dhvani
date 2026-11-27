@@ -113,40 +113,64 @@ public final class StreamService extends Service {
             java.util.concurrent.Executors.newSingleThreadExecutor();
     private final Runnable watchdog = new Runnable() {
         @Override public void run() {
-            if (!running) return;
+            Run r = run;
+            if (r == null || !r.active) return;
             long t = writeStartedAt;
             if (t != 0 && SystemClock.uptimeMillis() - t > WRITE_STALL_MS) {
                 stalls++;
                 Log.w(TAG, "write stuck " + (SystemClock.uptimeMillis() - t) + " ms, dropping connection");
-                closeQuietly(socket);
+                closeQuietly(r.socket);
             }
             long heard = lastHeardAt;
             if (useUdp && heard != 0 && SystemClock.uptimeMillis() - heard > LAPTOP_SILENT_MS) {
                 stalls++;
                 Log.w(TAG, "laptop silent " + (SystemClock.uptimeMillis() - heard) + " ms, dropping connection");
                 lastHeardAt = 0;
-                closeQuietly(socket);
+                closeQuietly(r.socket);
             }
             main.postDelayed(this, 1000);
         }
     };
-    private MediaProjection projection;
-    /** Swapped by the worker when the capture dies, released by stopCapture; guarded by recordLock. */
-    private AudioRecord record;
-    private final Object recordLock = new Object();
     /** Capture failures this close together count toward giving up on the capture. */
     private static final long CAPTURE_FAIL_WINDOW_MS = 30_000;
     private static final int CAPTURE_MAX_FAILS = 3;
-    private int captureFails;
-    private long lastCaptureFail;
+    /** How long teardown waits for a worker to finish before releasing the capture anyway. */
+    private static final long WORKER_JOIN_MS = 5000;
+
+    /**
+     * One Start: its own stop flag, projection, recorder, worker and socket. A stopped run's
+     * worker can linger (a blocked connect or read), and it must not touch the next run.
+     */
+    private final class Run {
+        volatile boolean active = true;
+        final MediaProjection projection;
+        /** Swapped by the worker when the capture dies, released by teardown; guarded by this. */
+        AudioRecord record;
+        Thread worker;
+        volatile Socket socket;
+        int captureFails;
+        long lastCaptureFail;
+        /** A stop callback queued for an earlier run must not stop this one. */
+        final MediaProjection.Callback onStop = new MediaProjection.Callback() {
+            @Override public void onStop() {
+                main.post(() -> {
+                    if (run == Run.this) stopStreaming(null);
+                });
+            }
+        };
+
+        Run(MediaProjection projection) {
+            this.projection = projection;
+        }
+    }
+
+    /** The current run, null when not streaming. Set and cleared on the main thread. */
+    private volatile Run run;
 
     /** The capture itself failed, not the network: retrying the laptop will not help. */
     private static final class CaptureLost extends Exception {
         CaptureLost(String why) { super(why); }
     }
-    private Thread worker;
-    private volatile boolean running;
-    private volatile Socket socket;
 
     private String host;
     private int port;
@@ -157,12 +181,6 @@ public final class StreamService extends Service {
     private AudioManager audio;
     private volatile int savedVolume = -1;
     private volatile boolean silenceBroken;
-
-    private final MediaProjection.Callback projectionCallback = new MediaProjection.Callback() {
-        @Override public void onStop() {
-            main.post(() -> stopStreaming(null));
-        }
-    };
 
     /** The live service, for the volume-key Accessibility service. */
     static volatile StreamService instance;
@@ -229,8 +247,18 @@ public final class StreamService extends Service {
         }
     }
 
+    private boolean running() {
+        Run r = run;
+        return r != null && r.active;
+    }
+
+    /** True while this run is the live one; a lingering worker from an old run is not. */
+    private boolean owns(Run r) {
+        return r.active && run == r;
+    }
+
     private boolean holdsPhoneSilent() {
-        return running && audio != null && savedVolume >= 0 && !silenceBroken;
+        return running() && audio != null && savedVolume >= 0 && !silenceBroken;
     }
 
     /** True while volume buttons should drive the laptop: streaming with the phone held silent. */
@@ -264,10 +292,10 @@ public final class StreamService extends Service {
 
     @Override public int onStartCommand(Intent intent, int flags, int startId) {
         if (intent != null && ACTION_CONTROL.equals(intent.getAction())) {
-            if (running) control(intent);
+            if (running()) control(intent);
             else {
                 Log.d(TAG, "control ignored, not streaming");
-                if (worker == null) stopSelf(startId);
+                if (run == null) stopSelf(startId);
             }
             return START_NOT_STICKY;
         }
@@ -276,7 +304,7 @@ public final class StreamService extends Service {
             stopStreaming(null);
             return START_NOT_STICKY;
         }
-        if (running) stopCapture();
+        if (run != null) stopCapture();
 
         host = intent.getStringExtra(EXTRA_HOST);
         port = intent.getIntExtra(EXTRA_PORT, Protocol.AUDIO_PORT);
@@ -302,34 +330,37 @@ public final class StreamService extends Service {
                 ? intent.getParcelableExtra(EXTRA_DATA, Intent.class)
                 : intent.getParcelableExtra(EXTRA_DATA);
         MediaProjectionManager mpm = (MediaProjectionManager) getSystemService(MEDIA_PROJECTION_SERVICE);
+        MediaProjection mp;
         try {
-            projection = data == null ? null : mpm.getMediaProjection(resultCode, data);
+            mp = data == null ? null : mpm.getMediaProjection(resultCode, data);
         } catch (RuntimeException e) {
-            projection = null;
+            mp = null;
         }
-        if (projection == null) {
+        if (mp == null) {
             fail("Audio sharing permission was not granted.");
             return START_NOT_STICKY;
         }
-        projection.registerCallback(projectionCallback, main);
+        Run r = new Run(mp);
+        mp.registerCallback(r.onStop, main);
 
         try {
-            record = buildRecorder(projection);
+            r.record = buildRecorder(mp);
         } catch (RuntimeException e) {
+            mp.unregisterCallback(r.onStop);
+            mp.stop();
             fail("Could not start audio capture: " + e.getMessage());
             return START_NOT_STICKY;
         }
 
-        running = true;
-        captureFails = 0;
         stalls = 0;
         reconnects = 0;
         Log.i(TAG, "start host=" + host + ":" + port + " silence=" + silence + " reconnect=" + reconnect
                 + " sdk=" + Build.VERSION.SDK_INT + " model=" + Build.MODEL);
         StreamState.setNotice("");
         acquireWifiLock();
-        worker = new Thread(this::runLoop, "dhvani-stream");
-        worker.start();
+        r.worker = new Thread(() -> runLoop(r), "dhvani-stream");
+        run = r;
+        r.worker.start();
         main.postDelayed(watchdog, 1000);
         return START_NOT_STICKY;
     }
@@ -374,12 +405,12 @@ public final class StreamService extends Service {
     }
 
     /** Starts the recorder, replacing it while it will not record. */
-    private AudioRecord startCapture(AudioRecord r) throws CaptureLost {
+    private AudioRecord startCapture(Run run, AudioRecord rec) throws CaptureLost {
         while (true) {
-            try { r.startRecording(); } catch (IllegalStateException ignored) {}
-            if (r.getRecordingState() == AudioRecord.RECORDSTATE_RECORDING) return r;
-            if (!running) throw new CaptureLost("stopped");
-            r = recoverCapture(r, "recorder would not start");
+            try { rec.startRecording(); } catch (IllegalStateException ignored) {}
+            if (rec.getRecordingState() == AudioRecord.RECORDSTATE_RECORDING) return rec;
+            if (!run.active) throw new CaptureLost("stopped");
+            rec = recoverCapture(run, rec, "recorder would not start");
         }
     }
 
@@ -387,40 +418,40 @@ public final class StreamService extends Service {
      * Swaps a recorder that stopped working for a new one from the same projection. A few
      * failures close together mean the projection itself is gone, so stop trying.
      */
-    private AudioRecord recoverCapture(AudioRecord old, String why) throws CaptureLost {
+    private AudioRecord recoverCapture(Run run, AudioRecord old, String why) throws CaptureLost {
         long now = SystemClock.uptimeMillis();
-        if (now - lastCaptureFail > CAPTURE_FAIL_WINDOW_MS) captureFails = 0;
-        lastCaptureFail = now;
-        captureFails++;
-        Log.w(TAG, "capture failed (" + why + "), rebuilding the recorder, try " + captureFails);
-        if (captureFails > CAPTURE_MAX_FAILS) throw new CaptureLost(why + ", " + captureFails + " times");
-        synchronized (recordLock) {
-            if (!running || projection == null) throw new CaptureLost("stopped");
+        if (now - run.lastCaptureFail > CAPTURE_FAIL_WINDOW_MS) run.captureFails = 0;
+        run.lastCaptureFail = now;
+        run.captureFails++;
+        Log.w(TAG, "capture failed (" + why + "), rebuilding the recorder, try " + run.captureFails);
+        if (run.captureFails > CAPTURE_MAX_FAILS) throw new CaptureLost(why + ", " + run.captureFails + " times");
+        synchronized (run) {
+            if (!run.active) throw new CaptureLost("stopped");
             try { old.stop(); } catch (RuntimeException ignored) {}
             old.release();
-            record = null;
+            run.record = null;
             try {
-                record = buildRecorder(projection);
+                run.record = buildRecorder(run.projection);
             } catch (RuntimeException e) {
                 throw new CaptureLost(why + "; new recorder failed: " + e.getMessage());
             }
-            return record;
+            return run.record;
         }
     }
 
-    private void runLoop() {
+    private void runLoop(Run run) {
         Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO);
         int backoff = 1000;
         // Since when (elapsedRealtime, which counts deep sleep) no attempt has reached the laptop.
         long lostSince = 0;
         byte[] buf = new byte[CHUNK_BYTES];
-        AudioRecord rec = record;
-        while (running) {
-            update(StreamState.Status.CONNECTING, "Connecting to " + host);
+        AudioRecord rec = run.record;
+        while (run.active) {
+            update(run, StreamState.Status.CONNECTING, "Connecting to " + host);
             Socket s = new Socket();
-            socket = s;
+            run.socket = s;
             // stopCapture may have closed the previous socket just before this one was published.
-            if (!running) { closeQuietly(s); break; }
+            if (!run.active) { closeQuietly(s); break; }
             boolean streamed = false;
             DatagramSocket statsSock = null;
             DatagramSocket audioSock = null;
@@ -436,9 +467,9 @@ public final class StreamService extends Service {
                 out.flush();
                 Protocol.Reply reply = Protocol.parseReply(readLine(s.getInputStream()));
                 if (!reply.ok) {
-                    if (!running) break;
+                    if (!run.active) break;
                     Log.w(TAG, "laptop refused: " + reply.error);
-                    stopFromWorker(Protocol.errorMessage(reply.error));
+                    stopFromWorker(run, Protocol.errorMessage(reply.error));
                     return;
                 }
                 Log.i(TAG, "streaming to " + reply.name);
@@ -458,12 +489,12 @@ public final class StreamService extends Service {
                 lateDue.clear();
                 lastHeardAt = SystemClock.uptimeMillis();
                 Log.i(TAG, "audio over " + (useUdp ? "udp" : "tcp"));
-                startLaptopReader(s);
-                rec = startCapture(rec);
-                silencePhone();
+                startLaptopReader(run, s);
+                rec = startCapture(run, rec);
+                silencePhone(run);
                 streamed = true;
                 backoff = 1000;
-                update(StreamState.Status.STREAMING, reply.name);
+                update(run, StreamState.Status.STREAMING, reply.name);
                 int zeroMs = 0;
                 int quietMs = 0;
                 long nextKeepalive = 0;
@@ -475,16 +506,16 @@ public final class StreamService extends Service {
                 String lastVolume = null;
                 long nextVolumeCheck = 0, volumeResendAt = 0;
                 boolean wasUdp = useUdp;
-                while (running) {
+                while (run.active) {
                     long r0 = SystemClock.uptimeMillis();
                     int n = rec.read(buf, 0, buf.length);
                     long readMs = SystemClock.uptimeMillis() - r0;
                     if (readMs > readMax) readMax = readMs;
                     if (readMs > 50) slowReads++;
                     if (n < 0) {
-                        if (!running) break;
+                        if (!run.active) break;
                         // The recorder died (often the audio server restarting): build a new one, keep the laptop.
-                        rec = startCapture(recoverCapture(rec, "read error " + n));
+                        rec = startCapture(run, recoverCapture(run, rec, "read error " + n));
                         continue;
                     }
                     if (n == 0) continue;
@@ -550,15 +581,15 @@ public final class StreamService extends Service {
                     }
                 }
             } catch (CaptureLost e) {
-                if (!running) break;
+                if (!run.active) break;
                 Log.w(TAG, "capture lost: " + e.getMessage());
-                stopFromWorker("Android stopped the audio capture. Tap Start to share again.");
+                stopFromWorker(run, "Android stopped the audio capture. Tap Start to share again.");
                 return;
             } catch (IOException | RuntimeException e) {
-                if (!running) break;
+                if (!run.active) break;
                 Log.w(TAG, (streamed ? "connection lost: " : "connect failed: ") + e);
                 if (!reconnect) {
-                    stopFromWorker(streamed ? "Connection to the laptop was lost." : friendly(e));
+                    stopFromWorker(run, streamed ? "Connection to the laptop was lost." : friendly(e));
                     return;
                 }
                 reconnects++;
@@ -567,19 +598,23 @@ public final class StreamService extends Service {
                 if (now - lostSince >= GIVE_UP_MS) {
                     Log.w(TAG, "no laptop for " + (now - lostSince) / 1000 + " s after " + reconnects + " tries; giving up");
                     notifyGaveUp();
-                    stopFromWorker("The laptop stopped answering, so streaming stopped. Tap Start when it's back.");
+                    stopFromWorker(run, "The laptop stopped answering, so streaming stopped. Tap Start when it's back.");
                     return;
                 }
-                update(StreamState.Status.RECONNECTING, streamed
+                update(run, StreamState.Status.RECONNECTING, streamed
                         ? "Connection lost. Retrying…" : friendly(e) + " Retrying…");
             } finally {
-                writeStartedAt = 0;
-                udpTarget = null;
-                useUdp = false;
-                lastHeardAt = 0;
+                // A stopped run's worker cleans up only its own sockets; the shared state is the next run's now.
+                boolean mine = owns(run);
+                if (mine) {
+                    writeStartedAt = 0;
+                    udpTarget = null;
+                    useUdp = false;
+                    lastHeardAt = 0;
+                    StreamState.clearLaptop();
+                    reportSock = null;
+                }
                 if (audioSock != null) audioSock.close();
-                StreamState.clearLaptop();
-                reportSock = null;
                 if (statsSock != null) statsSock.close();
                 closeQuietly(s);
                 try { rec.stop(); } catch (RuntimeException ignored) {}
@@ -587,7 +622,7 @@ public final class StreamService extends Service {
                 // once a reconnect has had a moment; a Wi-Fi blip should not blare the speaker.
                 // Only a dropped stream starts the wait: re-arming it on every failed retry
                 // kept the phone muted for the whole outage.
-                if (streamed) {
+                if (streamed && mine) {
                     main.removeCallbacks(restoreAfterGrace);
                     main.postDelayed(restoreAfterGrace, RESTORE_GRACE_MS);
                 }
@@ -659,13 +694,15 @@ public final class StreamService extends Service {
      * Reads the laptop's JSON lines (its volume, mute and LAN addresses) until the socket closes.
      * Over USB the TCP peer is 127.0.0.1, which UDP cannot reach, so reports go to a LAN address.
      */
-    private void startLaptopReader(Socket s) {
+    private void startLaptopReader(Run run, Socket s) {
         Thread t = new Thread(() -> {
             try {
                 InputStream in = s.getInputStream();
                 boolean first = true, wasMuted = false, wasMissing = false;
-                while (running && socket == s) {
+                while (run.active && run.socket == s) {
                     String line = readLine(in);
+                    // The run may have stopped or reconnected while this read blocked.
+                    if (!owns(run) || run.socket != s) break;
                     lastHeardAt = SystemClock.uptimeMillis();
                     if (Protocol.isTcpFallback(line)) {
                         Log.w(TAG, "laptop got no UDP audio, switching to tcp");
@@ -837,7 +874,9 @@ public final class StreamService extends Service {
 
     private final Runnable restoreAfterGrace = this::restoreVolume;
 
-    private synchronized void silencePhone() {
+    private synchronized void silencePhone(Run run) {
+        // Checked under the lock restoreVolume takes, so a stop cannot slip in and leave the phone muted.
+        if (!owns(run)) return;
         main.removeCallbacks(restoreAfterGrace);
         if (!silence || silenceBroken || savedVolume >= 0) return;
         try {
@@ -917,7 +956,8 @@ public final class StreamService extends Service {
         return n.trim();
     }
 
-    private void update(StreamState.Status s, String detail) {
+    private void update(Run run, StreamState.Status s, String detail) {
+        if (!owns(run)) return;
         StreamState.set(s, detail);
         refreshTile();
         String text;
@@ -936,7 +976,7 @@ public final class StreamService extends Service {
 
     private void refreshNotification() {
         main.post(() -> {
-            if (!running) return;
+            if (!running()) return;
             NotificationManager nm = getSystemService(NotificationManager.class);
             nm.notify(NOTIFICATION_ID, buildNotification(notificationText));
         });
@@ -974,8 +1014,10 @@ public final class StreamService extends Service {
         } catch (RuntimeException ignored) {}
     }
 
-    private void stopFromWorker(String error) {
-        main.post(() -> stopStreaming(error));
+    private void stopFromWorker(Run run, String error) {
+        main.post(() -> {
+            if (run == this.run) stopStreaming(error);
+        });
     }
 
     /** Stops everything; error is shown in the app, null means a normal stop. */
@@ -988,36 +1030,57 @@ public final class StreamService extends Service {
         stopSelf();
     }
 
+    /**
+     * Stops the current run without blocking the main thread: flags it, closes its socket and
+     * puts the volume back here, then stops the recorder, waits for the worker and releases
+     * the capture on a separate thread.
+     */
     private void stopCapture() {
-        running = false;
+        Run r = run;
+        run = null;
         main.removeCallbacks(watchdog);
         releaseWifiLock();
-        closeQuietly(socket);
-        // Stopping the recorder unblocks a worker waiting in read().
-        synchronized (recordLock) {
-            if (record != null) {
-                try { record.stop(); } catch (RuntimeException ignored) {}
-            }
-        }
-        Thread w = worker;
-        worker = null;
-        if (w != null && w != Thread.currentThread()) {
-            w.interrupt();
-            try { w.join(1500); } catch (InterruptedException ignored) {}
-        }
-        synchronized (recordLock) {
-            if (record != null) {
-                record.release();
-                record = null;
-            }
-        }
         main.removeCallbacks(restoreAfterGrace);
-        restoreVolume();
-        if (projection != null) {
-            projection.unregisterCallback(projectionCallback);
-            projection.stop();
-            projection = null;
+        if (r != null) {
+            r.active = false;
+            closeQuietly(r.socket);
         }
+        restoreVolume();
+        writeStartedAt = 0;
+        udpTarget = null;
+        useUdp = false;
+        lastHeardAt = 0;
+        reportSock = null;
+        StreamState.clearLaptop();
+        if (r == null) return;
+        Thread t = new Thread(() -> teardown(r), "dhvani-stop");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    private static void teardown(Run r) {
+        // Stopping the recorder unblocks a worker waiting in read().
+        synchronized (r) {
+            if (r.record != null) {
+                try { r.record.stop(); } catch (RuntimeException ignored) {}
+            }
+        }
+        Thread w = r.worker;
+        if (w != null) {
+            w.interrupt();
+            try { w.join(WORKER_JOIN_MS); } catch (InterruptedException ignored) {}
+            if (w.isAlive()) Log.w(TAG, "stream worker still running after " + WORKER_JOIN_MS + " ms; releasing anyway");
+        }
+        synchronized (r) {
+            if (r.record != null) {
+                r.record.release();
+                r.record = null;
+            }
+        }
+        try {
+            r.projection.unregisterCallback(r.onStop);
+            r.projection.stop();
+        } catch (RuntimeException ignored) {}
     }
 
     private static void closeQuietly(Socket s) {
