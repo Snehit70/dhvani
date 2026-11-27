@@ -933,11 +933,17 @@ function renderDown() {
 }
 
 // ---------- Events ----------
-let volTimer;
-const setVolume = (pct) => { pct = Math.max(0, Math.min(150, Math.round(pct))); $("volume").value = pct; setVolumeUi(pct, false); clearTimeout(volTimer); volTimer = setTimeout(() => post("/api/settings", { volume: pct / 100, muted: false }), 80); };
+// A slider move is sent 80 ms later and unmutes. Mute pressed in between sends that volume
+// with mute on, so the late slider post can't undo it.
+let volTimer, volPending = null;
+const setVolume = (pct) => { pct = Math.max(0, Math.min(150, Math.round(pct))); $("volume").value = pct; setVolumeUi(pct, false); volPending = pct / 100; clearTimeout(volTimer); volTimer = setTimeout(() => { const v = volPending; volPending = null; post("/api/settings", { volume: v, muted: false }); }, 80); };
 $("volume").addEventListener("input", (e) => setVolume(+e.target.value));
 for (const b of document.querySelectorAll(".presets button")) b.onclick = () => setVolume(+b.dataset.v);
-$("mute").onclick = () => post("/api/settings", { muted: !state?.muted });
+$("mute").onclick = () => {
+  if (volPending === null) return post("/api/settings", { muted: !state?.muted });
+  clearTimeout(volTimer); const v = volPending; volPending = null;
+  post("/api/settings", { volume: v, muted: true });
+};
 $("follow").addEventListener("change", (e) => post("/api/settings", { followPhone: e.target.checked }));
 $("notify").addEventListener("change", (e) => post("/api/settings", { notify: e.target.checked }));
 $("usb").addEventListener("change", (e) => post("/api/settings", { usb: e.target.checked }));

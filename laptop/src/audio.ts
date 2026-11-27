@@ -2,6 +2,8 @@
 const LIMIT_CEIL = 31_130;
 /** How long the limiter takes to give gain back after a peak. */
 const LIMIT_RELEASE_MS = 80;
+/** A volume or mute change glides over this long; a jump at a chunk boundary clicks on loud audio. */
+export const GAIN_RAMP_MS = 5;
 
 /**
  * Applies gain to s16le PCM and reports the post-gain peak in 0..1 for the level meter.
@@ -13,8 +15,14 @@ export class Limiter {
   /** Gain reduction currently applied, 1 when idle. */
   private env = 1;
   private readonly release: number;
+  private readonly rampFrames: number;
+  /** Gain in effect now, moving toward `target` by `step` per frame. Null until the first chunk. */
+  private cur: number | null = null;
+  private target = 1;
+  private step = 0;
   constructor(private readonly channels: number, rate: number) {
     this.release = 1 - Math.exp(-1 / ((LIMIT_RELEASE_MS / 1000) * rate));
+    this.rampFrames = Math.max(1, Math.round((GAIN_RAMP_MS / 1000) * rate));
   }
   process(chunk: Uint8Array, gain: number): { out: Uint8Array; peak: number } {
     const ch = Math.max(1, this.channels);
@@ -23,7 +31,12 @@ export class Limiter {
     const src = new DataView(chunk.buffer, chunk.byteOffset, frames * ch * 2);
     const dst = new DataView(out.buffer);
     let peak = 0;
-    const unity = gain === 1 && this.env === 1;
+    if (this.cur === null) this.cur = this.target = gain;
+    else if (gain !== this.target) {
+      this.target = gain;
+      this.step = (gain - this.cur) / this.rampFrames;
+    }
+    const unity = gain === 1 && this.cur === 1 && this.env === 1;
     for (let f = 0; f < frames; f++) {
       const base = f * ch * 2;
       if (unity) {
@@ -35,17 +48,22 @@ export class Limiter {
         }
         continue;
       }
+      if (this.cur !== this.target) {
+        this.cur += this.step;
+        if (this.step > 0 ? this.cur >= this.target : this.cur <= this.target) this.cur = this.target;
+      }
+      const level = this.cur;
       let loud = 0;
       for (let c = 0; c < ch; c++) {
         const s = src.getInt16(base + c * 2, true);
         const a = s < 0 ? -s : s;
         if (a > loud) loud = a;
       }
-      const want = loud * gain > LIMIT_CEIL ? LIMIT_CEIL / (loud * gain) : 1;
+      const want = loud * level > LIMIT_CEIL ? LIMIT_CEIL / (loud * level) : 1;
       if (want < this.env) this.env = want;
       else this.env += (want - this.env) * this.release;
       if (this.env > 0.99999) this.env = 1;
-      const g = gain * this.env;
+      const g = level * this.env;
       for (let c = 0; c < ch; c++) {
         let s = Math.round(src.getInt16(base + c * 2, true) * g);
         if (s > 32767) s = 32767;
@@ -59,13 +77,22 @@ export class Limiter {
   }
 }
 
+/** Below this setting (10%, -60 dB) the curve stops being cubic. */
+const CUBIC_KNEE = 0.1;
+/** Gain just above 0%, in dB. */
+const FLOOR_DB = -80;
+
 /**
  * Gain for a volume setting (0..1.5, the number the panel and the phone show). Cubic, like
  * PipeWire's own volume, so equal slider moves sound like equal steps: 50% is about -18 dB,
  * 100% unity, 150% about +10.6 dB. A linear scale made 5-15% loud and 100-150% barely louder.
+ * Under 10% the cube drops faster than 16-bit audio can follow (1% is -120 dB, so every sample
+ * rounds to 0), so there it falls evenly in dB from -60 to -80 instead.
  */
 export function volumeGain(volume: number): number {
-  return volume > 0 ? volume ** 3 : 0;
+  if (!(volume > 0)) return 0;
+  if (volume >= CUBIC_KNEE) return volume ** 3;
+  return 10 ** ((FLOOR_DB + (volume / CUBIC_KNEE) * (-60 - FLOOR_DB)) / 20);
 }
 
 /** Converts a setting saved on the old linear scale to the cubic one, keeping the same loudness. */

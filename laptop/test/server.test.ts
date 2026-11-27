@@ -175,9 +175,10 @@ test("phone volume scales output; muted phone means silent laptop", async () => 
   expect(players[0]!.data).toEqual([0, 0, 0, 0]);
   send({ code: "424242", index: 15, max: 15, muted: false });
   await until(() => server.session?.phoneVolume?.muted === false);
-  c.sock.write(Buffer.from([0x00, 0x40, 0x00, 0x40]));
-  await until(() => players[0]!.data.length === 8);
-  expect(players[0]!.data.slice(4)).toEqual([0x00, 0x40, 0x00, 0x40]);
+  // The unmute glides in over GAIN_RAMP_MS; after that it plays at full level.
+  c.sock.write(Buffer.alloc(4 * 300, Buffer.from([0x00, 0x40, 0x00, 0x40])));
+  await until(() => players[0]!.data.length === 4 + 1200);
+  expect(players[0]!.data.slice(-4)).toEqual([0x00, 0x40, 0x00, 0x40]);
   udp.close();
   c.sock.end();
 });
@@ -207,9 +208,9 @@ test("a missing output plays silence instead of falling back to the speakers", a
   await until(() => players[0]?.data.length === 4);
   expect(players[0]!.data).toEqual([0, 0, 0, 0]);
   missing = false;
-  c.sock.write(Buffer.from([0x00, 0x40, 0x00, 0x40]));
-  await until(() => players[0]?.data.length === 8);
-  expect(players[0]!.data.slice(4)).toEqual([0x00, 0x40, 0x00, 0x40]);
+  c.sock.write(Buffer.alloc(4 * 300, Buffer.from([0x00, 0x40, 0x00, 0x40])));
+  await until(() => players[0]?.data.length === 4 + 1200);
+  expect(players[0]!.data.slice(-4)).toEqual([0x00, 0x40, 0x00, 0x40]);
   c.sock.end();
 });
 

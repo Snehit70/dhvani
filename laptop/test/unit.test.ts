@@ -5,7 +5,7 @@ import { SessionNotifier } from "../src/notify";
 import { BACK_STABLE_MS, PinnedOutput } from "../src/output";
 import { sessionHistory } from "../src/report";
 import { usbSerials } from "../src/usb";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { sanitize, defaults, loadConfig } from "../src/config";
@@ -86,6 +86,20 @@ describe("audio", () => {
     expect(after[0]).toBeLessThan(1000);
     expect(after[after.length - 1]).toBe(1500);
   });
+  test("a gain change glides instead of jumping at the chunk boundary", () => {
+    const l = new Limiter(1, 48000);
+    l.process(pcm(...Array(480).fill(20000)), 1);
+    const out = read(l.process(pcm(...Array(480).fill(20000)), 0).out);
+    // 5 ms at 48 kHz: down in even steps, then silent.
+    expect(out[0]).toBeGreaterThan(19800);
+    expect(out[119]).toBeCloseTo(10000, -2);
+    expect(out.slice(240).every((s) => s === 0)).toBe(true);
+    for (let i = 1; i < 240; i++) expect(out[i]!).toBeLessThanOrEqual(out[i - 1]!);
+  });
+  test("the first chunk plays at its gain with no ramp", () => {
+    expect(read(processPcm(pcm(1000, -1000), 0).out)).toEqual([0, 0]);
+    expect(read(processPcm(pcm(1000, -20000), 1.5).out)).toEqual([1500, -30000]);
+  });
   test("FrameAligner keeps frames whole across chunks", () => {
     const a = new FrameAligner(4);
     const all = pcm(1, 2, 3, 4, 5, 6);
@@ -105,6 +119,28 @@ test("volume curve is cubic: 0 silent, 100% unity, 50% about -18 dB, 150% about 
   const db = (v: number) => 20 * Math.log10(volumeGain(v));
   expect(db(0.3) - db(0.25)).toBeLessThan(5);
   expect(db(1.5) - db(1.45)).toBeGreaterThan(0.8);
+});
+
+test("the lowest volume steps are quiet but not digital silence", () => {
+  const db = (v: number) => 20 * Math.log10(volumeGain(v));
+  // A full-scale sample must still come out nonzero at 1%.
+  expect(Math.round(32767 * volumeGain(0.01))).toBeGreaterThan(0);
+  expect(db(0.01)).toBeCloseTo(-78, 0);
+  expect(db(0.1)).toBeCloseTo(-60, 5);
+  for (let v = 0.01; v < 1.5; v += 0.01) expect(volumeGain(v + 0.01)).toBeGreaterThan(volumeGain(v));
+});
+
+test.skipIf(process.getuid?.() === 0)("a legacy config on a read-only path still loads", () => {
+  const dir = mkdtempSync(join(tmpdir(), "dhvani-cfg-"));
+  const path = join(dir, "config.json");
+  writeFileSync(path, JSON.stringify({ ...defaults(), volumeScale: undefined, volume: 0.13 }));
+  chmodSync(path, 0o400);
+  chmodSync(dir, 0o500);
+  try {
+    expect(loadConfig(path).volume).toBe(0.51);
+  } finally {
+    chmodSync(dir, 0o700);
+  }
 });
 
 test("a config saved on the old linear scale keeps its loudness", () => {

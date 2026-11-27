@@ -65,7 +65,14 @@ export function loadConfig(path = configPath()): Config {
     // Up to 0.8 the volume was a linear gain; move it to the cubic scale at the same loudness.
     const linear = raw.volumeScale !== "cubic";
     if (linear) merged.volume = fromLinearVolume(merged.volume);
-    if (raw.code !== merged.code || linear) saveConfig(merged, path);
+    if (raw.code !== merged.code || linear) {
+      // A config on a read-only mount still loads; the migration just runs again next start.
+      try {
+        saveConfig(merged, path);
+      } catch (e) {
+        console.warn(`could not update ${path}: ${(e as Error).message}`);
+      }
+    }
     return merged;
   } catch {
     const fresh = defaults();
