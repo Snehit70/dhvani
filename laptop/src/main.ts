@@ -11,7 +11,7 @@ import { SessionNotifier, notifySend } from "./notify";
 import { PinnedOutput } from "./output";
 import { UsbBridge } from "./usb";
 
-const VERSION = "0.9.4";
+const VERSION = "0.9.5";
 let config: Config = loadConfig();
 
 /** Container, VM and VPN-internal bridges a phone on the LAN can never reach. */
