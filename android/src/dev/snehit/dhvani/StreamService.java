@@ -131,7 +131,19 @@ public final class StreamService extends Service {
         }
     };
     private MediaProjection projection;
+    /** Swapped by the worker when the capture dies, released by stopCapture; guarded by recordLock. */
     private AudioRecord record;
+    private final Object recordLock = new Object();
+    /** Capture failures this close together count toward giving up on the capture. */
+    private static final long CAPTURE_FAIL_WINDOW_MS = 30_000;
+    private static final int CAPTURE_MAX_FAILS = 3;
+    private int captureFails;
+    private long lastCaptureFail;
+
+    /** The capture itself failed, not the network: retrying the laptop will not help. */
+    private static final class CaptureLost extends Exception {
+        CaptureLost(String why) { super(why); }
+    }
     private Thread worker;
     private volatile boolean running;
     private volatile Socket socket;
@@ -309,6 +321,7 @@ public final class StreamService extends Service {
         }
 
         running = true;
+        captureFails = 0;
         stalls = 0;
         reconnects = 0;
         Log.i(TAG, "start host=" + host + ":" + port + " silence=" + silence + " reconnect=" + reconnect
@@ -360,13 +373,48 @@ public final class StreamService extends Service {
         return r;
     }
 
+    /** Starts the recorder, replacing it while it will not record. */
+    private AudioRecord startCapture(AudioRecord r) throws CaptureLost {
+        while (true) {
+            try { r.startRecording(); } catch (IllegalStateException ignored) {}
+            if (r.getRecordingState() == AudioRecord.RECORDSTATE_RECORDING) return r;
+            if (!running) throw new CaptureLost("stopped");
+            r = recoverCapture(r, "recorder would not start");
+        }
+    }
+
+    /**
+     * Swaps a recorder that stopped working for a new one from the same projection. A few
+     * failures close together mean the projection itself is gone, so stop trying.
+     */
+    private AudioRecord recoverCapture(AudioRecord old, String why) throws CaptureLost {
+        long now = SystemClock.uptimeMillis();
+        if (now - lastCaptureFail > CAPTURE_FAIL_WINDOW_MS) captureFails = 0;
+        lastCaptureFail = now;
+        captureFails++;
+        Log.w(TAG, "capture failed (" + why + "), rebuilding the recorder, try " + captureFails);
+        if (captureFails > CAPTURE_MAX_FAILS) throw new CaptureLost(why + ", " + captureFails + " times");
+        synchronized (recordLock) {
+            if (!running || projection == null) throw new CaptureLost("stopped");
+            try { old.stop(); } catch (RuntimeException ignored) {}
+            old.release();
+            record = null;
+            try {
+                record = buildRecorder(projection);
+            } catch (RuntimeException e) {
+                throw new CaptureLost(why + "; new recorder failed: " + e.getMessage());
+            }
+            return record;
+        }
+    }
+
     private void runLoop() {
         Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO);
         int backoff = 1000;
         // Since when (elapsedRealtime, which counts deep sleep) no attempt has reached the laptop.
         long lostSince = 0;
         byte[] buf = new byte[CHUNK_BYTES];
-        final AudioRecord rec = record;
+        AudioRecord rec = record;
         while (running) {
             update(StreamState.Status.CONNECTING, "Connecting to " + host);
             Socket s = new Socket();
@@ -411,7 +459,7 @@ public final class StreamService extends Service {
                 lastHeardAt = SystemClock.uptimeMillis();
                 Log.i(TAG, "audio over " + (useUdp ? "udp" : "tcp"));
                 startLaptopReader(s);
-                rec.startRecording();
+                rec = startCapture(rec);
                 silencePhone();
                 streamed = true;
                 backoff = 1000;
@@ -433,7 +481,12 @@ public final class StreamService extends Service {
                     long readMs = SystemClock.uptimeMillis() - r0;
                     if (readMs > readMax) readMax = readMs;
                     if (readMs > 50) slowReads++;
-                    if (n < 0) throw new IOException("capture error " + n);
+                    if (n < 0) {
+                        if (!running) break;
+                        // The recorder died (often the audio server restarting): build a new one, keep the laptop.
+                        rec = startCapture(recoverCapture(rec, "read error " + n));
+                        continue;
+                    }
                     if (n == 0) continue;
                     // Over UDP nothing writes to the socket, so a closed one shows up only here.
                     if (s.isClosed()) throw new IOException("laptop closed the connection");
@@ -496,6 +549,11 @@ public final class StreamService extends Service {
                         }
                     }
                 }
+            } catch (CaptureLost e) {
+                if (!running) break;
+                Log.w(TAG, "capture lost: " + e.getMessage());
+                stopFromWorker("Android stopped the audio capture. Tap Start to share again.");
+                return;
             } catch (IOException | RuntimeException e) {
                 if (!running) break;
                 Log.w(TAG, (streamed ? "connection lost: " : "connect failed: ") + e);
@@ -936,8 +994,10 @@ public final class StreamService extends Service {
         releaseWifiLock();
         closeQuietly(socket);
         // Stopping the recorder unblocks a worker waiting in read().
-        if (record != null) {
-            try { record.stop(); } catch (RuntimeException ignored) {}
+        synchronized (recordLock) {
+            if (record != null) {
+                try { record.stop(); } catch (RuntimeException ignored) {}
+            }
         }
         Thread w = worker;
         worker = null;
@@ -945,9 +1005,11 @@ public final class StreamService extends Service {
             w.interrupt();
             try { w.join(1500); } catch (InterruptedException ignored) {}
         }
-        if (record != null) {
-            record.release();
-            record = null;
+        synchronized (recordLock) {
+            if (record != null) {
+                record.release();
+                record = null;
+            }
         }
         main.removeCallbacks(restoreAfterGrace);
         restoreVolume();
