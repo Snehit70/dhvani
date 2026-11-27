@@ -200,6 +200,8 @@ public final class StreamService extends Service {
             int prev = i.getIntExtra("android.media.EXTRA_PREV_VOLUME_STREAM_VALUE", 0);
             if (value <= 0 || !holdsPhoneSilent()) return;
             try { audio.setStreamVolume(AudioManager.STREAM_MUSIC, 0, 0); } catch (RuntimeException ignored) {}
+            // While reconnecting there is no laptop to move; don't let that press use up the window.
+            if (!ownsVolumeKeys()) return;
             long now = SystemClock.uptimeMillis();
             if (!fallbackStepDue(now, lastFallbackStep)) return;
             lastFallbackStep = now;
@@ -210,6 +212,7 @@ public final class StreamService extends Service {
     /**
      * One press is 10 phone steps on some phones (MIUI has 150), and a held key or the shade
      * slider sends a run of changes. Counting steps sent the laptop from 25% to 125% in two presses.
+     * Two real presses closer than this count as one; people don't press that fast.
      */
     private static final long FALLBACK_STEP_MS = 100;
     private long lastFallbackStep;
@@ -892,6 +895,36 @@ public final class StreamService extends Service {
 
     private android.content.SharedPreferences statePrefs() {
         return getSharedPreferences(STATE_PREFS, MODE_PRIVATE);
+    }
+
+    /**
+     * Puts back a volume left saved by a run that was killed while the phone was silenced
+     * ("Active apps" -> Stop gives no callback). Called on a cold app open; does nothing while
+     * a stream holds the phone silent.
+     */
+    static void restoreLeftover(Context c) {
+        StreamService s = instance;
+        if (s != null) {
+            s.restoreIfIdle();
+            return;
+        }
+        android.content.SharedPreferences p = c.getSharedPreferences(STATE_PREFS, MODE_PRIVATE);
+        int v = p.getInt(KEY_SAVED_VOLUME, -1);
+        if (v < 0) return;
+        p.edit().remove(KEY_SAVED_VOLUME).apply();
+        AudioManager am = c.getSystemService(AudioManager.class);
+        try {
+            if (am != null && am.getStreamVolume(AudioManager.STREAM_MUSIC) == 0) {
+                am.setStreamVolume(AudioManager.STREAM_MUSIC, v, 0);
+            }
+        } catch (RuntimeException ignored) {}
+    }
+
+    private synchronized void restoreIfIdle() {
+        if (run != null) return;
+        if (audio == null) audio = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
+        if (savedVolume >= 0) restoreVolume();
+        else restoreLeftoverVolume();
     }
 
     /** Puts back a volume saved by a previous run that died while the phone was silenced. */

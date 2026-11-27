@@ -193,6 +193,7 @@ public final class MainActivity extends Activity implements StreamState.Listener
     @Override protected void onCreate(Bundle state) {
         super.onCreate(state);
         prefs = getSharedPreferences("dhvani", MODE_PRIVATE);
+        if (!StreamState.active()) StreamService.restoreLeftover(this);
         dark = (getResources().getConfiguration().uiMode & Configuration.UI_MODE_NIGHT_MASK)
                 == Configuration.UI_MODE_NIGHT_YES;
         palette();
@@ -514,10 +515,14 @@ public final class MainActivity extends Activity implements StreamState.Listener
         p.view.setBackground(pressable(shape(bg, 16), fg, 16));
     }
 
-    /** Thick rounded track and a ringed thumb, in the streaming card's colors. */
+    /**
+     * Thick rounded track and a ringed thumb, in the streaming card's colors. The fill is clipped
+     * from the left on purpose: the SeekBar mirrors its drawable in RTL itself, and START would
+     * flip it a second time.
+     */
     private void styleSlider(SeekBar b) {
         GradientDrawable track = shape(alpha(onPrimaryContainer, 0.16f), 4);
-        ClipDrawable fill = new ClipDrawable(shape(primary, 4), Gravity.START, ClipDrawable.HORIZONTAL);
+        ClipDrawable fill = new ClipDrawable(shape(primary, 4), Gravity.LEFT, ClipDrawable.HORIZONTAL);
         LayerDrawable ld = new LayerDrawable(new Drawable[] {track, fill});
         ld.setId(0, android.R.id.background);
         ld.setId(1, android.R.id.progress);
