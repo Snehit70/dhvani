@@ -11,10 +11,18 @@
 //   and {"dhvani":"transport","udp":false} if no UDP audio arrives; the phone then sends PCM here.
 //   A connection whose first line is a discover request gets one discover reply and is closed
 //   (lets a phone find the laptop through `adb reverse` over USB, where UDP does not pass).
+//   Phone hello may carry "ctl":1. The reply then adds "ctl" (a key for this session only) and
+//   the laptop's "id" and "key" (kept across sessions, for the discovery proof below). Every
+//   report and control from that phone carries "key":ctl and a rising "n"; the laptop drops
+//   ones with another key or an old n, so a code seen on the network cannot steer the session.
+//   A connection whose first line is a control ({"dhvani":"control",...,"key","n"}) is answered
+//   with one laptop state line and closed: controls get through on TCP audio and over USB.
 //
 // Discovery (UDP broadcast, DISCOVERY_PORT):
-//   phone  -> 255.255.255.255  {"dhvani":"discover","v":1}
-//   laptop -> phone            {"dhvani":"here","v":1,"name":"fedora","port":47800}
+//   phone  -> 255.255.255.255  {"dhvani":"discover","v":1,"nonce"?:hex}
+//   laptop -> phone            {"dhvani":"here","v":1,"name":"fedora","port":47800,"id"?,"proof"?}
+//   proof = HMAC-SHA256(laptop key, nonce) in hex. A phone that paired before knows the key and
+//   can tell the real laptop from another machine answering with the same name.
 //
 // UDP audio (to DISCOVERY_PORT, which the firewall already opens), big-endian header:
 //   0 'D' 'H' | 2 version 1 | 3 flags (bit 0: late copy of an earlier packet) | 4 token, 8 bytes
@@ -26,6 +34,8 @@
 //   {"dhvani":"stats",...}    health counters every 10 s
 //   {"dhvani":"volume",...}   phone media volume and mute
 //   {"dhvani":"control","v":1,"code","volume"?:0..1.5,"muted"?:bool}  sets the laptop's own volume
+
+import { createHash, createHmac } from "node:crypto";
 
 export const PROTOCOL_VERSION = 1;
 export const AUDIO_PORT = 47800;
@@ -44,6 +54,8 @@ export type Hello = {
   format: "s16le";
   /** The phone can send audio over UDP. */
   udp: boolean;
+  /** The phone signs its reports and controls with a session key ("ctl"). */
+  ctl: boolean;
 };
 
 export type HelloError =
@@ -54,7 +66,7 @@ export type HelloError =
   | "rate_limited";
 
 export type HelloReply =
-  | { ok: true; name: string; udp?: { port: number; token: string } }
+  | { ok: true; name: string; udp?: { port: number; token: string }; ctl?: string; id?: string; key?: string }
   | { ok: false; error: HelloError };
 
 export function parseHello(line: string): Hello | { error: HelloError } {
@@ -87,6 +99,7 @@ export function parseHello(line: string): Hello | { error: HelloError } {
     channels: o.channels as 1 | 2,
     format: "s16le",
     udp: o.udp === 1 || o.udp === true,
+    ctl: o.ctl === 1 || o.ctl === true,
   };
 }
 
@@ -104,16 +117,33 @@ export function codesMatch(given: string, expected: string): boolean {
 }
 
 export function isDiscoverRequest(msg: string): boolean {
+  return discoverRequest(msg) !== null;
+}
+
+/** A discover request, with the phone's nonce when it sent one (newer phones). */
+export function discoverRequest(msg: string): { nonce: string | null } | null {
   try {
     const o = JSON.parse(msg) as Record<string, unknown>;
-    return o?.dhvani === "discover";
+    if (o?.dhvani !== "discover") return null;
+    return { nonce: typeof o.nonce === "string" && /^[0-9a-f]{16,64}$/.test(o.nonce) ? o.nonce : null };
   } catch {
-    return false;
+    return null;
   }
 }
 
-export function discoverReply(name: string, port: number): string {
-  return JSON.stringify({ dhvani: "here", v: PROTOCOL_VERSION, name, port });
+/** Public handle for the laptop key: tells the phone which stored key to check the proof with. */
+export function laptopId(key: string): string {
+  return createHash("sha256").update(`dhvani-id:${key}`).digest("hex").slice(0, 16);
+}
+
+export function discoverProof(key: string, nonce: string): string {
+  return createHmac("sha256", key).update(`dhvani-discover:${nonce}`).digest("hex");
+}
+
+/** With a nonce and the laptop key, the reply proves it comes from the laptop the phone paired with. */
+export function discoverReply(name: string, port: number, key?: string, nonce?: string | null): string {
+  const proof = key && nonce ? { id: laptopId(key), proof: discoverProof(key, nonce) } : {};
+  return JSON.stringify({ dhvani: "here", v: PROTOCOL_VERSION, name, port, ...proof });
 }
 
 /** Wrong-code limiter: after `maxFails` misses an address waits `blockMs`. */
@@ -153,9 +183,19 @@ export class FailureLimiter {
  * cannot inject arbitrary structures into the log.
  */
 /** Envelope and log keys a phone report may not set. */
-const RESERVED_STATS_KEYS = new Set(["dhvani", "code", "v", "t", "ev", "session"]);
+const RESERVED_STATS_KEYS = new Set(["dhvani", "code", "v", "t", "ev", "session", "key", "n"]);
 
-export function parsePhoneStats(msg: string): { code: string; fields: Record<string, number | boolean | string> } | null {
+/** The session key and counter a newer phone adds to every report (see the hello's "ctl"). */
+export type Signed = { key?: string; n?: number };
+
+function signed(r: Record<string, unknown>): Signed {
+  const out: Signed = {};
+  if (typeof r.key === "string" && /^[0-9a-f]{16}$/.test(r.key)) out.key = r.key;
+  if (Number.isSafeInteger(r.n) && (r.n as number) >= 0) out.n = r.n as number;
+  return out;
+}
+
+export function parsePhoneStats(msg: string): ({ code: string; fields: Record<string, number | boolean | string> } & Signed) | null {
   let o: unknown;
   try {
     o = JSON.parse(msg);
@@ -174,10 +214,10 @@ export function parsePhoneStats(msg: string): { code: string; fields: Record<str
     else if (typeof v === "boolean") fields[k] = v;
     else if (typeof v === "string") fields[k] = v.slice(0, 64);
   }
-  return { code: r.code, fields };
+  return { code: r.code, fields, ...signed(r) };
 }
 
-export type PhoneVolume = { code: string; index: number; max: number; muted: boolean };
+export type PhoneVolume = { code: string; index: number; max: number; muted: boolean } & Signed;
 
 /** Phone media volume report: {"dhvani":"volume","v":1,"code","index","max","muted"}. */
 export function parsePhoneVolume(msg: string): PhoneVolume | null {
@@ -193,7 +233,7 @@ export function parsePhoneVolume(msg: string): PhoneVolume | null {
   const { index, max, muted } = r;
   if (!Number.isInteger(index) || !Number.isInteger(max) || typeof muted !== "boolean") return null;
   if ((max as number) < 1 || (max as number) > 1000 || (index as number) < 0 || (index as number) > (max as number)) return null;
-  return { code: r.code, index: index as number, max: max as number, muted };
+  return { code: r.code, index: index as number, max: max as number, muted, ...signed(r) };
 }
 
 /** Lowest phone step maps to -45 dB; linear in dB like Android's own media curve. */
@@ -206,7 +246,7 @@ export function phoneGain(v: { index: number; max: number; muted: boolean }): nu
   return 10 ** ((-PHONE_RANGE_DB * (1 - v.index / v.max)) / 20);
 }
 
-export type PhoneControl = { code: string; volume?: number; muted?: boolean };
+export type PhoneControl = { code: string; volume?: number; muted?: boolean } & Signed;
 
 /** Phone asking to change the laptop's volume or mute. */
 export function parseControl(msg: string): PhoneControl | null {
@@ -219,7 +259,7 @@ export function parseControl(msg: string): PhoneControl | null {
   if (!o || typeof o !== "object") return null;
   const r = o as Record<string, unknown>;
   if (r.dhvani !== "control" || typeof r.code !== "string") return null;
-  const out: PhoneControl = { code: r.code };
+  const out: PhoneControl = { code: r.code, ...signed(r) };
   if (typeof r.volume === "number" && Number.isFinite(r.volume)) out.volume = Math.min(1.5, Math.max(0, r.volume));
   if (typeof r.muted === "boolean") out.muted = r.muted;
   return out.volume === undefined && out.muted === undefined ? null : out;

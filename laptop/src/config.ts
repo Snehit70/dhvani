@@ -1,7 +1,7 @@
 import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { dirname, join } from "node:path";
-import { randomInt } from "node:crypto";
+import { randomBytes, randomInt } from "node:crypto";
 import { fromLinearVolume, type LatencyMode } from "./audio";
 
 export type Config = {
@@ -24,6 +24,8 @@ export type Config = {
   notify: boolean;
   /** Set up `adb reverse` for phones plugged in by USB, so audio can skip Wi-Fi. */
   usb: boolean;
+  /** Secret a paired phone learns, so discovery replies can prove they come from this laptop. Never shown. */
+  laptopKey: string;
 };
 
 export function configPath(): string {
@@ -38,7 +40,7 @@ export function newCode(): string {
 export function defaults(): Config {
   return {
     code: newCode(), sink: "", volume: 1, volumeScale: "cubic", muted: false, followPhone: true, name: hostname(),
-    latency: "stable", notify: true, usb: true,
+    latency: "stable", notify: true, usb: true, laptopKey: randomBytes(16).toString("hex"),
   };
 }
 
@@ -55,6 +57,7 @@ export function sanitize(input: Partial<Config>, base: Config): Config {
   if (input.latency === "low" || input.latency === "stable") c.latency = input.latency;
   if (typeof input.notify === "boolean") c.notify = input.notify;
   if (typeof input.usb === "boolean") c.usb = input.usb;
+  if (typeof input.laptopKey === "string" && /^[0-9a-f]{32}$/.test(input.laptopKey)) c.laptopKey = input.laptopKey;
   return c;
 }
 
@@ -65,7 +68,11 @@ export function loadConfig(path = configPath()): Config {
     // Up to 0.8 the volume was a linear gain; move it to the cubic scale at the same loudness.
     const linear = raw.volumeScale !== "cubic";
     if (linear) merged.volume = fromLinearVolume(merged.volume);
-    if (raw.code !== merged.code || linear) {
+    // The file holds the code and the laptop key: owner-only even if something loosened it.
+    try {
+      chmodSync(path, 0o600);
+    } catch {}
+    if (raw.code !== merged.code || raw.laptopKey !== merged.laptopKey || linear) {
       // A config on a read-only mount still loads; the migration just runs again next start.
       try {
         saveConfig(merged, path);

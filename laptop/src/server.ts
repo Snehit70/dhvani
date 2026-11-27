@@ -13,12 +13,13 @@ import {
   MAX_HELLO_BYTES,
   codesMatch,
   discoverReply,
+  discoverRequest,
   encodeReply,
-  isDiscoverRequest,
   parseHello,
   parsePhoneStats,
   parseControl,
   parsePhoneVolume,
+  laptopId,
   laptopState,
   phoneGain,
   isAudioPacket,
@@ -27,8 +28,15 @@ import {
   TCP_FALLBACK_LINE,
   UDP_RESUME_LINE,
   type PhoneControl,
+  type PhoneVolume,
   type Hello,
+  type Signed,
 } from "./protocol";
+
+/** Report kinds with their own rising counter: a late UDP copy of one must not undo a newer one. */
+type ReportKind = "stats" | "volume" | "control";
+/** Why a phone report was not applied. */
+type Refused = "no_session" | "bad_code" | "bad_key" | "stale";
 
 export type Session = {
   id: number;
@@ -151,6 +159,10 @@ type Active = {
   lastTickAt: number;
   /** The player failure shown as lastError, cleared once a new player takes audio. */
   playerError: string;
+  /** Key the phone signs its reports with (hex), or null for an older phone that sends only the code. */
+  ctl: string | null;
+  /** Highest report counter seen per kind. */
+  lastN: Record<ReportKind, number>;
   udp: {
     token: Buffer;
     reorder: Reorder;
@@ -229,9 +241,10 @@ export class AudioServer {
       if (vol) return this.phoneVolume(vol, rinfo.address);
       const ctl = parseControl(text);
       if (ctl) return this.phoneControl(ctl, rinfo.address);
-      if (msg.length > 512 || !isDiscoverRequest(text)) return;
-      const reply = Buffer.from(discoverReply(this.getConfig().name, audioPort));
-      udp.send(reply, rinfo.port, rinfo.address);
+      const disc = msg.length > 512 ? null : discoverRequest(text);
+      if (!disc) return;
+      const cfg = this.getConfig();
+      udp.send(Buffer.from(discoverReply(cfg.name, audioPort, cfg.laptopKey, disc.nonce)), rinfo.port, rinfo.address);
     });
     await new Promise<void>((resolve, reject) => {
       udp.once("error", reject);
@@ -328,14 +341,30 @@ export class AudioServer {
       }
       const line = buf.subarray(0, nl).toString("utf8");
       const rest = buf.subarray(nl + 1);
-      if (isDiscoverRequest(line)) {
+      const disc = discoverRequest(line);
+      if (disc) {
         // USB probe through adb reverse: answer like UDP discovery, no session, no log noise.
         done = true;
         clearTimeout(timer);
-        socket.end(discoverReply(this.getConfig().name, this.audioPort) + "\n");
+        const cfg = this.getConfig();
+        socket.end(discoverReply(cfg.name, this.audioPort, cfg.laptopKey, disc.nonce) + "\n");
         return;
       }
       if (this.limiter.blocked(address)) return reject({ ok: false, error: "rate_limited" });
+      const ctl = parseControl(line);
+      if (ctl) {
+        // A control on its own connection: works while audio fills the session socket, and over USB.
+        done = true;
+        clearTimeout(timer);
+        const refused = ctl.key ? this.phoneControl(ctl, address) : "bad_key";
+        if (refused === "bad_code") this.limiter.fail(address);
+        const a = this.active;
+        const cfg = this.getConfig();
+        socket.end(refused || !a
+          ? JSON.stringify({ ok: false, error: refused || "no_session" }) + "\n"
+          : laptopState(cfg.volume, cfg.muted, this.hooks.addresses?.() ?? [], this.hooks.outputMissing?.() ?? false));
+        return;
+      }
       const hello = parseHello(line);
       if ("error" in hello) return reject({ ok: false, error: hello.error });
       if (!codesMatch(hello.code, this.getConfig().code)) {
@@ -401,6 +430,8 @@ export class AudioServer {
       secTimer: setInterval(() => this.tickSecond(active), 1000),
       lastTickAt: Date.now(),
       playerError: "",
+      ctl: hello.ctl ? randomBytes(8).toString("hex") : null,
+      lastN: { stats: -1, volume: -1, control: -1 },
       udp: null,
     };
     active.statsTimer.unref?.();
@@ -417,10 +448,12 @@ export class AudioServer {
     this.quality = null;
     this.phone = null;
     const token = useUdp ? randomBytes(8) : null;
+    const key = this.getConfig().laptopKey;
     socket.write(encodeReply({
       ok: true,
       name: this.getConfig().name,
       ...(token ? { udp: { port: this.discoveryPort, token: token.toString("hex") } } : {}),
+      ...(active.ctl && key ? { ctl: active.ctl, id: laptopId(key), key } : {}),
     }));
     this.pushLaptopState();
 
@@ -653,10 +686,17 @@ export class AudioServer {
    * address is loopback (adb reverse carries TCP only), so the phone reports over
    * Wi-Fi instead and only the code can tie the packet to the session.
    */
-  private sessionFor(address: string, code: string): Active | null {
+  private sessionFor(address: string, code: string, signed: Signed, kind: ReportKind): Active | Refused {
     const a = this.active;
-    if (!a || !codesMatch(code, this.getConfig().code)) return null;
-    if (a.session.address !== address && !isLoopback(a.session.address)) return null;
+    if (!a) return "no_session";
+    if (!codesMatch(code, this.getConfig().code)) return "bad_code";
+    if (a.session.address !== address && !isLoopback(a.session.address)) return "no_session";
+    // A phone that signs must sign everything: an unsigned packet with only the code is someone else.
+    if (a.ctl) {
+      if (!signed.key || !codesMatch(signed.key, a.ctl)) return "bad_key";
+      if (signed.n === undefined || signed.n <= a.lastN[kind]) return "stale";
+      a.lastN[kind] = signed.n;
+    }
     return a;
   }
 
@@ -677,10 +717,10 @@ export class AudioServer {
     a.socket.write(UDP_RESUME_LINE);
   }
 
-  private phoneStats(s: { code: string; fields: Record<string, unknown> }, address: string) {
+  private phoneStats(s: { code: string; fields: Record<string, unknown> } & Signed, address: string) {
     // Only the phone that is currently streaming, with the right code, gets logged.
-    const a = this.sessionFor(address, s.code);
-    if (!a) return;
+    const a = this.sessionFor(address, s.code, s, "stats");
+    if (typeof a === "string") return;
     this.udpReachable(a);
     log("phone_stats", { ...s.fields, session: a.session.id });
     if (typeof s.fields.screenOn === "boolean" && a.screenOff === s.fields.screenOn) {
@@ -692,9 +732,9 @@ export class AudioServer {
     this.hooks.onChange();
   }
 
-  private phoneVolume(v: { code: string; index: number; max: number; muted: boolean }, address: string) {
-    const a = this.sessionFor(address, v.code);
-    if (!a) return;
+  private phoneVolume(v: PhoneVolume, address: string) {
+    const a = this.sessionFor(address, v.code, v, "volume");
+    if (typeof a === "string") return;
     this.udpReachable(a);
     const prev = a.session.phoneVolume;
     if (prev && prev.index === v.index && prev.max === v.max && prev.muted === v.muted) return;
@@ -703,14 +743,16 @@ export class AudioServer {
     this.hooks.onChange();
   }
 
-  private phoneControl(c: PhoneControl, address: string) {
-    const a = this.sessionFor(address, c.code);
-    if (!a) return;
+  /** Applies a control from the streaming phone; returns why not, or null once applied. */
+  private phoneControl(c: PhoneControl, address: string): Refused | null {
+    const a = this.sessionFor(address, c.code, c, "control");
+    if (typeof a === "string") return a;
     const change: { volume?: number; muted?: boolean } = {};
     if (c.volume !== undefined) change.volume = c.volume;
     if (c.muted !== undefined) change.muted = c.muted;
     log("phone_control", { session: a.session.id, ...change });
     this.hooks.onControl?.(change);
+    return null;
   }
 
   private reportLevel(active: Active, peak: number) {

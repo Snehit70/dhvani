@@ -23,7 +23,7 @@ const CODE = "135790";
 
 const cfg: Config = {
   code: CODE, sink: "", volume: 1, volumeScale: "cubic", muted: false, followPhone: false, name: "e2e-laptop",
-  latency: "stable", notify: false, usb: false,
+  latency: "stable", notify: false, usb: false, laptopKey: "00112233445566778899aabbccddeeff",
 };
 
 let audioBytes = 0;

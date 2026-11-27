@@ -7,7 +7,7 @@ import { AudioServer } from "../src/server";
 
 const config: Config = {
   code: "424242", sink: "", volume: 1, volumeScale: "cubic", muted: false, followPhone: true, name: "testbox",
-  latency: "stable", notify: false, usb: false,
+  latency: "stable", notify: false, usb: false, laptopKey: "00112233445566778899aabbccddeeff",
 };
 
 type FakePlayer = Player & { data: number[]; opts: Parameters<PlayerFactory>[0] };
@@ -285,7 +285,70 @@ test("control packet from the streaming phone reaches the hook; wrong code does 
   c.sock.end();
 });
 
-import { encodeAudioPacket, TCP_FALLBACK_LINE, UDP_RESUME_LINE } from "../src/protocol";
+test("a signing phone's session ignores unsigned, foreign-key and replayed controls", async () => {
+  const port = await start();
+  const probe = dgram.createSocket("udp4");
+  await new Promise<void>((r) => probe.bind(0, "127.0.0.1", () => r()));
+  const discPort = probe.address().port;
+  probe.close();
+  await server.listenDiscovery(discPort, port);
+  const c = connect(port);
+  c.sock.write(JSON.stringify({ v: 1, code: "424242", device: "Pixel", rate: 48000, channels: 2, format: "s16le", ctl: 1 }) + "\n");
+  const reply = JSON.parse(await c.line());
+  expect(reply.ctl).toMatch(/^[0-9a-f]{16}$/);
+  expect(reply.key).toBe(config.laptopKey);
+  expect(reply.id).toBe(laptopId(config.laptopKey));
+  await until(() => server.session !== null);
+  const udp = dgram.createSocket("udp4");
+  const send = (o: object) => udp.send(JSON.stringify({ dhvani: "control", v: 1, code: "424242", ...o }), discPort, "127.0.0.1");
+  send({ volume: 0.1 }); // code only
+  send({ volume: 0.2, key: "0000000000000000", n: 1 }); // another session's key
+  send({ volume: 0.3, key: reply.ctl, n: 5 });
+  await until(() => controls.length === 1);
+  send({ volume: 0.4, key: reply.ctl, n: 5 }); // replay
+  send({ volume: 0.5, key: reply.ctl, n: 4 }); // older
+  send({ volume: 0.6, key: reply.ctl, n: 6 });
+  await until(() => controls.length === 2);
+  expect(controls).toEqual([{ volume: 0.3 }, { volume: 0.6 }]);
+  udp.close();
+  c.sock.end();
+});
+
+test("a control on its own TCP connection is applied and answered with the laptop state", async () => {
+  const port = await start();
+  const c = connect(port);
+  c.sock.write(JSON.stringify({ v: 1, code: "424242", device: "Pixel", rate: 48000, channels: 2, format: "s16le", ctl: 1 }) + "\n");
+  const { ctl } = JSON.parse(await c.line());
+  await until(() => server.session !== null);
+  const control = async (o: object) => {
+    const k = connect(port);
+    k.sock.write(JSON.stringify({ dhvani: "control", v: 1, code: "424242", ...o }) + "\n");
+    const line = JSON.parse(await k.line());
+    await k.closed;
+    return line;
+  };
+  expect(await control({ muted: true, key: ctl, n: 1 })).toMatchObject({ dhvani: "laptop", volume: 1, muted: false });
+  expect(controls).toEqual([{ muted: true }]);
+  expect(await control({ muted: false })).toEqual({ ok: false, error: "bad_key" });
+  expect(await control({ muted: false, key: ctl, n: 1 })).toEqual({ ok: false, error: "stale" });
+  expect(await control({ muted: false, key: ctl, n: 2, code: "000000" })).toEqual({ ok: false, error: "bad_code" });
+  expect(controls.length).toBe(1);
+  expect(server.session?.id).toBe(1);
+  c.sock.end();
+});
+
+test("discovery with a nonce carries the laptop id and a proof of its key", async () => {
+  const port = await start();
+  const nonce = "0123456789abcdef0123456789abcdef";
+  const c = connect(port);
+  c.sock.write(JSON.stringify({ dhvani: "discover", v: 1, nonce }) + "\n");
+  expect(JSON.parse(await c.line())).toEqual({
+    dhvani: "here", v: 1, name: "testbox", port,
+    id: laptopId(config.laptopKey), proof: discoverProof(config.laptopKey, nonce),
+  });
+});
+
+import { discoverProof, encodeAudioPacket, laptopId, TCP_FALLBACK_LINE, UDP_RESUME_LINE } from "../src/protocol";
 
 async function startUdp(retryMs?: number) {
   controls = [];

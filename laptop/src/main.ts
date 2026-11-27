@@ -283,7 +283,7 @@ ui = new WebUI({
   state,
   updateSettings(input) {
     // The code is only changed through "New code", never typed in.
-    const { code: _ignored, ...rest } = input as Partial<Config>;
+    const { code: _ignored, laptopKey: _secret, ...rest } = input as Partial<Config>;
     apply(sanitize(rest, config));
   },
   newCode() {

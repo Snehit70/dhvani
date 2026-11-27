@@ -5,11 +5,11 @@ import { SessionNotifier } from "../src/notify";
 import { BACK_STABLE_MS, PinnedOutput } from "../src/output";
 import { sessionHistory } from "../src/report";
 import { usbSerials } from "../src/usb";
-import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { sanitize, defaults, loadConfig } from "../src/config";
-import { FailureLimiter, codesMatch, isDiscoverRequest, parseHello, parseControl, parsePhoneStats, parsePhoneVolume, phoneGain } from "../src/protocol";
+import { FailureLimiter, codesMatch, discoverRequest, isDiscoverRequest, parseHello, parseControl, parsePhoneStats, parsePhoneVolume, phoneGain } from "../src/protocol";
 import { StreamStats } from "../src/stats";
 
 const hello = (o: Record<string, unknown> = {}) =>
@@ -804,4 +804,34 @@ describe("pipePlayer", () => {
     child.stdin.emit("error", new Error("EPIPE"));
     expect(child.kills).toEqual(["SIGKILL"]);
   });
+});
+
+test("signed reports: key and counter are parsed and kept out of the logged fields", () => {
+  expect(parseHello(hello({ ctl: 1 }))).toMatchObject({ ctl: true });
+  expect(parseHello(hello())).toMatchObject({ ctl: false });
+  const key = "0123456789abcdef";
+  expect(parseControl(JSON.stringify({ dhvani: "control", code: "1", muted: true, key, n: 3 }))).toEqual({ code: "1", muted: true, key, n: 3 });
+  expect(parseControl(JSON.stringify({ dhvani: "control", code: "1", muted: true, key: "XYZ", n: -1 }))).toEqual({ code: "1", muted: true });
+  const s = parsePhoneStats(JSON.stringify({ dhvani: "stats", code: "1", key, n: 9, rssi: -50 }));
+  expect(s).toEqual({ code: "1", fields: { rssi: -50 }, key, n: 9 });
+  expect(parsePhoneVolume(JSON.stringify({ dhvani: "volume", code: "1", index: 1, max: 15, muted: false, n: 2 }))?.n).toBe(2);
+});
+
+test("discover nonce must be plain hex of a sane length", () => {
+  expect(discoverRequest('{"dhvani":"discover","v":1}')).toEqual({ nonce: null });
+  expect(discoverRequest('{"dhvani":"discover","nonce":"00112233445566778899aabbccddeeff"}')).toEqual({ nonce: "00112233445566778899aabbccddeeff" });
+  expect(discoverRequest('{"dhvani":"discover","nonce":"short"}')).toEqual({ nonce: null });
+  expect(discoverRequest('{"dhvani":"discover","nonce":"' + "a".repeat(65) + '"}')).toEqual({ nonce: null });
+  expect(discoverRequest('{"dhvani":"here"}')).toBeNull();
+});
+
+test("config: a laptop key is created once and kept; the file is made owner-only", () => {
+  const dir = mkdtempSync(join(tmpdir(), "dhvani-key-"));
+  const path = join(dir, "config.json");
+  const { laptopKey: _k, ...old } = defaults();
+  writeFileSync(path, JSON.stringify(old), { mode: 0o644 });
+  const a = loadConfig(path);
+  expect(a.laptopKey).toMatch(/^[0-9a-f]{32}$/);
+  expect(loadConfig(path).laptopKey).toBe(a.laptopKey);
+  expect(statSync(path).mode & 0o777).toBe(0o600);
 });
