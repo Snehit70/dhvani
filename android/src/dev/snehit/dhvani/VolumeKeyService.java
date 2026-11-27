@@ -22,12 +22,25 @@ public final class VolumeKeyService extends AccessibilityService {
             case KeyEvent.KEYCODE_VOLUME_MUTE: direction = 0; break;
             default: return false;
         }
+        int k = direction + 1;
         StreamService s = StreamService.instance;
-        if (s == null || !s.ownsVolumeKeys()) return false;
-        // Held keys repeat ACTION_DOWN; the matching ACTION_UP is swallowed too.
-        if (e.getAction() == KeyEvent.ACTION_DOWN) s.volumeKey(direction);
+        if (e.getAction() == KeyEvent.ACTION_DOWN && e.getRepeatCount() == 0) {
+            // Decided once per press: a stream starting or stopping mid-press doesn't split it,
+            // so the phone never sees an UP without its DOWN or the other way round.
+            owned[k] = s != null && s.ownsVolumeKeys();
+        }
+        if (!owned[k]) return false;
+        if (e.getAction() == KeyEvent.ACTION_UP) {
+            owned[k] = false;
+            return true;
+        }
+        // Holding up or down keeps stepping; holding mute toggles once.
+        if (s != null && (direction != 0 || e.getRepeatCount() == 0)) s.volumeKey(direction);
         return true;
     }
+
+    /** Whether the current press of mute, down or up (by direction + 1) belongs to Dhvani. */
+    private final boolean[] owned = new boolean[3];
 
     @Override public void onAccessibilityEvent(AccessibilityEvent event) {}
 

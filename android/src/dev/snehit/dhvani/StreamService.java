@@ -59,8 +59,19 @@ public final class StreamService extends Service {
     private static final int NOTIFICATION_ID = 1;
     private static final int CHUNK_MS = 10;
     private static final int CHUNK_BYTES = Protocol.RATE * Protocol.CHANNELS * 2 * CHUNK_MS / 1000;
-    /** Media playing but capture all zeros this long means muting the phone also mutes the capture. */
+    /**
+     * Media playing but capture all zeros this long: either muting the phone also mutes the
+     * capture, or the playing app does not allow capture. A short unmuted probe tells them apart.
+     */
     private static final int SILENCE_PROBE_MS = 3000;
+    /** How long the probe lets the phone play out loud while it listens for capture to return. */
+    private static final long PROBE_LISTEN_MS = 600;
+    /** isMusicActive is a binder call; the silence check needs it a few times a second at most. */
+    private static final long MUSIC_ACTIVE_POLL_MS = 500;
+    /** A phone control the laptop has not confirmed by then is taken back on screen. */
+    private static final long CONTROL_CONFIRM_MS = 1500;
+    /** Late copies waiting to be sent; 20 ms of 5 ms packets needs far fewer. */
+    private static final int LATE_RING = 64;
 
     /** A write stuck this long means the laptop vanished without closing the socket. */
     private static final long WRITE_STALL_MS = 3000;
@@ -97,8 +108,28 @@ public final class StreamService extends Service {
     private volatile long lastHeardAt;
     private int udpSeq;
     private int udpErrors;
-    private final java.util.ArrayDeque<byte[]> lateCopies = new java.util.ArrayDeque<>();
-    private final java.util.ArrayDeque<Long> lateDue = new java.util.ArrayDeque<>();
+    /** Packets reused for every send: a ring of first copies kept until their late copy is due. */
+    private final byte[][] lateBuf = new byte[LATE_RING][Protocol.UDP_HEADER + Protocol.UDP_PCM_BYTES];
+    private final int[] lateLen = new int[LATE_RING];
+    private final long[] lateAt = new long[LATE_RING];
+    private int lateHead, lateCount;
+    private DatagramPacket audioPacket;
+    /** Session key from the laptop for signing reports and controls (null: an older laptop). */
+    private volatile String ctlKey;
+    private final java.util.concurrent.atomic.AtomicLong reportN = new java.util.concurrent.atomic.AtomicLong();
+    /** The session's TCP peer, where controls go on their own connection. */
+    private volatile InetSocketAddress controlAddr;
+    /** Laptop volume and mute as the laptop last reported them (-1: not yet). */
+    private volatile double confirmedVolume = -1;
+    private volatile boolean confirmedMuted;
+    /** Main thread: until then, laptop updates do not move the controls the user just changed. */
+    private long settleAt;
+    /** Main thread: bumped by every control, so only the latest one's answer is shown. */
+    private int controlGen;
+    private final Object controlLock = new Object();
+    private Double pendingVolume;
+    private Boolean pendingMuted;
+    private boolean controlQueued;
     /** Uptime when the current socket write began, 0 when no write is in flight. */
     private volatile long writeStartedAt;
     /** Times the watchdog killed a stuck connection this run. */
@@ -181,6 +212,17 @@ public final class StreamService extends Service {
     private AudioManager audio;
     private volatile int savedVolume = -1;
     private volatile boolean silenceBroken;
+    /** The silence probe has the phone audible for a moment; nothing may re-silence it meanwhile. */
+    private volatile boolean probing;
+    /** Capture was not all zeros while the phone was silenced: muting does not mute capture here. */
+    private boolean heardWhileSilenced;
+    /** A probe found the playing app blocks capture; probe again only after audio has been heard. */
+    private boolean probedBlocked;
+    private boolean musicActive;
+    private long musicActiveAt;
+    /** When the phone was silenced: audio read just after that may still be from before it. */
+    private volatile long silencedAt;
+    private static final long SILENCE_SETTLE_MS = 1000;
 
     /** The live service, for the volume-key Accessibility service. */
     static volatile StreamService instance;
@@ -261,7 +303,7 @@ public final class StreamService extends Service {
     }
 
     private boolean holdsPhoneSilent() {
-        return running() && audio != null && savedVolume >= 0 && !silenceBroken;
+        return running() && audio != null && savedVolume >= 0 && !silenceBroken && !probing;
     }
 
     /** True while volume buttons should drive the laptop: streaming with the phone held silent. */
@@ -315,6 +357,9 @@ public final class StreamService extends Service {
         silence = intent.getBooleanExtra(EXTRA_SILENCE, true);
         reconnect = intent.getBooleanExtra(EXTRA_RECONNECT, true);
         silenceBroken = false;
+        probing = false;
+        heardWhileSilenced = false;
+        probedBlocked = false;
         getSystemService(NotificationManager.class).cancel(GAVE_UP_NOTIFICATION_ID);
         audio = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
         restoreLeftoverVolume();
@@ -360,7 +405,6 @@ public final class StreamService extends Service {
         Log.i(TAG, "start host=" + host + ":" + port + " silence=" + silence + " reconnect=" + reconnect
                 + " sdk=" + Build.VERSION.SDK_INT + " model=" + Build.MODEL);
         StreamState.setNotice("");
-        acquireWifiLock();
         r.worker = new Thread(() -> runLoop(r), "dhvani-stream");
         run = r;
         r.worker.start();
@@ -480,16 +524,24 @@ public final class StreamService extends Service {
                 udpTarget = s.getInetAddress();
                 reportPort = reply.udpPort > 0 ? reply.udpPort : Protocol.DISCOVERY_PORT;
                 // adb reverse carries TCP only, so over USB the audio stays on the socket.
-                useUdp = reply.udpToken != null && !s.getInetAddress().isLoopbackAddress();
+                boolean usb = s.getInetAddress().isLoopbackAddress();
+                useUdp = reply.udpToken != null && !usb;
                 if (useUdp) {
                     audioSock = new DatagramSocket();
                     try { audioSock.setTrafficClass(TOS_EF); } catch (IOException ignored) {}
                     audioSock.connect(new InetSocketAddress(s.getInetAddress(), reply.udpPort));
+                    audioPacket = new DatagramPacket(new byte[1], 1, s.getInetAddress(), reply.udpPort);
                 }
+                ctlKey = reply.ctl;
+                reportN.set(0);
+                controlAddr = new InetSocketAddress(s.getInetAddress(), s.getPort());
+                if (reply.laptopKey != null) LaptopKeys.remember(this, reply.laptopId, reply.laptopKey, reply.name);
+                // The locks keep Wi-Fi awake; over the cable they only cost battery.
+                if (usb) releaseWifiLock();
+                else acquireWifiLock();
                 udpSeq = 0;
                 udpErrors = 0;
-                lateCopies.clear();
-                lateDue.clear();
+                lateHead = lateCount = 0;
                 lastHeardAt = SystemClock.uptimeMillis();
                 Log.i(TAG, "audio over " + (useUdp ? "udp" : "tcp"));
                 startLaptopReader(run, s);
@@ -499,6 +551,7 @@ public final class StreamService extends Service {
                 backoff = 1000;
                 update(run, StreamState.Status.STREAMING, reply.name);
                 int zeroMs = 0;
+                long probeUntil = 0;
                 int quietMs = 0;
                 long nextKeepalive = 0;
                 long nextStats = SystemClock.uptimeMillis() + STATS_INTERVAL_MS;
@@ -526,10 +579,7 @@ public final class StreamService extends Service {
                     if (s.isClosed()) throw new IOException("laptop closed the connection");
                     boolean udpNow = useUdp && audioSock != null;
                     // Back on UDP after a TCP stint: late copies queued before then are stale.
-                    if (udpNow && !wasUdp) {
-                        lateCopies.clear();
-                        lateDue.clear();
-                    }
+                    if (udpNow && !wasUdp) lateHead = lateCount = 0;
                     wasUdp = udpNow;
                     if (udpNow) sendLateCopies(audioSock, SystemClock.uptimeMillis());
                     boolean zero = allZero(buf, n);
@@ -560,7 +610,7 @@ public final class StreamService extends Service {
                         String key = v[0] + "/" + v[1] + (v[2] == 1 ? " muted" : "");
                         if (!key.equals(lastVolume) || now >= volumeResendAt) {
                             if (!key.equals(lastVolume)) Log.i(TAG, "phone volume " + key);
-                            sendVolume(statsSock, s, Protocol.volume(code, v[0], v[1], v[2] == 1));
+                            sendVolume(statsSock, s, Protocol.volume(code, v[0], v[1], v[2] == 1, ctlKey, reportN.incrementAndGet()));
                             lastVolume = key;
                             volumeResendAt = now + VOLUME_RESEND_MS;
                         }
@@ -572,14 +622,24 @@ public final class StreamService extends Service {
                         slowReads = slowWrites = 0;
                         nextStats = SystemClock.uptimeMillis() + STATS_INTERVAL_MS;
                     }
-                    if (savedVolume >= 0 && !silenceBroken) {
-                        zeroMs = zero && audio.isMusicActive() ? zeroMs + CHUNK_MS : 0;
+                    if (probing) {
+                        zeroMs = 0;
+                        probeStep(zero, probeUntil);
+                        if (!probing) probeUntil = 0;
+                    } else if (savedVolume >= 0 && !silenceBroken) {
+                        if (!zero && now - silencedAt > SILENCE_SETTLE_MS) {
+                            heardWhileSilenced = true;
+                            if (probedBlocked) {
+                                probedBlocked = false;
+                                StreamState.setNotice("");
+                            }
+                        }
+                        // Audio already came through while silenced, so zeros now are the app, not the mute.
+                        boolean check = zero && !heardWhileSilenced && !probedBlocked && musicActive(now);
+                        zeroMs = check ? zeroMs + CHUNK_MS : 0;
                         if (zeroMs >= SILENCE_PROBE_MS) {
-                            silenceBroken = true;
-                            Log.w(TAG, "capture is silent while muted; un-silencing phone");
-                            restoreVolume();
-                            StreamState.setNotice("This phone mutes the shared audio too, so it keeps "
-                                    + "playing out loud. Turn off \"Silence this phone\".");
+                            zeroMs = 0;
+                            probeUntil = startProbe();
                         }
                     }
                 }
@@ -616,6 +676,10 @@ public final class StreamService extends Service {
                     lastHeardAt = 0;
                     StreamState.clearLaptop();
                     reportSock = null;
+                    ctlKey = null;
+                    controlAddr = null;
+                    confirmedVolume = -1;
+                    endProbe(false);
                 }
                 if (audioSock != null) audioSock.close();
                 if (statsSock != null) statsSock.close();
@@ -644,32 +708,94 @@ public final class StreamService extends Service {
      * scales its output by this. While the app holds the phone silent, report full
      * volume so the laptop keeps its own level.
      */
-    /** Sends one capture read as 5 ms packets and queues each one's late copy. */
+    /**
+     * Sends one capture read as 5 ms packets and keeps each in the ring for its late copy.
+     * No allocation per packet: the ring slots and the DatagramPacket are reused.
+     */
     private void sendUdp(DatagramSocket ds, byte[] token, byte[] buf, int n, long now) {
         for (int off = 0; off < n; off += Protocol.UDP_PCM_BYTES) {
             int len = Math.min(Protocol.UDP_PCM_BYTES, n - off);
-            byte[] p = Protocol.audioPacket(token, udpSeq++, (int) now, buf, off, len);
-            sendPacket(ds, p);
-            byte[] late = p.clone();
-            late[3] = 1;
-            lateCopies.add(late);
-            lateDue.add(now + Protocol.REDUNDANT_DELAY_MS);
+            // Full ring (sends stalled for a long while): the oldest late copy is too old to help anyway.
+            if (lateCount == LATE_RING) {
+                lateHead = (lateHead + 1) % LATE_RING;
+                lateCount--;
+            }
+            int slot = (lateHead + lateCount) % LATE_RING;
+            byte[] p = lateBuf[slot];
+            int plen = Protocol.writeAudioPacket(p, token, udpSeq++, (int) now, buf, off, len);
+            sendPacket(ds, p, plen);
+            p[3] = 1;
+            lateLen[slot] = plen;
+            lateAt[slot] = now + Protocol.REDUNDANT_DELAY_MS;
+            lateCount++;
         }
     }
 
     private void sendLateCopies(DatagramSocket ds, long now) {
-        while (!lateDue.isEmpty() && lateDue.peek() <= now) {
-            lateDue.poll();
-            sendPacket(ds, lateCopies.poll());
+        while (lateCount > 0 && lateAt[lateHead] <= now) {
+            sendPacket(ds, lateBuf[lateHead], lateLen[lateHead]);
+            lateHead = (lateHead + 1) % LATE_RING;
+            lateCount--;
         }
     }
 
     /** A failed send loses one packet; the TCP socket decides whether the laptop is still there. */
-    private void sendPacket(DatagramSocket ds, byte[] p) {
+    private void sendPacket(DatagramSocket ds, byte[] p, int len) {
         try {
-            ds.send(new DatagramPacket(p, p.length));
-        } catch (IOException e) {
+            audioPacket.setData(p, 0, len);
+            ds.send(audioPacket);
+        } catch (IOException | RuntimeException e) {
             udpErrors++;
+        }
+    }
+
+    /** isMusicActive, asked at most every MUSIC_ACTIVE_POLL_MS. Stream thread only. */
+    private boolean musicActive(long now) {
+        if (now - musicActiveAt >= MUSIC_ACTIVE_POLL_MS) {
+            musicActiveAt = now;
+            musicActive = audio.isMusicActive();
+        }
+        return musicActive;
+    }
+
+    /**
+     * Lets the phone play out loud for a moment. If capture comes back, muting is what silenced it
+     * and the phone stays audible; if not, the app blocks capture and the phone goes quiet again.
+     * Returns when the probe ends.
+     */
+    private synchronized long startProbe() {
+        int v = savedVolume;
+        if (v <= 0 || silenceBroken) return 0;
+        probing = true;
+        Log.i(TAG, "capture silent while media plays; probing with the phone audible");
+        try { audio.setStreamVolume(AudioManager.STREAM_MUSIC, v, 0); } catch (RuntimeException ignored) {}
+        return SystemClock.uptimeMillis() + PROBE_LISTEN_MS;
+    }
+
+    private void probeStep(boolean zero, long until) {
+        if (!zero) {
+            endProbe(true);
+        } else if (SystemClock.uptimeMillis() >= until) {
+            endProbe(false);
+            probedBlocked = true;
+            Log.i(TAG, "capture still silent with the phone audible; the playing app blocks sharing");
+            StreamState.setNotice("The app that's playing doesn't let its audio be shared, "
+                    + "so the laptop hears nothing. Try another app.");
+        }
+    }
+
+    /** Ends a probe. With captureCameBack the phone stays audible for the rest of the run. */
+    private synchronized void endProbe(boolean captureCameBack) {
+        if (!probing) return;
+        probing = false;
+        if (captureCameBack) {
+            silenceBroken = true;
+            Log.w(TAG, "capture returned with the phone audible; muting mutes capture here, un-silencing phone");
+            restoreVolume();
+            StreamState.setNotice("This phone mutes the shared audio too, so it keeps "
+                    + "playing out loud. Turn off \"Silence this phone\".");
+        } else if (savedVolume >= 0 && running()) {
+            try { audio.setStreamVolume(AudioManager.STREAM_MUSIC, 0, 0); } catch (RuntimeException ignored) {}
         }
     }
 
@@ -721,6 +847,8 @@ public final class StreamService extends Service {
                     }
                     Protocol.Laptop l = Protocol.parseLaptop(line);
                     if (l == null) continue;
+                    confirmedVolume = l.volume;
+                    confirmedMuted = l.muted;
                     if (s.getInetAddress().isLoopbackAddress()) {
                         for (String a : l.addresses) {
                             if (a.matches("\\d{1,3}(\\.\\d{1,3}){3}")) {
@@ -729,7 +857,7 @@ public final class StreamService extends Service {
                             }
                         }
                     }
-                    StreamState.setLaptop(l.volume, l.muted, l.addresses, l.outputMissing);
+                    main.post(() -> showLaptop(l));
                     if (l.outputMissing != wasMissing && StreamState.status == StreamState.Status.STREAMING) {
                         notificationText = streamingText(StreamState.detail);
                     }
@@ -769,17 +897,67 @@ public final class StreamService extends Service {
         return null;
     }
 
-    /** Sets the laptop's volume and/or mute. Null leaves a field unchanged. */
+    /**
+     * Laptop state from its own update: shown unless the user just changed it here and the
+     * laptop has not answered that yet. Main thread.
+     */
+    private void showLaptop(Protocol.Laptop l) {
+        if (!running()) return;
+        if (SystemClock.uptimeMillis() < settleAt) {
+            StreamState.setLaptop(StreamState.laptopVolume, StreamState.laptopMuted, l.addresses, l.outputMissing);
+        } else {
+            StreamState.setLaptop(l.volume, l.muted, l.addresses, l.outputMissing);
+        }
+    }
+
+    /** No answer for the latest control: show what the laptop last said it has. Main thread. */
+    private void settle(int gen, Protocol.Laptop answer) {
+        if (gen != controlGen || !running()) return;
+        settleAt = 0;
+        if (answer != null) {
+            confirmedVolume = answer.volume;
+            confirmedMuted = answer.muted;
+            StreamState.setLaptop(answer.volume, answer.muted, answer.addresses, answer.outputMissing);
+        } else if (confirmedVolume >= 0) {
+            StreamState.setLaptop(confirmedVolume, confirmedMuted, null, StreamState.laptopOutputMissing);
+        }
+    }
+
+    /**
+     * Sets the laptop's volume and/or mute. Null leaves a field unchanged. Shown at once, and
+     * taken back if the laptop does not confirm. Main thread.
+     */
     private void laptopControl(Double volume, Boolean muted) {
         if (volume == null && muted == null) return;
         final java.net.InetAddress t = udpTarget;
         final String c = code;
-        Log.d(TAG, "control volume=" + volume + " muted=" + muted + (t == null ? " (no laptop address)" : " to port " + reportPort));
+        final InetSocketAddress tcp = controlAddr;
+        final String key = ctlKey;
+        Log.d(TAG, "control volume=" + volume + " muted=" + muted + (t == null ? " (no laptop address)"
+                : key != null && tcp != null ? " over tcp" : " to port " + reportPort));
         if (t == null || c == null) return;
-        // Shown right away; the laptop confirms with its own update over TCP.
         if (volume != null) StreamState.laptopVolume = volume;
         if (muted != null) StreamState.setLaptop(StreamState.laptopVolume, muted, null, StreamState.laptopOutputMissing);
-        final byte[] b = Protocol.control(c, volume, muted).getBytes(StandardCharsets.UTF_8);
+        final int gen = ++controlGen;
+        settleAt = SystemClock.uptimeMillis() + CONTROL_CONFIRM_MS;
+        if (key != null && tcp != null) {
+            // A drag sends many values: queue only the newest, each on its own short connection.
+            synchronized (controlLock) {
+                if (volume != null) pendingVolume = volume;
+                if (muted != null) pendingMuted = muted;
+                if (controlQueued) return;
+                controlQueued = true;
+            }
+            try {
+                sender.execute(() -> flushControls(c, key, tcp));
+            } catch (java.util.concurrent.RejectedExecutionException e) {
+                synchronized (controlLock) { controlQueued = false; }
+            }
+            return;
+        }
+        // An older laptop: UDP only, confirmed by the state it pushes back over TCP.
+        main.postDelayed(() -> settle(gen, null), CONTROL_CONFIRM_MS);
+        final byte[] b = Protocol.control(c, volume, muted, key, reportN.incrementAndGet()).getBytes(StandardCharsets.UTF_8);
         try {
             sender.execute(() -> {
                 DatagramSocket ds = reportSock;
@@ -791,6 +969,54 @@ public final class StreamService extends Service {
                 }
             });
         } catch (java.util.concurrent.RejectedExecutionException ignored) {}
+    }
+
+    /** Sender thread: sends the newest pending control until none is left. */
+    private void flushControls(String c, String key, InetSocketAddress tcp) {
+        while (true) {
+            Double v;
+            Boolean m;
+            synchronized (controlLock) {
+                v = pendingVolume;
+                m = pendingMuted;
+                pendingVolume = null;
+                pendingMuted = null;
+                if (v == null && m == null) {
+                    controlQueued = false;
+                    return;
+                }
+            }
+            String line = Protocol.control(c, v, m, key, reportN.incrementAndGet());
+            Protocol.Laptop answer = sendTcpControl(tcp, line);
+            boolean more;
+            synchronized (controlLock) { more = pendingVolume != null || pendingMuted != null; }
+            if (more) continue;
+            main.post(() -> {
+                int gen = controlGen;
+                // A control queued after this one was sent gets its own answer.
+                synchronized (controlLock) { if (pendingVolume != null || pendingMuted != null) return; }
+                settle(gen, answer);
+            });
+        }
+    }
+
+    /** One control on its own TCP connection; the laptop answers with its state, or null on failure. */
+    private Protocol.Laptop sendTcpControl(InetSocketAddress to, String line) {
+        try (Socket c = new Socket()) {
+            c.setTcpNoDelay(true);
+            c.connect(to, (int) CONTROL_CONFIRM_MS);
+            c.setSoTimeout((int) CONTROL_CONFIRM_MS);
+            OutputStream o = c.getOutputStream();
+            o.write((line + "\n").getBytes(StandardCharsets.UTF_8));
+            o.flush();
+            String reply = readLine(c.getInputStream());
+            Protocol.Laptop l = Protocol.parseLaptop(reply);
+            if (l == null) Log.w(TAG, "laptop refused the control: " + reply);
+            return l;
+        } catch (IOException | RuntimeException e) {
+            Log.d(TAG, "control over tcp failed: " + e);
+            return null;
+        }
     }
 
     /** Best effort: a lost packet only loses one sample of diagnostics. */
@@ -824,7 +1050,7 @@ public final class StreamService extends Service {
                     StreamState.setWifiTip(wifiTip(wi.getRssi(), wi.getFrequency()));
                 }
             }
-            byte[] b = Protocol.stats(code, o).getBytes(StandardCharsets.UTF_8);
+            byte[] b = Protocol.stats(code, o, ctlKey, reportN.incrementAndGet()).getBytes(StandardCharsets.UTF_8);
             sock.send(new DatagramPacket(b, b.length, target(s), reportPort));
             Log.d(TAG, "stats " + o);
         } catch (Exception ignored) {}
@@ -887,6 +1113,7 @@ public final class StreamService extends Service {
             // Persist first so a crash or force-stop cannot leave the phone muted for good.
             statePrefs().edit().putInt(KEY_SAVED_VOLUME, savedVolume).commit();
             audio.setStreamVolume(AudioManager.STREAM_MUSIC, 0, 0);
+            silencedAt = SystemClock.uptimeMillis();
         } catch (RuntimeException e) {
             savedVolume = -1;
             statePrefs().edit().remove(KEY_SAVED_VOLUME).apply();
@@ -935,7 +1162,8 @@ public final class StreamService extends Service {
         restoreVolume();
     }
 
-    private void acquireWifiLock() {
+    private synchronized void acquireWifiLock() {
+        if (wifiLock != null) return;
         try {
             WifiManager wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
             if (wm == null) return;
@@ -946,6 +1174,8 @@ public final class StreamService extends Service {
             wifiLock = null;
         }
         // LOW_LATENCY only applies while the screen is on; HIGH_PERF keeps Wi-Fi awake with it off.
+        // From Android 14 HIGH_PERF is just LOW_LATENCY again, so a second lock adds nothing.
+        if (Build.VERSION.SDK_INT >= 34) return;
         try {
             WifiManager wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
             if (wm == null) return;
@@ -959,7 +1189,7 @@ public final class StreamService extends Service {
         }
     }
 
-    private void releaseWifiLock() {
+    private synchronized void releaseWifiLock() {
         if (wifiLock != null && wifiLock.isHeld()) {
             try { wifiLock.release(); } catch (RuntimeException ignored) {}
         }
@@ -1078,6 +1308,7 @@ public final class StreamService extends Service {
             r.active = false;
             closeQuietly(r.socket);
         }
+        probing = false;
         restoreVolume();
         writeStartedAt = 0;
         udpTarget = null;

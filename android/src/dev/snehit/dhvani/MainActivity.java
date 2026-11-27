@@ -55,11 +55,13 @@ import java.net.InterfaceAddress;
 import java.net.NetworkInterface;
 import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
+import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import org.json.JSONObject;
 
 /**
  * Single-screen UI built in code, following Material 3: tonal surfaces instead of borders,
@@ -73,9 +75,14 @@ public final class MainActivity extends Activity implements StreamState.Listener
     private static final int REQ_PERMS = 1;
     private static final int REQ_PROJECTION = 2;
     private static final long LAPTOP_TTL_MS = 8000;
+    /** Discovery asks every 2 s while picking a laptop, and only now and then while streaming. */
+    private static final long PROBE_IDLE_MS = 2000;
+    private static final long PROBE_STREAMING_MS = 15000;
+    private static final long LAPTOP_TTL_STREAMING_MS = 40000;
     /** Set by the Quick Settings tile: start streaming as soon as the screen opens. */
     static final String EXTRA_AUTOSTART = "autostart";
     private static final String USB_HOST = "127.0.0.1";
+    private static final SecureRandom RANDOM = new SecureRandom();
     /** M3 emphasized easing, used for every state change on this screen. */
     private static final PathInterpolator EASE = new PathInterpolator(0.2f, 0f, 0f, 1f);
 
@@ -128,8 +135,10 @@ public final class MainActivity extends Activity implements StreamState.Listener
 
     private static final class Laptop {
         final String ip; final String name; final int port; long seen;
-        Laptop(String ip, String name, int port, long seen) {
-            this.ip = ip; this.name = name; this.port = port; this.seen = seen;
+        /** Uses the name of a laptop this phone paired with, but could not prove it is that laptop. */
+        final boolean unverified;
+        Laptop(String ip, String name, int port, long seen, boolean unverified) {
+            this.ip = ip; this.name = name; this.port = port; this.seen = seen; this.unverified = unverified;
         }
     }
 
@@ -441,6 +450,9 @@ public final class MainActivity extends Activity implements StreamState.Listener
         e.setBackground(null);
         e.setPadding(0, dp(2), 0, dp(8));
         box.addView(e, fullWidth());
+        // TalkBack reads the label with the field instead of as a separate line.
+        e.setId(View.generateViewId());
+        l.setLabelFor(e.getId());
         e.setOnFocusChangeListener((v, focused) -> {
             bg.setStroke(focused ? dp(2) : 0, primary);
             l.setTextColor(focused ? primary : onSurfaceVariant);
@@ -486,7 +498,19 @@ public final class MainActivity extends Activity implements StreamState.Listener
         sw.setThumbTintList(new ColorStateList(states, new int[] {primary, outline}));
         sw.setTrackTintList(new ColorStateList(states, new int[] {alpha(primary, 0.5f), outlineVariant}));
         LinearLayout row = listRow(parent, iconRes, title, sub, sw);
+        // One control for touch and TalkBack: the row toggles, reads as a switch and its state.
+        sw.setClickable(false);
+        sw.setFocusable(false);
+        sw.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
         row.setOnClickListener(v -> sw.toggle());
+        row.setAccessibilityDelegate(new View.AccessibilityDelegate() {
+            @Override public void onInitializeAccessibilityNodeInfo(View host, android.view.accessibility.AccessibilityNodeInfo info) {
+                super.onInitializeAccessibilityNodeInfo(host, info);
+                info.setClassName(Switch.class.getName());
+                info.setCheckable(true);
+                info.setChecked(sw.isChecked());
+            }
+        });
         return sw;
     }
 
@@ -605,6 +629,9 @@ public final class MainActivity extends Activity implements StreamState.Listener
         heroTitle.setEllipsize(TextUtils.TruncateAt.END);
         heroDetail = text("", 14, onSurfaceVariant, false);
         heroDetail.setPadding(0, dp(2), 0, 0);
+        // Status changes (connecting, streaming, lost) are announced without moving focus.
+        heroTitle.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
+        heroDetail.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
         texts.addView(heroOverline);
         texts.addView(heroTitle);
         texts.addView(heroDetail);
@@ -670,6 +697,7 @@ public final class MainActivity extends Activity implements StreamState.Listener
         nilp.setMarginEnd(dp(12));
         noticeBox.addView(noticeIcon, nilp);
         notice = text("", 14, onWarningContainer, false);
+        notice.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
         noticeBox.addView(notice, weighted());
         LinearLayout.LayoutParams nlp = fullWidth();
         nlp.topMargin = dp(16);
@@ -941,7 +969,8 @@ public final class MainActivity extends Activity implements StreamState.Listener
         long now = System.currentTimeMillis();
         List<Laptop> list = new ArrayList<>();
         synchronized (laptops) {
-            laptops.values().removeIf(l -> now - l.seen > LAPTOP_TTL_MS);
+            long ttl = StreamState.active() ? LAPTOP_TTL_STREAMING_MS : LAPTOP_TTL_MS;
+            laptops.values().removeIf(l -> now - l.seen > ttl);
             list.addAll(laptops.values());
         }
         String current = addressField.getText().toString().trim();
@@ -950,7 +979,7 @@ public final class MainActivity extends Activity implements StreamState.Listener
         for (Laptop l : list) {
             String a = address(l);
             if (a.equals(current)) inList = true;
-            key.append(a).append('=').append(l.name).append(';');
+            key.append(a).append('=').append(l.name).append(l.unverified ? "?" : "").append(';');
         }
         searchRow.setVisibility(list.isEmpty() ? View.VISIBLE : View.GONE);
         // The typed address shows only when asked for, or when it is not one of the laptops listed.
@@ -984,7 +1013,7 @@ public final class MainActivity extends Activity implements StreamState.Listener
             name.setSingleLine(true);
             name.setEllipsize(TextUtils.TruncateAt.END);
             t.addView(name);
-            String shown = usb ? "USB cable" : addr;
+            String shown = (usb ? "USB cable" : addr) + (l.unverified ? " \u00b7 not verified" : "");
             t.addView(text(shown, 13, selected ? alpha(onSecondaryContainer, 0.8f) : onSurfaceVariant, false));
             row.addView(t, weighted());
             if (selected) {
@@ -1046,8 +1075,9 @@ public final class MainActivity extends Activity implements StreamState.Listener
             startService(new Intent(this, StreamService.class).setAction(StreamService.ACTION_STOP));
             return;
         }
-        String addr = addressField.getText().toString().trim();
-        if (addr.isEmpty()) { showError("Pick a laptop or type its address."); return; }
+        // Check the address before the permission and sharing prompts, not after them.
+        Object[] parsed = Protocol.parseAddress(addressField.getText().toString());
+        if (parsed[0] == null) { showError((String) parsed[1]); return; }
         if (!codeField.getText().toString().trim().matches("\\d{6}")) {
             showError("Enter the 6-digit code shown on the laptop.");
             return;
@@ -1093,19 +1123,10 @@ public final class MainActivity extends Activity implements StreamState.Listener
             showError("Sharing was cancelled.");
             return;
         }
-        String addr = prefs.getString("host", "");
-        String host = addr;
-        int port = Protocol.AUDIO_PORT;
-        int colon = addr.lastIndexOf(':');
-        if (colon > 0 && addr.indexOf(':') == colon) {
-            try {
-                port = Integer.parseInt(addr.substring(colon + 1));
-                host = addr.substring(0, colon);
-            } catch (NumberFormatException e) {
-                showError("The port after ':' must be a number.");
-                return;
-            }
-        }
+        Object[] parsed = Protocol.parseAddress(prefs.getString("host", ""));
+        if (parsed[0] == null) { showError((String) parsed[1]); return; }
+        String host = (String) parsed[0];
+        int port = (Integer) parsed[1];
         Intent svc = new Intent(this, StreamService.class)
                 .setAction(StreamService.ACTION_START)
                 .putExtra(StreamService.EXTRA_RESULT_CODE, result)
@@ -1153,54 +1174,92 @@ public final class MainActivity extends Activity implements StreamState.Listener
      * With a cable and the laptop's USB mode on, adb reverse forwards 127.0.0.1:47800 to the laptop.
      * Ask it the discovery question over TCP; no listener there fails at once.
      */
-    private void probeUsb() {
+    private void probeUsb(String nonce, JSONObject known) {
         try (java.net.Socket s = new java.net.Socket()) {
             s.connect(new java.net.InetSocketAddress(USB_HOST, Protocol.AUDIO_PORT), 300);
             s.setSoTimeout(600);
-            s.getOutputStream().write((Protocol.DISCOVER + "\n").getBytes(StandardCharsets.UTF_8));
+            s.getOutputStream().write((Protocol.discover(nonce) + "\n").getBytes(StandardCharsets.UTF_8));
             java.io.InputStream in = s.getInputStream();
             StringBuilder sb = new StringBuilder();
             int c;
             while (sb.length() < 512 && (c = in.read()) >= 0 && c != '\n') sb.append((char) c);
-            Object[] r = Protocol.parseDiscoverReply(sb.toString());
-            if (r == null) return;
-            boolean fresh = !laptops.containsKey(USB_HOST);
-            laptops.put(USB_HOST, new Laptop(USB_HOST, (String) r[0], Protocol.AUDIO_PORT, System.currentTimeMillis()));
-            if (fresh) main.post(this::renderLaptops);
+            Protocol.Here r = Protocol.parseDiscoverReply(sb.toString());
+            Boolean unverified = r == null ? null : unverified(r, known, nonce, null);
+            if (unverified == null) return;
+            seen(USB_HOST, new Laptop(USB_HOST, r.name, Protocol.AUDIO_PORT, System.currentTimeMillis(), unverified));
         } catch (Exception ignored) {
             // No cable, USB mode off, or the laptop is not running.
         }
     }
 
+    /**
+     * Checks a reply against the laptops this phone paired with. A reply that claims a known id
+     * without the right proof is an impostor: null, dropped. One that uses a known laptop's name
+     * but proves nothing is shown marked as not verified.
+     */
+    private static Boolean unverified(Protocol.Here r, JSONObject known, String nonce, String previous) {
+        if (r.id != null) {
+            JSONObject k = known.optJSONObject(r.id);
+            if (k != null) {
+                String key = k.optString("key");
+                if (Protocol.proofMatches(key, nonce, r.proof)) return false;
+                if (previous != null && Protocol.proofMatches(key, previous, r.proof)) return false;
+                return null;
+            }
+        }
+        for (java.util.Iterator<String> it = known.keys(); it.hasNext(); ) {
+            JSONObject k = known.optJSONObject(it.next());
+            if (k != null && r.name.equals(k.optString("name"))) return true;
+        }
+        return false;
+    }
+
+    private void seen(String ip, Laptop l) {
+        Laptop had = laptops.put(ip, l);
+        if (had == null || had.unverified != l.unverified || !had.name.equals(l.name)) main.post(this::renderLaptops);
+    }
+
+    private static String nonce() {
+        byte[] b = new byte[8];
+        RANDOM.nextBytes(b);
+        return Protocol.hex(b);
+    }
+
     private void discoverLoop() {
-        byte[] probe = Protocol.DISCOVER.getBytes(StandardCharsets.UTF_8);
         byte[] buf = new byte[512];
         try (DatagramSocket sock = new DatagramSocket()) {
             sock.setBroadcast(true);
             sock.setSoTimeout(400);
-            long nextProbe = 0;
+            long lastProbe = 0;
             long nextRender = 0;
+            String nonce = nonce(), previous = null;
+            JSONObject known = LaptopKeys.all(this);
             while (discoveryThread == Thread.currentThread()) {
                 long now = System.currentTimeMillis();
-                if (now >= nextProbe) {
+                long every = StreamState.active() ? PROBE_STREAMING_MS : PROBE_IDLE_MS;
+                if (now - lastProbe >= every) {
+                    // A fresh nonce each round; a late reply to the round before still counts.
+                    previous = lastProbe == 0 ? null : nonce;
+                    nonce = nonce();
+                    known = LaptopKeys.all(this);
+                    byte[] probe = Protocol.discover(nonce).getBytes(StandardCharsets.UTF_8);
                     for (InetAddress t : broadcastTargets()) {
                         try {
                             sock.send(new DatagramPacket(probe, probe.length, t, Protocol.DISCOVERY_PORT));
                         } catch (Exception ignored) {}
                     }
-                    probeUsb();
-                    nextProbe = now + 2000;
+                    probeUsb(nonce, known);
+                    lastProbe = now;
                 }
                 try {
                     DatagramPacket p = new DatagramPacket(buf, buf.length);
                     sock.receive(p);
-                    Object[] r = Protocol.parseDiscoverReply(
+                    Protocol.Here r = Protocol.parseDiscoverReply(
                             new String(p.getData(), 0, p.getLength(), StandardCharsets.UTF_8));
-                    if (r != null) {
+                    Boolean unverified = r == null ? null : unverified(r, known, nonce, previous);
+                    if (unverified != null) {
                         String ip = p.getAddress().getHostAddress();
-                        boolean fresh = !laptops.containsKey(ip);
-                        laptops.put(ip, new Laptop(ip, (String) r[0], (Integer) r[1], System.currentTimeMillis()));
-                        if (fresh) main.post(this::renderLaptops);
+                        seen(ip, new Laptop(ip, r.name, r.port, System.currentTimeMillis(), unverified));
                     }
                 } catch (SocketTimeoutException ignored) {}
                 if (now >= nextRender) {
