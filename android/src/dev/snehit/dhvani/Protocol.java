@@ -10,7 +10,7 @@ final class Protocol {
     static final int DISCOVERY_PORT = 47802;
     static final int RATE = 48000;
     static final int CHANNELS = 2;
-    static final String APP_VERSION = "0.9.0";
+    static final String APP_VERSION = "0.9.1";
 
     /** UDP audio packet: 'D' 'H', version, flags (bit 0 = late copy), 8-byte token, seq, phone ms, PCM. */
     static final int UDP_HEADER = 20;
