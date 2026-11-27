@@ -601,3 +601,58 @@ test("report: phone retries count per session, not the phone's running total", (
   writeFileSync(file, ev.map((e) => JSON.stringify(e)).join("\n") + "\n");
   expect(sessionHistory(file, 1).map((r) => r.reconnects)).toEqual([2, 1, 4143, 0]);
 });
+
+import { EventEmitter } from "node:events";
+import { STUCK_MS, pipePlayer } from "../src/player";
+
+describe("pipePlayer", () => {
+  const fakeChild = () => {
+    const kills: string[] = [];
+    const stdin = Object.assign(new EventEmitter(), { writableLength: 0, write: () => true, end: () => {} });
+    const child = Object.assign(new EventEmitter(), {
+      stdin, stderr: new EventEmitter(), kills,
+      kill: (sig: string) => (kills.push(sig), true),
+    });
+    return child;
+  };
+  const opts = { rate: 48000, channels: 2, sink: "" };
+
+  test("a pw-cat that stops reading is killed so a new one can start", () => {
+    const child = fakeChild();
+    let t = 0;
+    const exits: string[] = [];
+    const p = pipePlayer(child as never, opts, (r) => exits.push(r), () => t);
+    child.stdin.writableLength = 1e9;
+    expect(p.write(new Uint8Array(192))).toBe("stalled");
+    t = STUCK_MS - 1;
+    expect(p.write(new Uint8Array(192))).toBe("stalled");
+    expect(p.closed).toBe(false);
+    t = STUCK_MS + 1;
+    expect(p.write(new Uint8Array(192))).toBe("closed");
+    expect(p.closed).toBe(true);
+    expect(child.kills).toEqual(["SIGKILL"]);
+    expect(exits).toEqual(["pw-cat stopped reading; restarting it"]);
+  });
+
+  test("a short stall that clears does not count toward the next one", () => {
+    const child = fakeChild();
+    let t = 0;
+    const p = pipePlayer(child as never, opts, () => {}, () => t);
+    child.stdin.writableLength = 1e9;
+    p.write(new Uint8Array(192));
+    child.stdin.writableLength = 0;
+    t = STUCK_MS - 100;
+    p.write(new Uint8Array(192));
+    child.stdin.writableLength = 1e9;
+    t = STUCK_MS + 100;
+    expect(p.write(new Uint8Array(192))).toBe("stalled");
+    expect(p.closed).toBe(false);
+  });
+
+  test("a broken pipe kills pw-cat", () => {
+    const child = fakeChild();
+    pipePlayer(child as never, opts, () => {}, () => 0);
+    child.stdin.emit("error", new Error("EPIPE"));
+    expect(child.kills).toEqual(["SIGKILL"]);
+  });
+});

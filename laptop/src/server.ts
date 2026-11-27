@@ -70,8 +70,16 @@ const LEVEL_INTERVAL_MS = 66;
 const RESPAWN_INTERVAL_MS = 1000;
 /** No UDP audio this long after the session starts: the path is blocked, fall back to TCP. */
 export const UDP_FALLBACK_MS = 2500;
-/** UDP audio stopped this long (the phone sends a keepalive at least every 250 ms): phone is gone. */
+/** UDP audio stopped this long (the phone sends a keepalive at least every 250 ms): carry it over TCP instead. */
 export const UDP_TIMEOUT_MS = 8000;
+/** After a fallback, TCP audio stopped this long (the phone sends at least every 250 ms): the phone is gone. */
+export const TCP_SILENT_MS = 4000;
+/**
+ * Wait this long after a good hello before starting the session. A hello that arrives with
+ * its FIN came from a connection the phone already gave up on (the laptop stalled while it
+ * waited for the reply); starting it would replace the live session for nothing.
+ */
+export const HELLO_SETTLE_MS = 25;
 /** A housekeeping tick this late means the laptop itself stalled (suspend, heavy load), not the phone. */
 export const LATE_TICK_MS = 3000;
 /** The once-a-second timer this late means the laptop was asleep: the phone gave up on this connection long ago. */
@@ -135,6 +143,8 @@ type Active = {
   secTimer: ReturnType<typeof setInterval>;
   /** Wall clock at the last one-second tick; a big jump means the laptop slept. */
   lastTickAt: number;
+  /** The player failure shown as lastError, cleared once a new player takes audio. */
+  playerError: string;
   udp: {
     token: Buffer;
     reorder: Reorder;
@@ -149,6 +159,9 @@ type Active = {
     /** Earliest next UDP retry after a fallback, and the wait after that one. */
     retryAt: number;
     retryMs: number;
+    /** When audio last moved to TCP, and when TCP audio last arrived: a phone gone quiet on TCP is gone. */
+    tcpSince: number;
+    tcpAt: number;
     stale: StaleGate;
     timers: ReturnType<typeof setInterval>[];
   } | null;
@@ -182,6 +195,7 @@ export class AudioServer {
     private hooks: ServerHooks,
     private helloTimeoutMs = 5000,
     private udpRetryMs = UDP_RETRY_MS,
+    private udpTimeoutMs = UDP_TIMEOUT_MS,
   ) {}
 
   async listen(port: number, host = "0.0.0.0"): Promise<number> {
@@ -320,7 +334,23 @@ export class AudioServer {
       done = true;
       clearTimeout(timer);
       socket.off("data", onHelloData);
-      this.start(socket, hello, address, rest);
+      // Hold any audio that follows the hello until the session starts.
+      const early: Buffer[] = rest.length ? [rest] : [];
+      const hold = (c: Buffer) => early.push(c);
+      let ended = false;
+      const onEnd = () => (ended = true);
+      socket.on("data", hold);
+      socket.once("end", onEnd);
+      setTimeout(() => {
+        socket.off("data", hold);
+        socket.off("end", onEnd);
+        if (ended || socket.destroyed || socket.readableEnded) {
+          log("hello_stale", { address, device: hello.device });
+          socket.destroy();
+          return;
+        }
+        this.start(socket, hello, address, Buffer.concat(early));
+      }, HELLO_SETTLE_MS);
     };
 
     socket.on("data", onHelloData);
@@ -358,6 +388,7 @@ export class AudioServer {
       sec: { bytes: 0, gapMax: 0, lastAt: 0, lastSilent: false, idle: true, tMin: Infinity, tMax: -Infinity },
       secTimer: setInterval(() => this.tickSecond(active), 1000),
       lastTickAt: Date.now(),
+      playerError: "",
       udp: null,
     };
     active.statsTimer.unref?.();
@@ -381,7 +412,10 @@ export class AudioServer {
     }));
     this.pushLaptopState();
 
-    const aligner = new FrameAligner(2 * hello.channels);
+    const frameBytes = 2 * hello.channels;
+    // Only the TCP byte stream can split a frame. UDP packets bypass this aligner, or a
+    // partial TCP frame left over at a switch would shift every UDP sample after it.
+    const tcpAligner = new FrameAligner(frameBytes);
     const onAudio = (chunk: Uint8Array, d?: Delivered) => {
       if (this.active !== active) return;
       const now = performance.now();
@@ -398,7 +432,7 @@ export class AudioServer {
       if (active.sec.lastAt && !active.sec.lastSilent) active.sec.gapMax = Math.max(active.sec.gapMax, now - active.sec.lastAt);
       active.sec.lastAt = now;
       active.sec.bytes += chunk.length;
-      const frames = aligner.push(chunk);
+      const frames = d ? chunk.subarray(0, chunk.length - (chunk.length % frameBytes)) : chunk;
       if (!frames.length) return;
       // Backlog released by a Wi-Fi stall: skip it and play live audio, rather than play old audio and skip later.
       if (d && d.sentMs !== null && active.player && !active.player.closed && active.udp?.stale.stale(
@@ -415,6 +449,11 @@ export class AudioServer {
       const follow = cfg.followPhone && pv ? phoneGain(pv) : 1;
       const { out, peak } = active.limiter.process(frames, cfg.muted || this.hooks.outputMissing?.() ? 0 : volumeGain(cfg.volume) * follow);
       const result = player ? player.write(out, peak < QUIET_PEAK) : "closed";
+      if (result === "ok" && active.playerError) {
+        // A restarted player is playing again: the failure is over.
+        if (this.lastError === active.playerError) this.fail("");
+        active.playerError = "";
+      }
       if (result === "quiet") active.stats.dropQuiet++;
       else if (result !== "ok") {
         this.drops++;
@@ -441,6 +480,8 @@ export class AudioServer {
         resuming: false,
         retryAt: 0,
         retryMs: this.udpRetryMs,
+        tcpSince: 0,
+        tcpAt: 0,
         stale: new StaleGate(),
         timers: [],
       };
@@ -451,10 +492,14 @@ export class AudioServer {
       );
       for (const t of u.timers) t.unref?.();
     }
-    // Over UDP the socket carries no audio until the laptop asks for the TCP fallback.
-    socket.on("data", (chunk: Uint8Array) => {
-      if (active.session.transport === "tcp") onAudio(chunk);
-    });
+    // Over UDP the socket carries no audio until the laptop asks for the TCP fallback. The
+    // aligner still sees every TCP byte, so a stray chunk after a switch cannot misalign it.
+    const onTcp = (chunk: Uint8Array) => {
+      if (active.udp) active.udp.tcpAt = performance.now();
+      const frames = tcpAligner.push(chunk);
+      if (frames.length && active.session.transport === "tcp") onAudio(frames);
+    };
+    socket.on("data", onTcp);
     socket.on("error", (e) => {
       active.socketError = e.message;
     });
@@ -463,7 +508,7 @@ export class AudioServer {
     });
     this.hooks.onChange();
     this.hooks.onSessionStart?.(session);
-    if (rest.length && session.transport === "tcp") onAudio(rest);
+    if (rest.length) onTcp(rest);
   }
 
   private udpAudio(msg: Buffer) {
@@ -483,36 +528,57 @@ export class AudioServer {
     u.reorder.push(p.seq, p.sentMs, p.late, p.pcm);
   }
 
-  /** Once a second over UDP: keep the phone's watchdog fed, fall back to TCP, notice a vanished phone. */
+  /** Once a second over UDP: keep the phone's watchdog fed, switch between UDP and TCP, notice a vanished phone. */
   private udpHousekeeping(active: Active) {
     const u = active.udp;
     if (this.active !== active || !u || active.socket.destroyed) return;
     const now = performance.now();
     const late = now - u.lastTick > LATE_TICK_MS;
     u.lastTick = now;
-    if (late) u.since = Math.max(u.since, now - UDP_FALLBACK_MS / 2);
-    if (active.session.transport !== "udp" && !u.resuming) return;
-    // After a laptop stall the queued packets have not been read yet; give the phone a fresh window.
-    if (late && u.lastAt) u.lastAt = now;
-    const age = now - u.lastAt;
-    if (u.reorder.received === u.receivedAtStart && now - u.since >= UDP_FALLBACK_MS) {
-      const retried = u.resuming;
-      active.session.transport = "tcp";
-      u.resuming = false;
-      u.retryAt = now + u.retryMs;
-      if (retried) u.retryMs = Math.min(UDP_RETRY_MAX_MS, u.retryMs * 2);
-      log("udp_fallback", { session: active.session.id, retry: retried, nextTryS: Math.round((u.retryAt - now) / 1000) });
-      active.socket.write(TCP_FALLBACK_LINE);
-      this.hooks.onChange();
-      return;
+    if (late) {
+      // After a laptop stall the queued packets have not been read yet; give the phone a fresh window.
+      u.since = Math.max(u.since, now - UDP_FALLBACK_MS / 2);
+      if (u.lastAt) u.lastAt = now;
+      if (u.tcpSince) u.tcpSince = now;
     }
-    if (active.session.transport === "udp" && u.reorder.received && age > UDP_TIMEOUT_MS) {
-      log("udp_timeout", { session: active.session.id, ms: Math.round(age) });
-      active.socket.destroy();
-      this.endActive("timeout");
-      return;
+    const onUdp = active.session.transport === "udp";
+    if (onUdp || u.resuming) {
+      if (u.reorder.received === u.receivedAtStart && now - u.since >= UDP_FALLBACK_MS) {
+        this.toTcp(active, now, {});
+        return;
+      }
+      const age = now - u.lastAt;
+      if (onUdp && u.reorder.received && age > this.udpTimeoutMs) {
+        // UDP stopped but the control socket is up (a router or power-save hiccup): carry on over TCP.
+        log("udp_timeout", { session: active.session.id, ms: Math.round(age) });
+        this.toTcp(active, now, { midstream: true });
+        return;
+      }
+    } else if (u.tcpSince) {
+      const quiet = now - Math.max(u.tcpSince, u.tcpAt);
+      if (quiet > TCP_SILENT_MS) {
+        log("tcp_timeout", { session: active.session.id, ms: Math.round(quiet) });
+        active.socket.destroy();
+        this.endActive("timeout");
+        return;
+      }
     }
+    // Over TCP too: the phone ignores it there, and it is ready the moment UDP resumes.
     active.socket.write(PING_LINE);
+  }
+
+  /** Tells the phone to send its audio over the TCP socket, and when to try UDP again. */
+  private toTcp(active: Active, now: number, extra: Record<string, unknown>) {
+    const u = active.udp!;
+    const retried = u.resuming;
+    active.session.transport = "tcp";
+    u.resuming = false;
+    u.tcpSince = now;
+    u.retryAt = now + u.retryMs;
+    if (retried) u.retryMs = Math.min(UDP_RETRY_MAX_MS, u.retryMs * 2);
+    log("udp_fallback", { session: active.session.id, retry: retried, ...extra, nextTryS: Math.round((u.retryAt - now) / 1000) });
+    active.socket.write(TCP_FALLBACK_LINE);
+    this.hooks.onChange();
   }
 
   private ensurePlayer(active: Active): Player | null {
@@ -527,7 +593,10 @@ export class AudioServer {
       { rate: active.hello.rate, channels: active.hello.channels, sink, latency: this.getConfig().latency, screenOff: active.screenOff },
       (reason) => {
         log("player_exit", { session: active.session.id, reason });
-        if (this.active === active && active.player === player) this.fail(reason);
+        if (this.active === active && active.player === player) {
+          active.playerError = reason;
+          this.fail(reason);
+        }
       },
     );
     active.player = player;

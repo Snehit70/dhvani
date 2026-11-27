@@ -380,3 +380,100 @@ test("a UDP retry that gets nothing goes back to TCP", async () => {
   udp.close();
   c.sock.end();
 }, 10000);
+
+test("a hello whose phone already hung up does not replace the live session", async () => {
+  const port = await start();
+  const a = connect(port);
+  a.sock.write(hello("424242"));
+  await a.line();
+  await until(() => server.session !== null);
+  const live = server.session!.id;
+  // A connection the phone gave up on: its hello and FIN arrive together after a laptop stall.
+  const stale = connect(port);
+  stale.sock.end(hello("424242"));
+  await stale.closed;
+  await Bun.sleep(50);
+  expect(server.session?.id).toBe(live);
+  expect(a.sock.destroyed).toBe(false);
+  // A live hello still takes over.
+  const b = connect(port);
+  b.sock.write(hello("424242"));
+  await b.line();
+  await until(() => server.session?.id !== live);
+  await a.closed;
+  b.sock.end();
+});
+
+test("a partial TCP frame left at a switch to UDP does not shift the UDP audio", async () => {
+  const port = await startUdp(0);
+  const c = connect(port);
+  c.sock.write(helloUdp);
+  const reply = JSON.parse(await c.line());
+  const token = Buffer.from(reply.udp.token, "hex");
+  while ((await c.line()) !== TCP_FALLBACK_LINE.trim()) {}
+  // Three bytes: not a whole stereo frame, so one is left waiting for the next TCP chunk.
+  c.sock.write(Buffer.from([5, 0, 6]));
+  await Bun.sleep(30);
+  const udp = dgram.createSocket("udp4");
+  udp.send(JSON.stringify({ dhvani: "stats", v: 1, code: "424242" }), reply.udp.port, "127.0.0.1");
+  while ((await c.line()) !== UDP_RESUME_LINE.trim()) {}
+  udp.send(encodeAudioPacket({ token, seq: 10, sentMs: 50_000, late: false, pcm: new Uint8Array(4).fill(9) }), reply.udp.port, "127.0.0.1");
+  await until(() => players[0]?.data.length === 4);
+  expect(players[0]!.data).toEqual([9, 9, 9, 9]);
+  udp.close();
+  c.sock.end();
+}, 8000);
+
+test("UDP that stops mid-stream moves to TCP; TCP going quiet too ends the session", async () => {
+  server = new AudioServer(() => config, factory, {
+    onChange: () => changes++, onLevel: () => {}, addresses: () => [], allowUdp: () => true,
+  }, 500, 60_000, 1500);
+  const port = await server.listen(0, "127.0.0.1");
+  await server.listenDiscovery(0, port);
+  const c = connect(port);
+  c.sock.write(helloUdp);
+  const reply = JSON.parse(await c.line());
+  const token = Buffer.from(reply.udp.token, "hex");
+  const udp = dgram.createSocket("udp4");
+  for (let seq = 0; seq < 3; seq++) {
+    udp.send(encodeAudioPacket({ token, seq, sentMs: 1000 + seq * 5, late: false, pcm: new Uint8Array(4).fill(1) }), reply.udp.port, "127.0.0.1");
+  }
+  await until(() => players[0]?.data.length === 12);
+  // UDP goes dark but the control socket lives: the laptop asks for TCP instead of hanging up.
+  while ((await c.line()) !== TCP_FALLBACK_LINE.trim()) {}
+  expect(server.session?.transport).toBe("tcp");
+  c.sock.write(Buffer.from([5, 0, 6, 0]));
+  await until(() => players[0]?.data.length === 16);
+  // Nothing on TCP either: the phone is gone.
+  await until(() => server.session === null, 7000);
+  expect(server.recent[0]?.reason).toBe("timeout");
+  udp.close();
+  c.sock.end();
+}, 15000);
+
+test("a restarted player that plays again clears the player error", async () => {
+  let n = 0;
+  const failing: PlayerFactory = (opts, onExit) => {
+    const p = factory(opts, onExit) as FakePlayer;
+    if (n++ === 0) {
+      let closed = false;
+      Object.defineProperty(p, "closed", { get: () => closed });
+      p.write = () => { closed = true; onExit("pw-cat stopped reading; restarting it"); return "closed"; };
+    }
+    return p;
+  };
+  server = new AudioServer(() => config, failing, { onChange: () => changes++, onLevel: () => {} }, 500);
+  const port = await server.listen(0, "127.0.0.1");
+  const c = connect(port);
+  c.sock.write(hello("424242"));
+  await c.line();
+  await until(() => server.session !== null);
+  c.sock.write(Buffer.from([1, 0, 1, 0]));
+  await until(() => server.lastError !== "");
+  // The next player spawns after the respawn interval and takes the audio.
+  const feed = setInterval(() => c.sock.write(Buffer.from([2, 0, 2, 0])), 50);
+  await until(() => (players[1]?.data.length ?? 0) > 0, 3000);
+  clearInterval(feed);
+  await until(() => server.lastError === "");
+  c.sock.end();
+}, 6000);

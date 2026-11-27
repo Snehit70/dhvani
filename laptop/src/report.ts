@@ -48,18 +48,20 @@ export function recentSessions(file: string, n: number) {
 const num = (v: unknown) => (typeof v === "number" ? v : 0);
 
 /** One row per session in the log, oldest first, with what went wrong in it. */
-function buildRows(events: Ev[]): { rows: Row[]; rejected: number } {
+function buildRows(events: Ev[]): { rows: Row[]; rejected: number; stale: number } {
   const rows = new Map<number, Row>();
   // Session ids restart with the service, so key on start order instead.
   let current = new Map<number, Row>();
   let seq = 0;
   let rejected = 0;
+  let stale = 0;
   // The phone counts stalls and reconnects since Start was tapped, across sessions. Keep its
   // last totals per device so each session gets only what happened since the one before.
   const phoneTotals = new Map<string, PhoneCounts>();
   for (const e of events) {
     if (e.ev === "start") current = new Map();
     if (e.ev === "hello_rejected") rejected++;
+    if (e.ev === "hello_stale") stale++;
     const sid = num(e.session);
     if (e.ev === "session_start") {
       const r: Row = {
@@ -108,7 +110,7 @@ function buildRows(events: Ev[]): { rows: Row[]; rejected: number } {
         break;
     }
   }
-  return { rows: [...rows.values()], rejected };
+  return { rows: [...rows.values()], rejected, stale };
 }
 
 /** Sessions that started within the last `days` days, newest first, for the panel's history view. */
@@ -137,7 +139,7 @@ export function report(file: string, args: string[]) {
   const events = readEvents(file);
   if (!events.length) return void console.log(`No events yet in ${file}`);
   const limit = Number(args[0]) > 0 ? Number(args[0]) : 10;
-  const { rows, rejected } = buildRows(events);
+  const { rows, rejected, stale } = buildRows(events);
   const list = rows.slice(-limit);
   const pad = (s: unknown, n: number) => String(s).slice(0, n).padEnd(n);
   console.log(
@@ -164,6 +166,7 @@ export function report(file: string, args: string[]) {
       `(100 = real time); phone = longest single socket write on the phone. Times are UTC.` +
       `\nretries to connect = connection drops and failed attempts on the phone since its session before.` +
       (rejected ? `\n${rejected} connection attempts rejected (wrong code, timeout or bad hello).` : "") +
+      (stale ? `\n${stale} connections ignored because the phone had already hung up (the laptop stalled).` : "") +
       `\nRaw events: ${file}`,
   );
 }

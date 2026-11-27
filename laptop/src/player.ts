@@ -43,6 +43,9 @@ export const PW_LATENCY_MS: Record<LatencyMode, number> = { low: 10, stable: 20 
 /** Hard cap on audio stuck in Node's pipe buffer (pw-cat stalled). */
 export const MAX_BACKLOG_MS = 150;
 
+/** pw-cat alive but not reading for this long is wedged: kill it so a fresh one starts. */
+export const STUCK_MS = 2000;
+
 export const pwCatPlayer: PlayerFactory = (opts, onExit) => {
   const args = [
     "--playback",
@@ -62,6 +65,16 @@ export const pwCatPlayer: PlayerFactory = (opts, onExit) => {
   args.push("-");
 
   const child = spawn("pw-cat", args, { stdio: ["pipe", "ignore", "pipe"] });
+  return pipePlayer(child, opts, onExit, () => performance.now());
+};
+
+type Child = Pick<ReturnType<typeof spawn>, "kill" | "on"> & {
+  stdin: NodeJS.WritableStream & { writableLength: number };
+  stderr: NodeJS.ReadableStream;
+};
+
+/** The player logic around a pw-cat process; separate so tests can drive a fake child. */
+export function pipePlayer(child: Child, opts: PlayerOptions, onExit: (reason: string) => void, now: () => number): Player {
   const bytesPerMs = (opts.rate * opts.channels * 2) / 1000;
   const frameBytes = opts.channels * 2;
   const lead = new JitterBuffer(bytesPerMs, latencyBounds(opts.latency ?? "stable", opts.screenOff));
@@ -70,6 +83,7 @@ export const pwCatPlayer: PlayerFactory = (opts, onExit) => {
   const maxBacklog = Math.round(bytesPerMs * (MAX_BACKLOG_MS + LATENCY.stable.maxMs));
   let closed = false;
   let stderr = "";
+  let stalledSince: number | null = null;
   // Last samples handed to pw-cat, and whether the next write follows a skip or inserted silence.
   let last: number[] = new Array(opts.channels).fill(0);
   let splice = false;
@@ -81,7 +95,8 @@ export const pwCatPlayer: PlayerFactory = (opts, onExit) => {
   child.stderr.on("data", (d: Buffer) => {
     stderr = (stderr + d.toString()).slice(-500);
   });
-  child.stdin.on("error", () => {});
+  // A broken pipe means pw-cat is going away; make sure it does, and its exit reports why.
+  child.stdin.on("error", () => child.kill("SIGKILL"));
   const finish = (reason: string) => {
     if (closed) return;
     closed = true;
@@ -118,8 +133,16 @@ export const pwCatPlayer: PlayerFactory = (opts, onExit) => {
       if (closed) return "closed";
       if (child.stdin.writableLength > maxBacklog) {
         splice = true;
+        const t = now();
+        if (stalledSince === null) stalledSince = t;
+        else if (t - stalledSince > STUCK_MS) {
+          child.kill("SIGKILL");
+          finish("pw-cat stopped reading; restarting it");
+          return "closed";
+        }
         return "stalled";
       }
+      stalledSince = null;
       const a = lead.admit(pcm.length, quiet);
       if (a.prefillMs > 0) {
         const n = Math.round((a.prefillMs * bytesPerMs) / frameBytes) * frameBytes;
@@ -158,10 +181,14 @@ export const pwCatPlayer: PlayerFactory = (opts, onExit) => {
       if (closed) return;
       closed = true;
       child.stdin.end();
-      setTimeout(() => child.kill("SIGTERM"), 200).unref();
+      // A wedged pw-cat can ignore SIGTERM; it must not linger holding the sink.
+      setTimeout(() => {
+        child.kill("SIGTERM");
+        setTimeout(() => child.kill("SIGKILL"), 1000).unref();
+      }, 200).unref();
     },
   };
-};
+}
 
 export type Sink = { name: string; description: string };
 
